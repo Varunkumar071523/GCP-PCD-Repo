@@ -1,0 +1,472 @@
+The previous post covered connecting IBM i to cloud platforms. This post steps back to something closer to the core of how IBM i works: Control Language.
+
+CL is the scripting language of IBM i. It is not a general-purpose language — it does not compete with RPG for business logic or with SQL for data access. It does something neither of those does well: it controls the environment in which other programs run. Job setup, library lists, file overrides, error monitoring, subsystem management, and batch job orchestration — these are CL's domain. Understanding CL is understanding how IBM i operations actually work.
+
+This post covers CL from a modern perspective: ILE CL structure, practical patterns, error handling, SQL integration, and where CL fits in a 2026 DevOps pipeline.
+
+<h2>What CL is and what it is for</h2>
+
+Control Language is IBM i's system command language. Every command you type at a 5250 command line — STRSBS, CHGCURLIB, OVRDBF, SBMJOB — is a CL command. A CL program is a compiled sequence of those commands with added logic: variables, branching, loops, and error handling.
+
+CL programs are compiled objects on IBM i, not scripts. They run under a job with a user profile, a library list, and all the security controls that apply to any other IBM i program. This is different from shell scripts on Linux: a CL program is a first-class IBM i object.
+
+<strong>What CL is typically used for:</strong>
+<ul>
+<li>Job setup — building library lists, setting job attributes before calling application programs</li>
+<li>Batch job orchestration — chaining programs, checking return codes, branching on failure</li>
+<li>File overrides — redirecting file references to different physical files or members for testing and multi-tenant processing</li>
+<li>System administration — automating repetitive operator tasks</li>
+<li>Error handling wrappers — catching exceptions from RPG or SQL programs and taking appropriate action</li>
+<li>Scheduled job streams — the control layer for nightly batch processes</li>
+</ul>
+
+<strong>What CL is not used for:</strong> Business logic, data transformation, string manipulation at scale, or anything requiring complex data structures. RPG or SQL is the right tool for those needs.
+
+<h2>ILE CL versus OPM CL</h2>
+
+IBM i has two CL programming models:
+
+<strong>OPM CL (Original Program Model)</strong> — the older model. A CL program is a single compilation unit. No subprocedures, no service programs, no binding. Still functional, still common in legacy systems. Compiled with CRTCLPGM.
+
+<strong>ILE CL (Integrated Language Environment)</strong> — the current model, available since V3R6. Supports subprocedures, prototyped calls, binding to service programs, and integration with other ILE languages. Compiled with CRTBNDCL (bound program) or CRTCLMOD + CRTPGM (module + bind).
+
+For any new CL development, use ILE CL. It supports all modern IBM i features and integrates cleanly with ILE RPG programs.
+
+<strong>Identifying which model a source file uses:</strong> ILE CL source uses <code>PGM</code>/<code>ENDPGM</code> or <code>PROCEDURE</code>/<code>ENDPROC</code>. OPM CL uses <code>PGM</code>/<code>ENDPGM</code> without subprocedures. The file extension convention is <code>.clle</code> for ILE CL source in the IFS.
+
+<h2>ILE CL program structure</h2>
+
+A minimal ILE CL program:
+
+<pre>PGM
+
+DCL VAR(&ORDLIB) TYPE(*CHAR) LEN(10) VALUE('ORDLIB')
+DCL VAR(&RETCODE) TYPE(*INT) LEN(4)
+
+/* Add application library to library list */
+ADDLIBLE LIB(&ORDLIB) POSITION(*FIRST)
+
+/* Call RPG order processing program */
+CALL PGM(CRTORD) PARM('ORD00143' &RETCODE)
+
+IF COND(&RETCODE *NE 0) THEN(DO)
+    SNDPGMMSG MSG('Order creation failed, RC=' *CAT &RETCODE) +
+              MSGTYPE(*ESCAPE)
+ENDDO
+
+ENDPGM</pre>
+
+<strong>Variable types in ILE CL:</strong>
+
+<ul>
+<li><code>*CHAR</code> — fixed-length character string (up to 9999 characters in ILE CL)</li>
+<li><code>*INT</code> — integer, 2 or 4 bytes</li>
+<li><code>*UINT</code> — unsigned integer</li>
+<li><code>*DEC</code> — packed decimal (length and decimals required)</li>
+<li><code>*LGL</code> — logical (boolean), single character <code>'1'</code> (true) or <code>'0'</code> (false)</li>
+<li><code>*PTR</code> — pointer (for system API calls)</li>
+</ul>
+
+<pre>DCL VAR(&CUSTNO)  TYPE(*CHAR) LEN(10)
+DCL VAR(&ORDAMT)  TYPE(*DEC)  LEN(11 2)
+DCL VAR(&ACTIVE)  TYPE(*LGL)
+DCL VAR(&COUNTER) TYPE(*INT)  LEN(4)</pre>
+
+<h2>Error handling with MONMSG</h2>
+
+MONMSG (Monitor Message) is CL's primary error handling mechanism. It intercepts escape messages — the IBM i equivalent of exceptions — before they terminate the job.
+
+<strong>Program-level MONMSG (catch-all):</strong>
+
+<pre>PGM
+
+MONMSG MSGID(CPF0000) EXEC(GOTO CMDLBL(ERROR))
+
+/* ... program logic ... */
+
+RETURN
+
+ERROR:
+    SNDPGMMSG MSG('Batch process failed — check joblog') +
+              TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+    /* Log or alert, then end */
+
+ENDPGM</pre>
+
+The program-level MONMSG at the top catches any CPF message (CPF0000 is the generic CPF message class) and branches to the ERROR label. This is a safety net, not a substitute for specific error handling.
+
+<strong>Command-level MONMSG (specific error handling):</strong>
+
+<pre>PGM
+
+DCL VAR(&LIBEXISTS) TYPE(*LGL) VALUE('0')
+
+/* Check if library exists before adding */
+ADDLIBLE LIB(APPLIB)
+MONMSG MSGID(CPF2103) EXEC(CHGVAR VAR(&LIBEXISTS) VALUE('1'))
+
+IF COND(&LIBEXISTS *EQ '0') THEN(DO)
+    CRTLIB LIB(APPLIB) TYPE(*TEST)
+    ADDLIBLE LIB(APPLIB)
+ENDDO
+
+ENDPGM</pre>
+
+CPF2103 is the specific message ID for "library already in library list". Monitoring for that specific ID and continuing gracefully is the right pattern — do not catch all errors when you know which one to expect.
+
+<strong>Common CPF message IDs worth knowing:</strong>
+
+<ul>
+<li><code>CPF2103</code> — Library already exists in library list (ADDLIBLE)</li>
+<li><code>CPF2110</code> — Library not found (ADDLIBLE, RMVLIBLE)</li>
+<li><code>CPF3203</code> — Cannot allocate object (file in use)</li>
+<li><code>CPF4131</code> — Override already exists for file</li>
+<li><code>CPF9801</code> — Object not found</li>
+<li><code>CPF9802</code> — Not authorised to object</li>
+<li><code>MCH0000</code> — Machine check (catch-all for machine-level exceptions)</li>
+</ul>
+
+<strong>Retrieving the failing message for logging:</strong>
+
+<pre>PGM
+
+DCL VAR(&MSGID)  TYPE(*CHAR) LEN(7)
+DCL VAR(&MSGDTA) TYPE(*CHAR) LEN(100)
+DCL VAR(&MSGF)   TYPE(*CHAR) LEN(10)
+DCL VAR(&MSGFLIB)TYPE(*CHAR) LEN(10)
+
+MONMSG MSGID(CPF0000) EXEC(GOTO CMDLBL(ERROR))
+
+/* ... program logic ... */
+RETURN
+
+ERROR:
+    /* Receive the last escape message */
+    RCVMSG MSGTYPE(*EXCP) MSGID(&MSGID) MSG(&MSGDTA) +
+           MSGF(&MSGF) MSGFLIB(&MSGFLIB)
+
+    SNDPGMMSG MSG('Program failed: ' *CAT &MSGID *BCAT &MSGDTA) +
+              TOMSGQ(QSYSOPR)
+
+ENDPGM</pre>
+
+<h2>Library list management</h2>
+
+The library list is how IBM i resolves unqualified object names. A CL program that sets up the library list correctly before calling application programs is the foundation of every IBM i job stream.
+
+<strong>Building a controlled library list at job start:</strong>
+
+<pre>PGM PARM(&ENV)
+
+DCL VAR(&ENV) TYPE(*CHAR) LEN(10)  /* 'PROD', 'TEST', 'DEV' */
+DCL VAR(&APPLIB) TYPE(*CHAR) LEN(10)
+
+/* Clear user portion of library list */
+CHGLIBL LIBL(QTEMP)
+
+/* Set application library based on environment */
+SELECT
+WHEN COND(&ENV *EQ 'PROD') THEN(DO)
+    CHGVAR VAR(&APPLIB) VALUE('ORDLIB')
+ENDDO
+WHEN COND(&ENV *EQ 'TEST') THEN(DO)
+    CHGVAR VAR(&APPLIB) VALUE('ORDLIBTEST')
+ENDDO
+OTHERWISE DO
+    CHGVAR VAR(&APPLIB) VALUE('ORDLIBDEV')
+ENDDO
+ENDSELECT
+
+ADDLIBLE LIB(&APPLIB)   POSITION(*FIRST)
+ADDLIBLE LIB(ORDDATA)   POSITION(*AFTER &APPLIB)
+ADDLIBLE LIB(COMMLIB)   POSITION(*LAST)
+
+/* Confirm list */
+DSPLIBL  /* Optional — remove in production batch */
+
+ENDPGM</pre>
+
+This pattern — clear the user library list, then build it explicitly — guarantees the job runs against the intended environment regardless of who submitted it or how their profile's initial library list is configured.
+
+<h2>File overrides</h2>
+
+OVRDBF (Override Database File) redirects a file reference — when program A opens file ORDHDR, it actually opens ORDHDR in a different library, or a specific member, or with different record selection.
+
+<strong>Override to a specific library:</strong>
+
+<pre>OVRDBF FILE(ORDHDR) TOFILE(ORDLIBTEST/ORDHDR)</pre>
+
+Now any program in the job that opens ORDHDR will open the test version, not the production file.
+
+<strong>Override to a specific member (for multi-tenant or date-based partitioning):</strong>
+
+<pre>DCL VAR(&MEMBER) TYPE(*CHAR) LEN(10)
+CHGVAR VAR(&MEMBER) VALUE('JAN2026')
+
+OVRDBF FILE(ORDARCH) MBR(&MEMBER) OVRSCOPE(*JOB)</pre>
+
+<strong>Override scope:</strong>
+<ul>
+<li><code>*ACTGRPDFN</code> — default; override applies to the current activation group</li>
+<li><code>*JOB</code> — override applies to all programs in the job, regardless of call depth</li>
+<li><code>*CALLLVL</code> — override applies at the current call level and programs it calls</li>
+</ul>
+
+<strong>Delete overrides when done:</strong>
+
+<pre>DLTOVR FILE(ORDHDR)       /* Delete specific file override */
+DLTOVR FILE(*ALL)         /* Delete all overrides at current call level */</pre>
+
+Failing to clean up overrides is a common source of subtle bugs in CL programs — an override set for one step in a job stream remains active for subsequent steps unless explicitly deleted.
+
+<h2>Submitting batch jobs from CL</h2>
+
+SBMJOB submits a program to run in a batch subsystem. It is how most IBM i processing moves off the interactive subsystem.
+
+<pre>PGM PARM(&DATE)
+
+DCL VAR(&DATE) TYPE(*CHAR) LEN(7)
+DCL VAR(&JOBNAME) TYPE(*CHAR) LEN(10)
+
+CHGVAR VAR(&JOBNAME) VALUE('NGTBATCH')
+
+SBMJOB CMD(CALL PGM(NIGHTBATCH) PARM(&DATE)) +
+       JOB(&JOBNAME) +
+       JOBD(BATCHJOBD) +
+       JOBQ(BATCHQ) +
+       USER(BATCHUSR) +
+       HOLD(*NO) +
+       LOG(4 00 *SECLVL)
+
+SNDPGMMSG MSG('Batch job ' *CAT &JOBNAME *BCAT 'submitted')
+
+ENDPGM</pre>
+
+Key SBMJOB parameters:
+<ul>
+<li><code>JOBD</code> — job description controlling initial library list, output queue, and message logging</li>
+<li><code>JOBQ</code> — which job queue to submit to; controls priority and which subsystem picks it up</li>
+<li><code>USER</code> — profile the batch job runs under; should be a limited service profile, not an interactive user</li>
+<li><code>LOG</code> — job log detail level; <code>4 00 *SECLVL</code> logs all messages including those below severity 00 with second-level text</li>
+</ul>
+
+<h2>Running SQL from CL</h2>
+
+RUNSQL and RUNSQLSTM allow SQL statements to execute directly from CL, without an RPG program or interactive session.
+
+<strong>Single SQL statement:</strong>
+
+<pre>RUNSQL SQL('UPDATE ORDLIB/ORDHDR SET ORDSTS = ''CL'' +
+            WHERE ORDDAT < CURRENT_DATE - 365 DAYS +
+            AND ORDSTS = ''OP''') +
+       COMMIT(*NONE)</pre>
+
+Note the doubled single quotes inside the SQL string — CL string literals use doubled quotes for embedded quotes.
+
+<strong>Running a SQL script file from the IFS:</strong>
+
+<pre>RUNSQLSTM SRCSTMF('/home/admin/scripts/monthly-archive.sql') +
+           COMMIT(*NONE) +
+           NAMING(*SQL)</pre>
+
+This is powerful for batch maintenance scripts — write the SQL in a proper editor, store it in the IFS under Git control, run it from CL as part of a scheduled job stream.
+
+<strong>Capturing a scalar SQL result into a CL variable:</strong>
+
+CL cannot directly receive a SQL SELECT result, but a single-row result can be retrieved via QCMDEXC calling a stored procedure that sets an output parameter:
+
+<pre>DCL VAR(&OPENCOUNT) TYPE(*INT) LEN(4)
+
+/* Stored procedure sets &OPENCOUNT via OUT parameter */
+CALL PGM(GETORDCNT) PARM(&OPENCOUNT)
+
+IF COND(&OPENCOUNT *GT 1000) THEN(DO)
+    SNDPGMMSG MSG('Open order count exceeds threshold: ' +
+                  *CAT &OPENCOUNT) TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+ENDDO</pre>
+
+<h2>CL subprocedures (ILE CL)</h2>
+
+ILE CL supports subprocedures — named, callable sections within a CL module. This allows CL logic to be organised without separate compiled programs for every small task.
+
+<pre>PGM
+
+DCL VAR(&RESULT) TYPE(*CHAR) LEN(200)
+
+/* Call local subprocedure */
+CALLSUBR SUBR(GETENVNAME) RTNVAL(&RESULT)
+
+SNDPGMMSG MSG('Environment: ' *CAT &RESULT)
+
+RETURN
+
+/* ─── Subprocedure ─────────────────────────── */
+SUBR SUBR(GETENVNAME)
+DCL VAR(&RTNVAL) TYPE(*CHAR) LEN(200)
+DCL VAR(&SYSNAME) TYPE(*CHAR) LEN(8)
+
+RTVNETA SYSNAME(&SYSNAME)
+
+IF COND(&SYSNAME *EQ 'PRODSYS') THEN(DO)
+    CHGVAR VAR(&RTNVAL) VALUE('PRODUCTION')
+ENDDO
+ELSE DO
+    CHGVAR VAR(&RTNVAL) VALUE('NON-PRODUCTION')
+ENDDO
+
+RTNSUBR RTNVAL(&RTNVAL)
+
+ENDSUBR
+
+ENDPGM</pre>
+
+Subprocedures keep related logic together and make CL programs easier to read and maintain. For complex job streams, organising setup, processing, and cleanup into subprocedures is significantly cleaner than a single flat program with GOTO labels.
+
+<h2>Retrieving system and job information</h2>
+
+CL has dedicated commands for retrieving runtime information about the job and system — these are used constantly in operational and batch CL programs.
+
+<pre>PGM
+
+DCL VAR(&JOBNAME)  TYPE(*CHAR) LEN(10)
+DCL VAR(&USER)     TYPE(*CHAR) LEN(10)
+DCL VAR(&JOBNBR)   TYPE(*CHAR) LEN(6)
+DCL VAR(&SYSNAME)  TYPE(*CHAR) LEN(8)
+DCL VAR(&CURDATE)  TYPE(*CHAR) LEN(7)  /* CYYMMDD */
+DCL VAR(&CURTIME)  TYPE(*CHAR) LEN(6)  /* HHMMSS */
+
+RTVJOBA JOB(&JOBNAME) USER(&USER) NBR(&JOBNBR)
+RTVNETA SYSNAME(&SYSNAME)
+RTVSYSVAL SYSVAL(QDATE) RTNVAR(&CURDATE)
+RTVSYSVAL SYSVAL(QTIME) RTNVAR(&CURTIME)
+
+SNDPGMMSG MSG('Job ' *CAT &JOBNAME *BCAT '/' *CAT +
+              &USER *BCAT 'started on' *BCAT &SYSNAME *BCAT +
+              'at' *BCAT &CURTIME)
+
+ENDPGM</pre>
+
+Common retrieval commands:
+<ul>
+<li><code>RTVJOBA</code> — retrieve current job attributes (name, user, number, status, type)</li>
+<li><code>RTVNETA</code> — retrieve network attributes (system name, local network ID)</li>
+<li><code>RTVSYSVAL</code> — retrieve a system value (QDATE, QTIME, QSECURITY, etc.)</li>
+<li><code>RTVUSRPRF</code> — retrieve user profile attributes</li>
+<li><code>RTVDTAARA</code> — retrieve a data area value (useful for job-to-job communication)</li>
+</ul>
+
+<h2>CL in a DevOps pipeline</h2>
+
+As covered in Post 17, IBM i build pipelines use Bob or GNU Make to compile source. CL programs fit into this pipeline like any other compiled object — source lives in the IFS under Git, Bob compiles from there.
+
+<strong>CL source in the IFS repository:</strong>
+
+<pre>project-repo/
+└── src/
+    └── clle/
+        ├── JOBSETUP.clle      ← Library list setup
+        ├── NIGHTBATCH.clle    ← Nightly batch orchestration
+        └── DPLYCHECK.clle     ← Deployment verification CL</pre>
+
+<strong>Compiling ILE CL from IFS source:</strong>
+
+<pre>CRTBNDCL PGM(BLDLIB/JOBSETUP) +
+          SRCSTMF('/home/build/project-repo/src/clle/JOBSETUP.clle') +
+          DBGVIEW(*SOURCE)</pre>
+
+<strong>CL as a deployment verification step:</strong>
+
+A CL program that verifies a deployment completed correctly is a practical CI/CD gate:
+
+<pre>PGM PARM(&TARGETLIB)
+
+DCL VAR(&TARGETLIB) TYPE(*CHAR) LEN(10)
+DCL VAR(&OBJCOUNT)  TYPE(*INT)  LEN(4)
+DCL VAR(&ERRFOUND)  TYPE(*LGL)  VALUE('0')
+
+MONMSG MSGID(CPF0000) EXEC(GOTO CMDLBL(ERROR))
+
+/* Verify expected programs exist */
+CHKOBJ OBJ(&TARGETLIB/CRTORD) OBJTYPE(*PGM)
+MONMSG MSGID(CPF9801) EXEC(DO)
+    SNDPGMMSG MSG('MISSING: ' *CAT &TARGETLIB *CAT '/CRTORD') +
+              MSGTYPE(*ESCAPE)
+ENDDO
+
+CHKOBJ OBJ(&TARGETLIB/ORDHDR) OBJTYPE(*FILE)
+MONMSG MSGID(CPF9801) EXEC(DO)
+    SNDPGMMSG MSG('MISSING: ' *CAT &TARGETLIB *CAT '/ORDHDR') +
+              MSGTYPE(*ESCAPE)
+ENDDO
+
+SNDPGMMSG MSG('Deployment verification passed for ' *CAT &TARGETLIB) +
+          MSGTYPE(*INFO)
+RETURN
+
+ERROR:
+    SNDPGMMSG MSG('Deployment verification FAILED for ' *CAT &TARGETLIB) +
+              MSGTYPE(*ESCAPE)
+
+ENDPGM</pre>
+
+The CI pipeline calls this CL program after deployment. If any expected object is missing, the CL sends an escape message, the program ends abnormally, and the pipeline step fails. This is a CL program doing what CL is actually good at: controlling and verifying the environment.
+
+<h2>Common operational patterns</h2>
+
+<strong>Data area for inter-job communication:</strong>
+
+<pre>/* Writer job: signal completion */
+CHGDTAARA DTAARA(QTEMP/BATCHSTS) VALUE('DONE')
+
+/* Reader job: poll until done */
+TOP:
+    RTVDTAARA DTAARA(QTEMP/BATCHSTS) RTNVAR(&STATUS)
+    IF COND(&STATUS *NE 'DONE') THEN(DO)
+        DLYJOB DLY(30)
+        GOTO CMDLBL(TOP)
+    ENDDO</pre>
+
+<strong>Save and restore for deployment:</strong>
+
+<pre>/* Save current production objects before deploying */
+SAVOBJ OBJ(*ALL) LIB(ORDLIB) DEV(*SAVF) +
+       SAVF(ORDLIB/PRODBACKUP) TGTRLS(*CURRENT)
+
+/* Restore from save file if rollback needed */
+RSTOBJ OBJ(*ALL) SAVLIB(ORDLIB) DEV(*SAVF) +
+       SAVF(ORDLIB/PRODBACKUP) MBROPT(*ALL) RSTLIB(ORDLIB)</pre>
+
+<strong>Clearing and initialising a work library:</strong>
+
+<pre>CLRLIB LIB(WORKLIB)   /* Clear all objects */
+
+/* Or selective clear */
+DLTOBJ OBJ(WORKLIB/*ALL) OBJTYPE(*FILE)
+DLTOBJ OBJ(WORKLIB/*ALL) OBJTYPE(*PGM)</pre>
+
+<h2>CL versus Python and shell scripts for automation</h2>
+
+With PASE available, IBM i administrators can write automation in Python or bash instead of CL. When should you use which?
+
+<strong>Use CL when:</strong>
+<ul>
+<li>The task manipulates IBM i objects, library lists, or subsystems — CL has native commands for this; Python does not</li>
+<li>The program runs as a compiled IBM i object with full object authority and auditing</li>
+<li>Error handling needs to integrate with IBM i message handling (escape messages, job logs)</li>
+<li>The program calls RPG or other ILE programs directly</li>
+<li>The existing team knows CL and the task does not require anything CL cannot do</li>
+</ul>
+
+<strong>Use Python or bash when:</strong>
+<ul>
+<li>The task involves REST API calls, JSON manipulation, or file processing better served by a scripting language</li>
+<li>The automation runs in a CI/CD pipeline where Python is the natural tool</li>
+<li>The task involves complex string manipulation or data transformation</li>
+<li>The audience includes developers who do not know CL</li>
+</ul>
+
+CL and PASE scripts are not in competition — they are complementary. A Python script that sets up a test environment might call CL programs that set library lists and compile objects. A CL job stream might call a Node.js script that sends a Teams notification on completion.
+
+CL is not a legacy tool that needs replacing. It is the correct tool for a specific class of IBM i operational tasks. Understanding where that boundary lies is what separates effective IBM i developers from those who try to do everything in RPG or everything in Python.
+
+<em>Next post: RPG in 2026 — modern free-format RPG IV, prototyped procedure calls, data structures, SQL integration, and what current RPG actually looks like compared to the fixed-format code that gave the language its reputation.</em>

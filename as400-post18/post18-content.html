@@ -1,0 +1,410 @@
+The previous post covered building a CI/CD pipeline — automating how code gets built and deployed to IBM i. This post covers what happens after deployment: knowing whether the system is healthy, understanding why it slowed down, and tracing problems through an application stack that spans RPG, DB2, and modern API layers.
+
+Observability is the property of a system that lets you answer questions you did not know you would need to ask. On IBM i, the platform has collected detailed performance and operational data for decades. Most shops do not look at it until something breaks. This post covers how to look at it continuously, and how to extend it to cover the application layer as well.
+
+<h2>What IBM i collects by default</h2>
+
+IBM i's Collection Services is a background facility that samples system performance metrics at a configurable interval and stores them in a performance database. It has been running on IBM i since V4R5. On most production systems it is already active — the data is there, it just is not being used.
+
+Collection Services captures:
+
+<ul>
+<li>CPU utilisation by job, subsystem, and processor pool</li>
+<li>Disk I/O — reads, writes, response times, arm utilisation</li>
+<li>Memory pool sizes, faulting rates, and paging activity</li>
+<li>Network interface throughput and error counts</li>
+<li>Database lock wait times and deadlock events</li>
+<li>Job counts, active jobs, and job queue depths</li>
+<li>Spool file and output queue activity</li>
+</ul>
+
+<strong>Check if Collection Services is running:</strong>
+
+<pre>WRKCOL</pre>
+
+Or via SQL:
+
+<pre>SELECT COLLECTION_NAME, STATUS, INTERVAL, RETENTION_PERIOD
+FROM QSYS2.COLLECTION_SERVICES_INFO</pre>
+
+If the status is not *ACTIVE, start it:
+
+<pre>STRPFRCOL INTERVAL(5)</pre>
+
+The INTERVAL parameter is in minutes. Five minutes is a reasonable default for a production system — granular enough to see trends, low enough overhead to leave running continuously.
+
+<h2>Querying Collection Services data with SQL</h2>
+
+Starting with IBM i 7.4 TR4 (and some views backported to 7.3), QSYS2 exposes Collection Services data through SQL table functions. This means you can query historical performance data the same way you query any other IBM i data — from ACS Run SQL Scripts, from your Node.js API layer, or from a monitoring tool.
+
+<strong>CPU utilisation over the last hour:</strong>
+
+<pre>SELECT TIMESTAMP_SAMPLED,
+       TOTAL_CPU_UTILIZATION,
+       INTERACTIVE_CPU_UTILIZATION,
+       BATCH_CPU_UTILIZATION
+FROM TABLE(QSYS2.COLLECTION_SERVICES_DATA(
+    START_TIME => CURRENT_TIMESTAMP - 1 HOUR,
+    STOP_TIME  => CURRENT_TIMESTAMP,
+    COLLECTION_OBJECT_LIBRARY => 'QPFRDATA'
+)) AS T
+ORDER BY TIMESTAMP_SAMPLED</pre>
+
+<strong>Top CPU-consuming jobs right now:</strong>
+
+<pre>SELECT JOB_NAME, USER_NAME, JOB_TYPE,
+       CPU_TIME, ELAPSED_CPU_PERCENTAGE,
+       FUNCTION_TYPE, FUNCTION
+FROM TABLE(QSYS2.ACTIVE_JOB_INFO(
+    RESET_STATISTICS => 'YES',
+    SUBSYSTEM_LIST_FILTER => ''
+)) AS T
+WHERE ELAPSED_CPU_PERCENTAGE > 1
+ORDER BY ELAPSED_CPU_PERCENTAGE DESC
+FETCH FIRST 20 ROWS ONLY</pre>
+
+<strong>Disk arm utilisation by unit:</strong>
+
+<pre>SELECT TIMESTAMP_SAMPLED, DISK_UNIT_NUMBER,
+       DISK_UTILIZATION, DISK_READ_OPERATIONS,
+       DISK_WRITE_OPERATIONS, DISK_RESPONSE_TIME
+FROM TABLE(QSYS2.COLLECTION_SERVICES_DATA(
+    START_TIME => CURRENT_TIMESTAMP - 2 HOURS,
+    STOP_TIME  => CURRENT_TIMESTAMP
+)) AS T
+WHERE DISK_UNIT_NUMBER IS NOT NULL
+ORDER BY TIMESTAMP_SAMPLED, DISK_UNIT_NUMBER</pre>
+
+<strong>Memory pool faulting — the primary indicator of memory pressure:</strong>
+
+<pre>SELECT TIMESTAMP_SAMPLED, POOL_NAME,
+       POOL_SIZE, DEFINED_SIZE,
+       DATABASE_FAULTS, NONDATABASE_FAULTS,
+       ACTIVE_TO_WAIT, WAIT_TO_INELIGIBLE
+FROM TABLE(QSYS2.COLLECTION_SERVICES_DATA(
+    START_TIME => CURRENT_TIMESTAMP - 1 HOUR,
+    STOP_TIME  => CURRENT_TIMESTAMP
+)) AS T
+WHERE POOL_NAME IS NOT NULL
+  AND (DATABASE_FAULTS > 0 OR NONDATABASE_FAULTS > 0)
+ORDER BY TIMESTAMP_SAMPLED, DATABASE_FAULTS DESC</pre>
+
+Sustained faulting in the *BASE or *INTERACT pools is the most common cause of IBM i performance degradation. If NONDATABASE_FAULTS is consistently above zero for interactive jobs, the system does not have enough memory allocated to those pools.
+
+<h2>QSYS2 health views — always-on diagnostics</h2>
+
+Beyond Collection Services, QSYS2 exposes a set of views that reflect current system state. These are useful for health dashboards and alerting — query them periodically and alert when thresholds are crossed.
+
+<strong>Long-running locks:</strong>
+
+<pre>SELECT JOB_NAME, LOCK_OBJECT_NAME, LOCK_OBJECT_LIBRARY,
+       LOCK_OBJECT_TYPE, LOCK_STATE, LOCK_SCOPE,
+       LOCK_WAIT_SECONDS
+FROM QSYS2.OBJECT_LOCK_INFO
+WHERE LOCK_WAIT_SECONDS > 30
+ORDER BY LOCK_WAIT_SECONDS DESC</pre>
+
+<strong>Jobs waiting on locks (potential deadlock indicator):</strong>
+
+<pre>SELECT JOB_NAME, USER_NAME, JOB_STATUS,
+       CURRENT_SYSTEM_OBJECT_NAME,
+       ELAPSED_TIME
+FROM TABLE(QSYS2.ACTIVE_JOB_INFO()) AS T
+WHERE JOB_STATUS = 'LCKW'
+ORDER BY ELAPSED_TIME DESC</pre>
+
+<strong>Journal receiver space and lag:</strong>
+
+<pre>SELECT JOURNAL_LIBRARY, JOURNAL_NAME,
+       CURRENT_RECEIVER, RECEIVER_SIZE_MB,
+       RECEIVER_STATUS, ATTACHED_DATE_TIME
+FROM QSYS2.JOURNAL_INFO
+ORDER BY JOURNAL_LIBRARY, JOURNAL_NAME</pre>
+
+<strong>Job queue depths — batch backlog indicator:</strong>
+
+<pre>SELECT SUBSYSTEM, JOB_QUEUE_NAME,
+       JOB_QUEUE_LIBRARY, JOB_QUEUE_STATUS,
+       NUMBER_OF_JOBS
+FROM QSYS2.JOB_QUEUE_INFO
+WHERE NUMBER_OF_JOBS > 0
+ORDER BY NUMBER_OF_JOBS DESC</pre>
+
+<strong>Active HTTP server instances and connection counts:</strong>
+
+<pre>SELECT SERVER_INSTANCE_NAME, SERVER_STATUS,
+       ACTIVE_CONNECTIONS, REQUESTS_PER_SECOND,
+       AVERAGE_RESPONSE_TIME_MS
+FROM QSYS2.HTTP_SERVER_INFO</pre>
+
+These views are the basis of a basic IBM i health dashboard. A scheduled job that queries them every five minutes and writes results to a monitoring table gives you a continuous health record without additional tooling.
+
+<h2>DB2 for i query performance</h2>
+
+The IBM i database engine includes its own query analysis tooling. The SQL Plan Cache and the Database Monitor are the two primary instruments.
+
+<strong>Plan cache — find expensive queries:</strong>
+
+<pre>SELECT STATEMENT_TEXT,
+       TOTAL_TIME_MS,
+       AVERAGE_TIME_MS,
+       TOTAL_ROWS_RETURNED,
+       TIMES_RUN,
+       PLAN_CACHE_CREATION_TIMESTAMP
+FROM QSYS2.PLAN_CACHE_STATS
+ORDER BY TOTAL_TIME_MS DESC
+FETCH FIRST 25 ROWS ONLY</pre>
+
+<strong>Queries with full table scans (missing indexes):</strong>
+
+<pre>SELECT STATEMENT_TEXT, TIMES_RUN,
+       AVERAGE_TIME_MS, TOTAL_ROWS_RETURNED
+FROM QSYS2.PLAN_CACHE_STATS
+WHERE STATEMENT_TEXT LIKE '%ORDHDR%'
+  AND AVERAGE_TIME_MS > 500
+ORDER BY AVERAGE_TIME_MS DESC</pre>
+
+<strong>Index advice — what DB2 recommends creating:</strong>
+
+<pre>SELECT TABLE_NAME, TABLE_SCHEMA,
+       INDEX_COLUMNS_ADVISED, TIMES_ADVISED,
+       ESTIMATED_CREATION_TIME_MS,
+       LAST_ADVISED
+FROM QSYS2.INDEX_ADVICE
+ORDER BY TIMES_ADVISED DESC
+FETCH FIRST 20 ROWS ONLY</pre>
+
+QSYS2.INDEX_ADVICE is one of the most immediately useful views on any IBM i system. It shows you exactly which indexes DB2 has determined would improve query performance, ranked by how often the advice has been generated. Creating the top-advised indexes is often the fastest path to resolving database performance complaints.
+
+<h2>Application-level logging</h2>
+
+Collection Services and QSYS2 views cover platform and database health. They do not cover application behaviour — which API endpoints are being called, how long RPG programs take to execute, what errors an application is producing, or how a request flows through the system.
+
+Application-level observability requires instrumentation in the application layer. The approach depends on where the application lives.
+
+<strong>Node.js in PASE — structured logging with Pino:</strong>
+
+Pino is a fast, low-overhead structured logger for Node.js that outputs JSON. JSON logs are parseable by every log management platform.
+
+<pre>const pino = require('pino');
+const logger = pino({
+  level: process.env.LOG_LEVEL || 'info',
+  transport: process.env.NODE_ENV !== 'production'
+    ? { target: 'pino-pretty' }
+    : undefined
+});
+
+// Request correlation middleware
+app.use((req, res, next) => {
+  req.correlationId = req.headers['x-correlation-id'] || crypto.randomUUID();
+  req.log = logger.child({ correlationId: req.correlationId, path: req.path });
+  res.setHeader('x-correlation-id', req.correlationId);
+  next();
+});
+
+// Log each request with timing
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    req.log.info({
+      method: req.method,
+      statusCode: res.statusCode,
+      durationMs: Date.now() - start,
+      userAgent: req.headers['user-agent']
+    }, 'request completed');
+  });
+  next();
+});</pre>
+
+<strong>Logging DB2 call durations:</strong>
+
+<pre>async function queryWithLogging(req, sql, params = []) {
+  const start = Date.now();
+  try {
+    const result = await db.query(sql, params);
+    req.log.debug({
+      query: sql.substring(0, 120),
+      rowCount: result.length,
+      durationMs: Date.now() - start
+    }, 'db2 query');
+    return result;
+  } catch (err) {
+    req.log.error({
+      query: sql.substring(0, 120),
+      durationMs: Date.now() - start,
+      error: err.message
+    }, 'db2 query failed');
+    throw err;
+  }
+}</pre>
+
+<strong>RPG application logging — writing to IFS:</strong>
+
+RPG programs can write to IFS stream files using the IFS I/O APIs or through a service program wrapper. A minimal approach uses QMHSNDPM to send messages to a message queue that a log collector monitors, but for structured logging, writing directly to an IFS file gives you a format that integrates with modern log tooling.
+
+<pre>// Service program: LOGUTIL
+// Call from RPG with log level, message text, and context data
+P writeLog         B                   EXPORT
+D writeLog         PI
+D   level                        10A   CONST
+D   message                     256A   CONST
+D   context                     128A   CONST OPTIONS(*NOPASS)
+
+D logEntry        S            512A
+D timestamp       S               Z
+
+/free
+  timestamp = %timestamp();
+  logEntry = '{"ts":"' + %char(timestamp) + '",' +
+             '"level":"' + %trimr(level) + '",' +
+             '"msg":"' + %trimr(message) + '",' +
+             '"ctx":"' + %trimr(context) + '"}' + x'0A';
+
+  // Write to IFS log file via open/write/close
+  callp writeToIFS('/var/log/ibmi-app/app.log': logEntry);
+/end-free
+P writeLog         E</pre>
+
+The IFS log file can then be tailed by a log shipper (Filebeat, Fluent Bit, or a custom Node.js watcher) and forwarded to a centralised log platform.
+
+<h2>Centralised log management</h2>
+
+Logs on the IBM i IFS are not useful in isolation. The value comes from aggregating them with logs from other systems — your web tier, your cloud services, your API gateway — into a single searchable store.
+
+Options that work with IBM i IFS logs:
+
+<strong>Elastic Stack (ELK):</strong> Filebeat running in PASE ships IFS log files to Elasticsearch. Kibana provides search and dashboards. This runs entirely self-hosted.
+
+<pre># filebeat.yml — ship IBM i app logs to Elasticsearch
+filebeat.inputs:
+  - type: log
+    enabled: true
+    paths:
+      - /var/log/ibmi-app/*.log
+    json.keys_under_root: true
+    json.add_error_key: true
+    fields:
+      system: ibmi
+      environment: production
+
+output.elasticsearch:
+  hosts: ["https://elk.internal:9200"]
+  username: "${ELASTIC_USER}"
+  password: "${ELASTIC_PASSWORD}"</pre>
+
+<strong>Grafana + Loki:</strong> Promtail in PASE ships logs to Loki; Grafana queries and visualises. Lower operational overhead than ELK for log-only use cases.
+
+<strong>Azure Monitor / AWS CloudWatch:</strong> Cloud-native options if IBM i is part of a hybrid cloud environment. The Azure Monitor agent runs on Linux/PASE; configure it to pick up IFS log files.
+
+<strong>Splunk:</strong> The Splunk Universal Forwarder has a PASE build. For organisations already on Splunk, this is the most straightforward integration.
+
+<h2>Metrics and dashboards</h2>
+
+For platform metrics (CPU, disk, memory), Collection Services data can be exposed as time-series metrics and fed into a dashboard alongside application metrics.
+
+<strong>Prometheus + Grafana approach:</strong>
+
+A Node.js exporter running in PASE queries QSYS2 views on a scrape interval and exposes the results in Prometheus text format. Prometheus scrapes the exporter; Grafana visualises.
+
+<pre>const express = require('express');
+const { Pool } = require('idb-connector');
+const app = express();
+
+app.get('/metrics', async (req, res) => {
+  const conn = getConnection(); // connection pool
+  const cpuRow = await conn.query(`
+    SELECT TOTAL_CPU_UTILIZATION, BATCH_CPU_UTILIZATION
+    FROM TABLE(QSYS2.ACTIVE_JOB_INFO(
+      RESET_STATISTICS => 'NO'
+    )) AS T
+    FETCH FIRST 1 ROW ONLY
+  `);
+
+  const lockRows = await conn.query(`
+    SELECT COUNT(*) AS LOCK_WAITS
+    FROM TABLE(QSYS2.ACTIVE_JOB_INFO()) AS T
+    WHERE JOB_STATUS = 'LCKW'
+  `);
+
+  const output = [
+    `# HELP ibmi_cpu_total_percent Total CPU utilization`,
+    `# TYPE ibmi_cpu_total_percent gauge`,
+    `ibmi_cpu_total_percent ${cpuRow[0]?.TOTAL_CPU_UTILIZATION ?? 0}`,
+    `# HELP ibmi_lock_waits Active jobs waiting on locks`,
+    `# TYPE ibmi_lock_waits gauge`,
+    `ibmi_lock_waits ${lockRows[0]?.LOCK_WAITS ?? 0}`
+  ].join('\n');
+
+  res.set('Content-Type', 'text/plain; version=0.0.4');
+  res.send(output);
+});
+
+app.listen(9100);</pre>
+
+This exporter runs alongside your existing Node.js API server in PASE. Prometheus scrapes it; Grafana displays CPU utilisation, lock waits, job queue depths, and any application metrics alongside each other.
+
+<h2>Alerting</h2>
+
+Dashboards show you what is happening when you are looking. Alerting tells you when something needs attention.
+
+Practical alert thresholds for IBM i:
+
+<ul>
+<li><strong>CPU &gt; 85% sustained for 5 minutes</strong> — investigate immediately; identify the top jobs via ACTIVE_JOB_INFO</li>
+<li><strong>Memory pool faulting rate &gt; 0 in *INTERACT pool</strong> — interactive response times will be degrading; increase pool size or investigate runaway jobs</li>
+<li><strong>Lock waits &gt; 10 jobs</strong> — likely a long-running transaction holding a lock; identify and assess</li>
+<li><strong>Disk arm utilisation &gt; 70%</strong> — I/O bottleneck developing; check for table scans via INDEX_ADVICE</li>
+<li><strong>Job queue depth &gt; 50 for a critical queue</strong> — batch backlog developing; check for failed or hung preceding jobs</li>
+<li><strong>HTTP server average response time &gt; 2000ms</strong> — API or web service degradation; correlate with CPU and lock wait alerts</li>
+</ul>
+
+Grafana Alerting or Prometheus Alertmanager handle rule evaluation and notification routing (PagerDuty, Teams, Slack, email). The IBM i side only needs to provide the metrics; the alerting infrastructure is off-system.
+
+<h2>Health check endpoints</h2>
+
+If your IBM i system hosts REST APIs (as covered in Post 15), add health check endpoints that surface system state to load balancers, uptime monitors, and orchestration tools:
+
+<pre>app.get('/health', async (req, res) => {
+  try {
+    const [cpuResult] = await db.query(`
+      SELECT TOTAL_CPU_UTILIZATION AS CPU
+      FROM TABLE(QSYS2.ACTIVE_JOB_INFO(RESET_STATISTICS => 'NO')) AS T
+      FETCH FIRST 1 ROW ONLY
+    `);
+    const cpu = cpuResult?.CPU ?? 0;
+    const status = cpu < 90 ? 'ok' : 'degraded';
+
+    res.status(cpu < 90 ? 200 : 503).json({
+      status,
+      timestamp: new Date().toISOString(),
+      checks: {
+        database: 'ok',
+        cpu: { value: cpu, status: cpu < 90 ? 'ok' : 'high' }
+      }
+    });
+  } catch (err) {
+    res.status(503).json({ status: 'error', error: err.message });
+  }
+});</pre>
+
+A load balancer or uptime monitor hitting <code>/health</code> every 30 seconds gives you automated detection of unresponsive API instances and integrates IBM i into the same health-check infrastructure as any other platform.
+
+<h2>What to instrument first</h2>
+
+If your IBM i system currently has no observability beyond WRKACTJOB and waiting for users to complain, a practical starting order:
+
+<strong>1. Verify Collection Services is running</strong> and retaining data for at least 7 days. No code to write — just confirm it is active.
+
+<strong>2. Schedule a daily SQL health report.</strong> A batch job that queries QSYS2.INDEX_ADVICE, QSYS2.PLAN_CACHE_STATS, and active lock waits, and emails the output to the team. This alone will surface the most common performance issues.
+
+<strong>3. Add structured logging to your Node.js API layer.</strong> Pino with correlation IDs, request timing, and DB2 call durations. Write to IFS. Takes a day to implement.
+
+<strong>4. Set up Prometheus + Grafana</strong> (or your organisation's existing monitoring platform) with the Node.js exporter querying QSYS2 views. Build a single dashboard with CPU, lock waits, and response time. Add alerts for the thresholds above.
+
+<strong>5. Extend to log shipping</strong> once you have identified the log platform your organisation uses. Ship IFS logs to that platform.
+
+Each step independently improves your ability to answer questions about the system. You do not need all five to benefit from the first.
+
+IBM i has been collecting the data to answer almost any performance question for thirty years. The gap between what is collected and what is used is almost entirely a tooling and process gap — one that is genuinely closing now that SQL access to that data is mature and the PASE tooling to act on it is available.
+
+<em>Next post: Connecting IBM i to the cloud — direct Azure and AWS integration patterns, hybrid connectivity options, and what IBM i looks like as a backend in a cloud-first architecture.</em>

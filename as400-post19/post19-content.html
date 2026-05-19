@@ -1,0 +1,306 @@
+The previous post covered observability — knowing what is happening inside IBM i. This post covers the other direction: connecting IBM i to the cloud services and platforms that now surround it in almost every enterprise environment.
+
+IBM i sitting in isolation from cloud infrastructure is a design choice, not a technical constraint. The same PASE tooling that runs Node.js and Git also runs HTTP clients, message queue SDKs, and cloud CLI tools. The same DB2 replication mechanisms that mirror data between IBM i partitions can replicate to cloud databases. The question is not whether IBM i can connect to Azure or AWS — it can — but which integration pattern fits the problem.
+
+This post covers the patterns that actually get used in production hybrid architectures.
+
+<h2>The hybrid IBM i reality</h2>
+
+Most IBM i shops are not choosing between IBM i and the cloud. They are operating both, and the challenge is making them work together without building a fragile web of custom integrations.
+
+The common scenarios:
+
+<ul>
+<li>IBM i holds the transactional record of truth; cloud-hosted applications need read access to that data</li>
+<li>Cloud-hosted APIs need to trigger IBM i business logic — order creation, inventory updates, shipment processing</li>
+<li>IBM i batch processes need to consume data or trigger workflows in cloud services (Azure Service Bus, AWS SQS, Salesforce)</li>
+<li>IBM i data needs to flow into cloud analytics platforms (Azure Synapse, AWS Redshift, Snowflake)</li>
+<li>The IBM i workload itself needs to move to cloud-hosted Power infrastructure (IBM Power Virtual Server)</li>
+</ul>
+
+Each scenario has a different integration pattern. Choosing the wrong one for the scenario creates maintenance problems that outlast the initial implementation.
+
+<h2>Pattern 1: REST API layer (IBM i as a service)</h2>
+
+The cleanest pattern for cloud applications needing IBM i data or logic is the REST API layer covered in Post 15. IBM i exposes a versioned REST API via Node.js in PASE; cloud applications call it over HTTPS exactly as they would call any other service.
+
+This pattern is architecture-agnostic from the cloud side. An Azure Function, an AWS Lambda, a containerised microservice, or a Salesforce integration all consume the same HTTP endpoint. IBM i internals — the RPG programs, the DB2 schema, the library structure — are invisible to the consumer.
+
+<strong>What cloud-side consumption looks like:</strong>
+
+<pre># Azure Function calling IBM i REST API
+import requests
+import os
+
+def get_open_orders(customer_id: str) -> dict:
+    response = requests.get(
+        f"{os.environ['IBMI_API_BASE']}/api/v1/orders/open",
+        params={"customerId": customer_id},
+        headers={"Authorization": f"Bearer {get_api_token()}"},
+        timeout=10
+    )
+    response.raise_for_status()
+    return response.json()</pre>
+
+The IBM i REST API layer is the right first choice when:
+<ul>
+<li>Cloud applications need to call IBM i logic synchronously</li>
+<li>The integration is request/response in nature</li>
+<li>You want IBM i to own the interface definition and the business logic</li>
+</ul>
+
+<h2>Pattern 2: Message queue integration</h2>
+
+For asynchronous integrations — IBM i triggering cloud workflows, or cloud events driving IBM i processing — message queues provide decoupling that survives temporary unavailability on either side.
+
+<strong>Azure Service Bus from IBM i (Node.js in PASE):</strong>
+
+<pre>const { ServiceBusClient } = require('@azure/service-bus');
+
+const sbClient = new ServiceBusClient(process.env.AZURE_SERVICEBUS_CONN_STRING);
+const sender = sbClient.createSender('ibmi-order-events');
+
+async function publishOrderCreated(orderNumber, customerNumber, amount) {
+  await sender.sendMessages({
+    body: {
+      eventType: 'order.created',
+      orderNumber,
+      customerNumber,
+      amount,
+      timestamp: new Date().toISOString(),
+      source: 'ibmi'
+    },
+    contentType: 'application/json',
+    subject: 'order.created'
+  });
+}
+
+module.exports = { publishOrderCreated };</pre>
+
+This runs in PASE alongside your existing Node.js API. When an RPG program creates an order, it calls the Node.js layer (via a stored procedure or direct HTTP call to localhost), which publishes to Service Bus. Azure Functions or Logic Apps consume the event.
+
+<strong>AWS SQS from IBM i:</strong>
+
+<pre>const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
+
+const sqs = new SQSClient({
+  region: process.env.AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  }
+});
+
+async function enqueueShipmentEvent(shipmentData) {
+  await sqs.send(new SendMessageCommand({
+    QueueUrl: process.env.SQS_SHIPMENT_QUEUE_URL,
+    MessageBody: JSON.stringify(shipmentData),
+    MessageGroupId: shipmentData.warehouseId  // for FIFO queues
+  }));
+}</pre>
+
+<strong>Consuming cloud queue messages on IBM i:</strong>
+
+A Node.js consumer process running in PASE polls Azure Service Bus or AWS SQS and calls the appropriate IBM i stored procedure or RPG program for each message:
+
+<pre>const receiver = sbClient.createReceiver('cloud-to-ibmi-commands');
+
+async function processIncoming() {
+  const messages = await receiver.receiveMessages(10, { maxWaitTimeInMs: 5000 });
+
+  for (const msg of messages) {
+    try {
+      await dispatchToRPG(msg.body);
+      await receiver.completeMessage(msg);
+    } catch (err) {
+      logger.error({ msg: msg.body, error: err.message }, 'message processing failed');
+      await receiver.abandonMessage(msg);
+    }
+  }
+}
+
+setInterval(processIncoming, 5000);</pre>
+
+Message queue integration is the right choice when:
+<ul>
+<li>IBM i batch processes need to trigger downstream cloud workflows</li>
+<li>Cloud events need to drive IBM i processing without a synchronous call</li>
+<li>Either side may be temporarily unavailable and you need guaranteed delivery</li>
+<li>You need to decouple IBM i release cycles from cloud service release cycles</li>
+</ul>
+
+<h2>Pattern 3: Data replication to cloud databases</h2>
+
+For analytics, reporting, and ML workloads that need IBM i data without querying IBM i directly, replication is the right pattern. IBM i DB2 journal-based replication can feed cloud databases continuously.
+
+<strong>IBM InfoSphere Data Replication (IIDR)</strong> — IBM's enterprise replication product. Reads DB2 for i journals and replicates changes to Azure SQL, AWS RDS, Snowflake, Kafka topics, and other targets. Near-real-time CDC (change data capture). High reliability, IBM support, enterprise cost.
+
+<strong>Striim</strong> — cloud-native CDC platform with IBM i source support. Similar capability to IIDR, different licensing and deployment model. Strong Azure and AWS integration.
+
+<strong>Debezium + Kafka</strong> — open-source CDC stack. Debezium has an IBM i connector that reads DB2 journals and publishes change events to Kafka topics. Kafka Connect sinks carry the data to the destination. More operational complexity than IIDR, no licensing cost.
+
+<strong>Custom journal reader approach (lower cost, lower reliability):</strong>
+
+<pre>-- Query DB2 journal for changes since last run
+SELECT JOURNAL_CODE, ENTRY_TYPE, OBJECT_NAME,
+       SEQUENCE_NUMBER, ENTRY_TIMESTAMP,
+       BEFORE_IMAGE, AFTER_IMAGE
+FROM TABLE(QSYS2.DISPLAY_JOURNAL(
+    JOURNAL_LIBRARY  => 'ORDLIB',
+    JOURNAL_NAME     => 'ORDJRN',
+    JOURNAL_ENTRY_TYPES => 'PT,UP,DL',
+    STARTING_SEQUENCE_NUMBER => :lastProcessedSeq
+)) AS T
+ORDER BY SEQUENCE_NUMBER</pre>
+
+A Node.js process in PASE reads this query on an interval, transforms the rows into the target schema, and bulk-inserts to the cloud database. Simpler than IIDR, suitable for lower-volume replication needs, requires custom maintenance.
+
+<strong>Azure Data Factory with ODBC:</strong> Azure Data Factory has an ODBC connector that can query IBM i DB2 via a self-hosted integration runtime on a Windows server with the IBM i Access ODBC driver installed. This works for scheduled batch replication (not CDC) and fits organisations already using Data Factory for other ETL.
+
+<h2>Pattern 4: IBM Power Virtual Server (cloud-hosted IBM i)</h2>
+
+IBM Power Virtual Server (PowerVS) is IBM Cloud's infrastructure-as-a-service offering for Power hardware — including IBM i. Instead of running IBM i on on-premises hardware, you run it on IBM-managed Power servers in IBM Cloud data centres.
+
+<strong>What PowerVS gives you:</strong>
+<ul>
+<li>IBM i running on the same Power10 hardware as on-premises, in IBM Cloud</li>
+<li>Elastic scaling — resize CPU and memory without a hardware procurement cycle</li>
+<li>Pay-as-you-go or reserved pricing</li>
+<li>Direct connectivity to IBM Cloud services (Object Storage, Db2 on Cloud, Kubernetes)</li>
+<li>ExpressRoute-equivalent private connectivity to Azure or AWS via IBM Cloud Direct Link</li>
+<li>Managed backup and snapshot capabilities</li>
+</ul>
+
+<strong>Network connectivity to Azure / AWS from PowerVS:</strong>
+
+IBM Cloud Direct Link connects a PowerVS environment to Azure or AWS via private BGP peering — no traffic over the public internet. This is the IBM i equivalent of Azure ExpressRoute or AWS Direct Connect, and it makes PowerVS IBM i appear as a private network peer to Azure VNets or AWS VPCs.
+
+<pre># Conceptual network topology
+
+IBM Power Virtual Server (IBM Cloud)
+  └── IBM Cloud Direct Link (private BGP)
+        ├── Azure VNet (via Azure ExpressRoute Gateway)
+        │     ├── Azure App Service (web tier)
+        │     ├── Azure Service Bus
+        │     └── Azure SQL Database
+        └── AWS VPC (via AWS Direct Connect)
+              ├── AWS Lambda
+              └── AWS RDS</pre>
+
+PowerVS is the right choice when:
+<ul>
+<li>On-premises hardware refresh is approaching</li>
+<li>Disaster recovery or secondary partition is needed without second data centre costs</li>
+<li>The organisation has a cloud-first policy that applies to infrastructure procurement</li>
+<li>Elastic capacity is needed for seasonal IBM i workloads</li>
+</ul>
+
+<h2>Pattern 5: Calling cloud APIs from IBM i</h2>
+
+The integration need is sometimes reversed — IBM i processes need to call external cloud services. An order confirmation email via SendGrid, a document stored in Azure Blob Storage, a record created in Salesforce, a notification sent through Teams.
+
+IBM i can make outbound HTTPS calls from PASE (Node.js, Python, or curl) and from ILE programs via the QHTTP APIs or the open-source <code>libcurl</code> port.
+
+<strong>Calling an external REST API from RPG via a Node.js sidecar:</strong>
+
+The cleanest pattern is a local HTTP service in PASE that RPG programs call via a stored procedure. The stored procedure calls the Node.js service; Node.js makes the external API call and returns the result.
+
+<pre>-- SQL stored procedure wrapping the Node.js sidecar call
+CREATE OR REPLACE PROCEDURE ORDLIB.SEND_CONFIRMATION_EMAIL(
+    IN  ORDER_NUMBER   VARCHAR(20),
+    IN  CUSTOMER_EMAIL VARCHAR(100),
+    OUT STATUS_CODE    INTEGER,
+    OUT STATUS_MSG     VARCHAR(200)
+)
+LANGUAGE SQL
+BEGIN
+  DECLARE HTTP_RESULT VARCHAR(1000);
+
+  SET HTTP_RESULT = SYSTOOLS.HTTPPOSTCLOB(
+    'http://localhost:3001/internal/send-email',
+    'Content-Type: application/json',
+    '{"orderNumber":"' || ORDER_NUMBER || '","email":"' || CUSTOMER_EMAIL || '"}'
+  );
+
+  SET STATUS_CODE = 200;
+  SET STATUS_MSG = HTTP_RESULT;
+END;</pre>
+
+SYSTOOLS.HTTPPOSTCLOB is a built-in IBM i SQL function that makes HTTP calls. It is available on IBM i 7.3+ and supports HTTPS. For simple outbound calls this eliminates the need for a Node.js sidecar entirely.
+
+<strong>Directly from SQL (no RPG required):</strong>
+
+<pre>-- Store a document in Azure Blob Storage from SQL
+VALUES SYSTOOLS.HTTPPUTCLOB(
+  'https://yourstorage.blob.core.windows.net/orders/ORD00143.json',
+  'x-ms-blob-type: BlockBlob
+Content-Type: application/json
+Authorization: SharedKey yourstorage:SIGNATURE',
+  (SELECT JSON_OBJECT(
+    'orderNumber': ORDNO,
+    'customerNumber': CUSNO,
+    'amount': ORDAMT
+  ) FROM ORDHDR WHERE ORDNO = 'ORD00143')
+)</pre>
+
+<h2>Network connectivity options</h2>
+
+The integration patterns above assume IBM i can reach cloud endpoints. How that connectivity is established depends on where IBM i lives.
+
+<strong>On-premises IBM i to Azure:</strong>
+<ul>
+<li><strong>Azure VPN Gateway (site-to-site IPSec)</strong> — Terminate the VPN on the IBM i network perimeter firewall. Azure VNet appears as a private subnet. Latency is typically 5–20ms depending on geography. Suitable for API calls and message queue integration.</li>
+<li><strong>Azure ExpressRoute</strong> — Private BGP peering via a colocation provider. No public internet. Required for high-throughput data replication or latency-sensitive integrations.</li>
+</ul>
+
+<strong>On-premises IBM i to AWS:</strong>
+<ul>
+<li><strong>AWS Site-to-Site VPN</strong> — IPSec tunnel from network perimeter to AWS Virtual Private Gateway. AWS VPC resources appear as private network peers.</li>
+<li><strong>AWS Direct Connect</strong> — Private dedicated connection via a colocation provider or Direct Connect partner. Equivalent to ExpressRoute.</li>
+</ul>
+
+<strong>IBM i to SaaS (Salesforce, ServiceNow, Teams, SendGrid):</strong> Outbound HTTPS over existing internet connectivity. No special network configuration needed — just outbound port 443 from IBM i.
+
+<h2>Authentication for cloud integrations</h2>
+
+Each cloud platform has its own authentication model. The IBM i integration layer needs to handle these securely:
+
+<strong>Azure:</strong> Use a managed identity (for PowerVS) or a service principal with client credentials. Store the client secret in Azure Key Vault; retrieve it at startup in the Node.js layer. Do not hard-code credentials in PASE files.
+
+<strong>AWS:</strong> IAM role (for PowerVS running in IBM Cloud with AWS Direct Connect) or IAM user with access keys. Store access keys as encrypted IFS files owned by the service profile, not in environment variables that show up in process listings.
+
+<strong>Generic API keys:</strong> Store in DB2 (encrypted), retrieved by the Node.js layer at runtime. Rotate without code changes.
+
+<pre>-- Store API credentials in DB2 (encrypted at rest via DB2 field procedure or AS/400 encryption)
+CREATE TABLE ORDLIB.API_CREDENTIALS (
+  SERVICE_NAME   VARCHAR(50)  NOT NULL,
+  CREDENTIAL_KEY VARCHAR(100) NOT NULL,
+  CREATED_AT     TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT PK_APICRED PRIMARY KEY (SERVICE_NAME)
+);
+
+-- Retrieve in Node.js at startup
+const creds = await db.query(
+  "SELECT CREDENTIAL_KEY FROM ORDLIB.API_CREDENTIALS WHERE SERVICE_NAME = ?",
+  ['azure-servicebus']
+);</pre>
+
+<h2>Choosing the right pattern</h2>
+
+A practical decision guide:
+
+<strong>Cloud app needs IBM i data or logic synchronously:</strong> REST API layer (Node.js in PASE with Express). Post 15 covers this in detail.
+
+<strong>IBM i event needs to trigger cloud workflow asynchronously:</strong> Message queue (Azure Service Bus or AWS SQS) published from Node.js in PASE.
+
+<strong>Cloud analytics needs IBM i DB2 data continuously:</strong> CDC replication via IIDR, Striim, or Debezium/Kafka to the cloud database of choice.
+
+<strong>IBM i needs to call external cloud services:</strong> SYSTOOLS.HTTPPOSTCLOB for simple calls; Node.js in PASE for calls requiring SDK features or complex authentication.
+
+<strong>IBM i hardware refresh coming or DR needed:</strong> IBM Power Virtual Server with Direct Link connectivity to Azure or AWS.
+
+<strong>Multiple patterns needed:</strong> API layer for synchronous access + message queue for events + replication for analytics is a common and stable combination. Each serves a different access pattern without overlap.
+
+The cloud does not replace IBM i in any of these scenarios. It changes the boundary — IBM i remains the system of record and the execution engine for business logic; cloud services handle the new concerns that sit around it: user interfaces, analytics, workflow orchestration, and the integrations to other platforms that the business now depends on.
+
+<em>Next post: CL in 2026 — what Control Language is actually for on a modern IBM i, ILE CL patterns, error handling with MONMSG, and how CL fits into automated pipelines alongside RPG and SQL.</em>

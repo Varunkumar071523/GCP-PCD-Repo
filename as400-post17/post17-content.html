@@ -1,0 +1,323 @@
+The previous post covered security hardening — locking down the IBM i environment before exposing it to the outside world. This post is about how you build and deploy software on that environment without reverting to the manual, error-prone release processes that most IBM i shops still rely on.
+
+DevOps on IBM i is not a theoretical concept. Every component needed for a proper CI/CD pipeline — Git, automated builds, test runners, deployment tooling — runs on IBM i 7.3 and above. The gap between IBM i shops running manual releases from personal libraries and shops running automated pipelines is not a platform limitation. It is a configuration and tooling decision that has not been made yet.
+
+This post closes that gap with specifics.
+
+<h2>The IBM i release problem</h2>
+
+Most IBM i development follows a pattern that would not be recognisable as software development in any other technology context: a developer makes changes in their personal library, compiles locally, tests locally, then someone copies the objects to a test library, manually tests, and eventually a production coordinator copies objects to the production library at a scheduled maintenance window — if they remember which objects changed.
+
+The problems with this pattern are well understood: no audit trail, no repeatable process, no ability to reproduce a build, no automated testing, and a release process that requires tribal knowledge to execute correctly.
+
+The solution on every other platform is source control, automated builds, and a pipeline. IBM i has had the tools to do this for several years. They are not yet widely used.
+
+<h2>Git on IBM i</h2>
+
+Git runs natively in PASE. IBM provides an official Git build for IBM i through the open-source package repository:
+
+<pre>yum install git</pre>
+
+This requires the IBM i Open Source Package Manager (yum) to be configured, which is a five-minute task documented in the IBM i OSS Getting Started guide. Once installed, Git in PASE is the same Git that runs on Linux — same commands, same behaviour, same hooks.
+
+<strong>The source code question:</strong> IBM i RPG and CL source has traditionally lived in source physical files (QRPGLESRC, QCLLESRC, and similar) in the QSYS library file system. Git works in the IFS. These are different file systems.
+
+The workflow that works is: source code lives in the IFS, in a Git repository, as plain text files. When a developer wants to compile, the source is either compiled directly from the IFS (supported since IBM i 7.1 with the SRCSTMF parameter), or synced to a source physical file for compilation.
+
+<strong>Recommended directory structure for an IBM i Git repository:</strong>
+
+<pre>project-repo/
+├── src/
+│   ├── rpgle/
+│   │   ├── ORDHDR.rpgle
+│   │   ├── ORDLIN.rpgle
+│   │   └── CRTORD.rpgle
+│   ├── clle/
+│   │   └── NIGHTBATCH.clle
+│   ├── sqlrpgle/
+│   │   └── ORDAPI.sqlrpgle
+│   └── dspf/
+│       └── ORDENTRY.dspf
+├── .ibmi.json          ← Bob/deploy target configuration
+├── .gitignore
+└── README.md</pre>
+
+<strong>Compiling from IFS stream files:</strong>
+
+<pre>CRTRPGMOD MODULE(ORDLIB/CRTORD)
+           SRCSTMF('/home/dev/project-repo/src/rpgle/CRTORD.rpgle')
+           DBGVIEW(*SOURCE)</pre>
+
+The SRCSTMF parameter takes an IFS path instead of a source physical file member. This is the bridge between Git-managed source in the IFS and the IBM i compilation system.
+
+<h2>Bob — Better Object Builder</h2>
+
+Bob is an open-source build tool purpose-built for IBM i. It reads a rules file that describes what to compile and the dependencies between objects, then runs the minimum set of compilations needed to bring the system up to date. It is analogous to Make but understands IBM i object types natively.
+
+Bob is maintained by the IBM i open-source community and available on GitHub. Install via:
+
+<pre>yum install bob</pre>
+
+<strong>How Bob works:</strong> Each source file in your IFS repository gets a companion <code>.ibmi.json</code> rules file (or a project-level one), or Bob infers compilation rules from file extensions. When you run Bob, it checks what has changed since the last build and compiles only the affected objects and their dependents.
+
+<strong>A sample <code>.ibmi.json</code> at the project level:</strong>
+
+<pre>{
+  "version": "0.1",
+  "build": {
+    "tgtCcsid": "37"
+  },
+  "targets": {
+    "ORDLIB": {
+      "ORDHDR.FILE": {
+        "type": "PF",
+        "text": "Order Header File"
+      },
+      "CRTORD.MODULE": {
+        "type": "RPGMOD",
+        "sourceFile": "src/rpgle/CRTORD.rpgle",
+        "deps": ["ORDHDR.FILE"]
+      },
+      "CRTORD.PGM": {
+        "type": "PGM",
+        "deps": ["CRTORD.MODULE"]
+      }
+    }
+  }
+}</pre>
+
+Bob resolves the dependency graph and compiles in the correct order. If ORDHDR.FILE changes, Bob recompiles CRTORD.MODULE and CRTORD.PGM. If only CRTORD.rpgle changes, it skips the file compile.
+
+<strong>Running a Bob build:</strong>
+
+<pre>cd /home/build/project-repo
+makei build -t ORDLIB</pre>
+
+The <code>makei</code> command is Bob's CLI. It outputs a build log showing which objects were compiled, which were skipped, and any compilation errors with IFS path references so your CI tool can parse them.
+
+<h2>GNU Make as an alternative</h2>
+
+If Bob does not fit your project structure, GNU Make runs in PASE and is a valid alternative. A Makefile on IBM i uses the same syntax as on Linux but calls IBM i compilation commands via <code>system()</code> or the <code>Qp0zSystem()</code> API, or directly through PASE wrappers.
+
+<pre># Makefile fragment for IBM i
+OBJLIB = ORDLIB
+
+$(OBJLIB)/CRTORD.PGM: src/rpgle/CRTORD.rpgle $(OBJLIB)/ORDHDR.FILE
+	system "CRTRPGMOD MODULE($(OBJLIB)/CRTORD) SRCSTMF('src/rpgle/CRTORD.rpgle')"
+	system "CRTPGM PGM($(OBJLIB)/CRTORD) MODULE($(OBJLIB)/CRTORD)"
+
+$(OBJLIB)/ORDHDR.FILE: src/dds/ORDHDR.dds
+	system "CRTPF FILE($(OBJLIB)/ORDHDR) SRCSTMF('src/dds/ORDHDR.dds')"</pre>
+
+GNU Make handles dependency tracking but requires you to define the dependency graph manually. Bob's IBM i-aware inference of compile rules from source file extensions reduces this overhead. For new projects, start with Bob. For shops with existing Makefiles, Make is a viable path.
+
+<h2>CI pipeline options</h2>
+
+With Git hosting and an automated build tool in place, the next step is running the build automatically on every push. The options depend on where your Git remote lives.
+
+<strong>GitHub Actions:</strong>
+
+GitHub Actions can SSH into an IBM i system and run build commands. The workflow lives in the repository alongside the source code:
+
+<pre># .github/workflows/build.yml
+name: IBM i Build
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync source to IBM i
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.IBMI_HOST }}
+          username: ${{ secrets.IBMI_USER }}
+          key: ${{ secrets.IBMI_SSH_KEY }}
+          source: "src/"
+          target: "/home/build/project-repo/"
+
+      - name: Run Bob build
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.IBMI_HOST }}
+          username: ${{ secrets.IBMI_USER }}
+          key: ${{ secrets.IBMI_SSH_KEY }}
+          script: |
+            cd /home/build/project-repo
+            makei build -t BLDLIB 2>&1
+            echo "Build exit code: $?"</pre>
+
+The SSH key for the build user is stored as a GitHub Actions secret. The build user on IBM i has authority to compile into a build library but not to production.
+
+<strong>Azure DevOps:</strong>
+
+If your organisation uses Azure DevOps, the same pattern applies — an SSH task connects to IBM i and runs the build. Azure DevOps pipelines support SSH key authentication through the service connections mechanism.
+
+<pre># azure-pipelines.yml
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+steps:
+- task: CopyFilesOverSSH@0
+  inputs:
+    sshEndpoint: 'IBMiDev'
+    sourceFolder: 'src'
+    targetFolder: '/home/build/project-repo/src'
+
+- task: SSH@0
+  inputs:
+    sshEndpoint: 'IBMiDev'
+    runOptions: 'inline'
+    inline: |
+      cd /home/build/project-repo
+      makei build -t BLDLIB</pre>
+
+<strong>Jenkins:</strong>
+
+Jenkins running on a separate server (Linux, Windows, or cloud VM) can reach IBM i over SSH. The Jenkins SSH plugin handles the connection. This is the most flexible option for organisations with complex pipeline requirements or existing Jenkins infrastructure.
+
+<strong>Self-hosted runner on IBM i (PASE):</strong>
+
+GitHub Actions and GitLab CI both support self-hosted runners. Running a self-hosted runner in PASE means the build executes directly on IBM i without an SSH hop — the runner pulls jobs from the CI platform and executes them in PASE. This eliminates the source sync step and simplifies the pipeline configuration.
+
+<pre># Install the GitHub Actions runner in PASE
+mkdir actions-runner && cd actions-runner
+curl -o actions-runner-linux-arm64-2.314.1.tar.gz -L \
+  https://github.com/actions/runner/releases/download/v2.314.1/actions-runner-linux-arm64-2.314.1.tar.gz
+tar xzf ./actions-runner-linux-arm64-2.314.1.tar.gz
+./config.sh --url https://github.com/YOUR-ORG/YOUR-REPO --token TOKEN
+./run.sh</pre>
+
+The self-hosted runner approach gives the cleanest pipeline and is worth the setup time for active development teams.
+
+<h2>Library management — where to compile</h2>
+
+A build pipeline needs a clear answer to: which library does the build compile into?
+
+The pattern that works:
+
+<ul>
+<li><strong>Developer builds</strong> compile into the developer's personal library (<code>DEVUSR_LIB</code>). No shared state, no conflicts between developers.</li>
+<li><strong>CI builds</strong> compile into a build library (<code>BLDLIB</code> or <code>CI_LIB</code>) that is rebuilt clean on each pipeline run. No carry-over objects from previous builds.</li>
+<li><strong>Test promotion</strong> copies verified objects from BLDLIB to a test library (<code>TESTLIB</code>) via a controlled step — not a developer's personal action.</li>
+<li><strong>Production promotion</strong> copies from TESTLIB to production library via a deployment step triggered by an approved merge to main.</li>
+</ul>
+
+<strong>Clean build library before compiling:</strong>
+
+<pre>-- Create or clear the build library
+DLTLIB LIB(BLDLIB)
+CRTLIB LIB(BLDLIB) TYPE(*TEST) TEXT('CI Build Library')</pre>
+
+Compiling into a fresh library on every CI run means your build is reproducible. It also catches missing dependencies — if a program compiles successfully in a clean library, all its dependencies were explicitly compiled.
+
+<h2>QTEMP in a CI context</h2>
+
+QTEMP is a job-scoped temporary library. Objects created in QTEMP exist only for the lifetime of the job that created them. This is useful for build processes — temporary work objects, sort files, intermediate results — but it means you cannot treat QTEMP as a build output library.
+
+The specific case that catches CI pipelines: some IBM i compilation processes use QTEMP internally for intermediate objects. If a compilation step fails with "object not found in QTEMP", the job running the CI step did not set up its environment correctly.
+
+Ensure your build job's job description sets an appropriate initial library list. The build user's user profile should specify a library list that includes QTEMP (which is always there) and the system libraries. Do not rely on the interactive library list being inherited in a batch or SSH-initiated job.
+
+<pre>CHGJOBD JOBD(BLDJOBD) INLLIBL(QTEMP *SYSVAL BLDLIB ORDLIB)</pre>
+
+<h2>Testing in the pipeline</h2>
+
+Automated testing for IBM i is less mature than for web platforms but not absent. The options:
+
+<strong>RPGUnit</strong> — an open-source unit test framework for RPG. Write test procedures in RPG, compile them, run them via a command. Output is parseable. RPGUnit test results can be output in JUnit XML format, which every CI platform understands.
+
+<pre>RUCALLTST TSTPGM(BLDLIB/CRTORDTST) OUTPUT(*JUNIT) JUNITXML('/tmp/test-results.xml')</pre>
+
+<strong>HSSFTP / SQL-based integration tests</strong> — for programs that interact with DB2, write test procedures in SQL or RPG that call the program, check the output, and report pass/fail. These are slower than unit tests but test the actual integration path.
+
+<strong>API tests</strong> — if Post 15's REST API layer is in place, standard API testing tools (Newman for Postman collections, Jest + Supertest) test the full stack from the HTTP layer down through RPG. These run on the CI server, not on IBM i.
+
+The minimum viable test suite for IBM i CI is: compile succeeds in a clean library + RPGUnit tests pass for critical business logic. That is more than most IBM i shops have today and catches the majority of regressions.
+
+<h2>Deployment to production</h2>
+
+The deployment step — promoting compiled objects from the CI build library to production — is where IBM i CI pipelines most commonly diverge from good practice.
+
+The wrong approach: let the CI pipeline overwrite production objects directly. No review, no approval gate, automated deployments to production on every merge to main.
+
+The right approach for most IBM i environments:
+
+<ul>
+<li>CI pipeline builds and tests automatically on every push to any branch</li>
+<li>Merge to main triggers a build and a deployment to a staging/UAT environment</li>
+<li>Production deployment requires a manual approval step in the pipeline (GitHub Actions environment protection, Azure DevOps approval gate)</li>
+<li>The approved deployment step copies objects from the staging library to production using SAVOBJ/RSTOBJ or a scripted CPYLIB</li>
+</ul>
+
+<strong>Deployment script example:</strong>
+
+<pre>#!/usr/bin/env bash
+# deploy-to-prod.sh — runs in PASE after manual approval
+set -e
+
+BUILD_LIB="STAGLIB"
+PROD_LIB="ORDLIB"
+BACKUP_LIB="ORDLIB_PREV"
+
+# Save current production as backup
+system "CPYLIB FROMLIB($PROD_LIB) TOLIB($BACKUP_LIB)" || true
+
+# Copy promoted objects to production
+system "CPYLIB FROMLIB($BUILD_LIB) TOLIB($PROD_LIB) CRTLIB(*NO)"
+
+echo "Deployment complete. Previous production backed up to $BACKUP_LIB."</pre>
+
+CPYLIB replaces objects in the target library with objects from the source library, preserving objects in the target that have no counterpart in the source. This is generally the right behaviour for incremental deployments.
+
+<h2>Getting started without disrupting what works</h2>
+
+The path to IBM i DevOps does not require migrating everything at once. A practical progression:
+
+<strong>Step 1 — Source to Git:</strong> Move source code from source physical files to IFS. Use the <code>CPYTOSTMF</code> command to extract existing source members to IFS stream files. Commit to Git. Keep the old source physical files as read-only reference until confidence is established.
+
+<pre>CPYTOSTMF FROMMBR('/QSYS.LIB/ORDLIB.LIB/QRPGLESRC.FILE/CRTORD.MBR')
+           TOSTMF('/home/dev/project-repo/src/rpgle/CRTORD.rpgle')
+           STMFOPT(*REPLACE) CVTDTA(*AUTO)</pre>
+
+<strong>Step 2 — Automated build:</strong> Install Bob. Write the initial rules file. Verify that <code>makei build</code> from the IFS source produces the same compiled objects as the existing PDM-based process.
+
+<strong>Step 3 — Git hosting:</strong> Push the repository to GitHub, Azure DevOps Repos, or Gitea (self-hosted). Start using branches and pull requests for changes, even if the CI pipeline is not yet automated.
+
+<strong>Step 4 — CI pipeline:</strong> Add a basic pipeline — SSH to IBM i, run Bob, report success or failure. No deployment automation yet, just build verification.
+
+<strong>Step 5 — Test integration:</strong> Add RPGUnit tests for the most critical business logic programs. Wire them into the pipeline.
+
+<strong>Step 6 — Staged deployment:</strong> Automate deployment to a test/staging environment from the main branch. Keep production deployment manual and approval-gated until confidence is high.
+
+Each step independently improves the development process. You do not need step 6 to benefit from step 1.
+
+<h2>Tooling summary</h2>
+
+<ul>
+<li><strong>Git</strong> — <code>yum install git</code> — source control in PASE</li>
+<li><strong>Bob (makei)</strong> — <code>yum install bob</code> — IBM i-aware build tool</li>
+<li><strong>RPGUnit</strong> — available from GitHub, installable via yum — unit testing for RPG</li>
+<li><strong>GNU Make</strong> — available in PASE — alternative build tool</li>
+<li><strong>GitHub Actions / Azure DevOps / Jenkins</strong> — CI orchestration, connects via SSH or self-hosted runner</li>
+<li><strong>ACS Source Orbit</strong> — IBM's own tool for migrating source from QSYS to IFS and integrating with Git; worth evaluating as a migration assistant</li>
+</ul>
+
+None of these require additional IBM licensing. The open-source tooling is available at no cost on any IBM i 7.3+ system with the OSS package repository configured.
+
+IBM i DevOps is not a project for the distant future. The tooling is stable, documented, and production-used by shops that have made the investment. The only thing standing between your current release process and an automated pipeline is the decision to start.
+
+<em>Next post: IBM i observability — monitoring performance with Collection Services, analysing system health with SQL, and what modern application-level logging looks like on a platform that predates the concept.</em>

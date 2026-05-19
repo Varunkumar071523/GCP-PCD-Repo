@@ -1,0 +1,358 @@
+The previous post covered building REST APIs that bridge IBM i and modern front ends. Before those APIs go anywhere near production, this post needs to happen.
+
+IBM i has a reputation for being secure. That reputation is partly deserved — the object-based architecture, integrated DB2, and single-level storage give IBM i structural security properties that Linux and Windows have to bolt on. But reputation is not configuration, and a misconfigured IBM i is as exposed as any other platform. The difference is that IBM i misconfiguration tends to be invisible: default settings that made sense in 1995, service profiles nobody has reviewed, exit programs that were never written.
+
+This post covers practical IBM i security hardening in 2026 — what to check, what to change, and what good looks like.
+
+<h2>Why IBM i security is different</h2>
+
+IBM i security is object-based. Every resource on the system — files, programs, queues, subsystems, devices — is an object. Authority to an object is controlled through user profiles and authorisation lists. This is fundamentally different from filesystem ACLs: you can control authority to run a program independently of authority to read the source code it was compiled from.
+
+The implication is that IBM i security configuration is more granular and more powerful than most administrators realise. It is also more layered: a user can gain access through adopted authority, group profiles, or *PUBLIC authority on an object even when their own profile has no explicit rights.
+
+The security model works well when it is actively managed. Most IBM i systems have not been actively managed since the system was installed.
+
+<h2>System security level (QSECURITY)</h2>
+
+The first thing to check is the system security level. Run this from a 5250 session or ACS:
+
+<pre>DSPSYSVAL SYSVAL(QSECURITY)</pre>
+
+The values:
+
+<ul>
+<li><strong>10</strong> — No security. Every user has full access to everything. Found only on ancient systems. Unacceptable in any environment connected to a network.</li>
+<li><strong>20</strong> — Password security only. User profiles require passwords but have access to all objects. Still too open for any production system.</li>
+<li><strong>30</strong> — Resource security. Authority checking is enforced. This is the minimum acceptable level for production.</li>
+<li><strong>40</strong> — Enhanced integrity. User-state programs cannot use privileged interfaces. Blocks a class of privilege escalation attacks. Recommended for all production systems.</li>
+<li><strong>50</strong> — Maximum security. Strict enforcement plus mandatory access control. Required for some regulated environments, but operationally demanding.</li>
+</ul>
+
+Most production IBM i systems should be running at level 40. If yours is at 30 or below, that is a remediable finding.
+
+<pre>CHGSYSVAL SYSVAL(QSECURITY) VALUE('40')</pre>
+
+Moving from 30 to 40 requires testing — some older programs use interfaces that level 40 blocks. Perform the change on a test partition first.
+
+<h2>Object authority — the foundation</h2>
+
+Every IBM i object has *PUBLIC authority — the authority level granted to any user who does not have explicit rights. The system default for new objects is *PUBLIC *CHANGE or *PUBLIC *USE depending on the object type. For most production libraries, *PUBLIC *EXCLUDE is the correct answer.
+
+<strong>Check *PUBLIC authority on critical libraries:</strong>
+
+<pre>DSPOBJAUT OBJ(ORDLIB) OBJTYPE(*LIB)</pre>
+
+If *PUBLIC shows *CHANGE or *USE on a library containing your business programs and data, that means every user on the system has access to everything in it.
+
+<strong>Revoke *PUBLIC access from production libraries:</strong>
+
+<pre>RVKOBJAUT OBJ(ORDLIB) OBJTYPE(*LIB) USER(*PUBLIC) AUT(*ALL)</pre>
+
+Then grant explicit authority to only the profiles that need it:
+
+<pre>GRTOBJAUT OBJ(ORDLIB) OBJTYPE(*LIB) USER(APPUSR) AUT(*USE)
+GRTOBJAUT OBJ(ORDLIB) OBJTYPE(*LIB) USER(BATCHUSR) AUT(*USE)</pre>
+
+<strong>Adopted authority</strong> is a mechanism that lets a program run with the authority of its owner rather than the calling user. This is legitimate and useful — it allows application users to execute programs without needing direct object authority. It becomes a risk when:
+
+<ul>
+<li>Programs are owned by a profile with *ALLOBJ (all-object authority)</li>
+<li>Adopted authority chains — one program adopts, calls another that also adopts, stacking authorities</li>
+<li>The adopting program can be called by any user, including service profiles</li>
+</ul>
+
+<strong>Find programs owned by *ALLOBJ profiles:</strong>
+
+<pre>SELECT OBJECT_NAME, OBJECT_TYPE, OBJECT_LIBRARY, OBJECT_OWNER
+FROM QSYS2.OBJECT_STATISTICS
+WHERE OBJECT_TYPE = '*PGM'
+  AND OBJECT_OWNER IN (
+      SELECT USER_NAME FROM QSYS2.USER_INFO
+      WHERE ALL_OBJECT = 'YES'
+  )
+ORDER BY OBJECT_LIBRARY, OBJECT_NAME</pre>
+
+Programs adopting *ALLOBJ should be audited. If a program does not need to own elevated authority, change its owner to a limited profile.
+
+<h2>Special authorities — who has *ALLOBJ</h2>
+
+*ALLOBJ special authority grants access to every object on the system. It is the IBM i equivalent of root. The list of profiles holding *ALLOBJ should be short, documented, and reviewed regularly.
+
+<strong>Who has *ALLOBJ right now:</strong>
+
+<pre>SELECT USER_NAME, PREVIOUS_SIGNON, STATUS, NO_PASSWORD
+FROM QSYS2.USER_INFO
+WHERE ALL_OBJECT = 'YES'
+ORDER BY PREVIOUS_SIGNON DESC</pre>
+
+What you are looking for:
+
+<ul>
+<li>Service profiles with *ALLOBJ that never sign on interactively — these are the highest-risk accounts if compromised</li>
+<li>Profiles with *ALLOBJ and NO_PASSWORD = 'YES' — they cannot be signed into but can still run programs with adopted authority</li>
+<li>Profiles with STATUS = '*DISABLED' that still hold *ALLOBJ — dormant accounts that could be re-enabled</li>
+<li>Any profile that is not QSECOFR, QSRV, or an explicitly documented administrator that holds *ALLOBJ</li>
+</ul>
+
+<strong>Reduce *ALLOBJ scope:</strong> Application service profiles should not have *ALLOBJ. Grant them only the specific object authorities they need. Use authorisation lists to manage access to groups of related objects consistently.
+
+<pre>-- Create an authorisation list
+CRTAUTL AUTL(ORDAPP_ACCESS) AUT(*EXCLUDE)
+
+-- Grant the app service profile access via the list
+ADDAUTLE AUTL(ORDAPP_ACCESS) USER(ORDSVC) AUT(*CHANGE)
+
+-- Secure objects using the list
+GRTOBJAUT OBJ(ORDLIB/ORDHDR) OBJTYPE(*FILE) USER(ORDAPP_ACCESS) AUT(*AUTL)</pre>
+
+<h2>Exit programs — IBM i network security</h2>
+
+Exit programs are one of the most powerful and most underused IBM i security mechanisms. When a network service (FTP, ODBC, DRDA, DDM, JDBC, remote command) receives a connection, IBM i calls a registered exit program before allowing the request to proceed. The exit program can inspect the connection — who is connecting, from where, what they are trying to do — and return an allow or deny decision.
+
+Without exit programs, IBM i network services allow any valid user profile to connect from any IP address. With exit programs, you can enforce:
+
+<ul>
+<li>IP allowlisting — only connections from known subnets are permitted</li>
+<li>Service-specific access — a profile can use JDBC but not FTP</li>
+<li>Time-of-day restrictions</li>
+<li>Logging of every network connection attempt</li>
+</ul>
+
+<strong>Check which exit points have programs registered:</strong>
+
+<pre>SELECT EXIT_POINT_NAME, FORMAT_NAME, EXIT_PROGRAM_LIBRARY, EXIT_PROGRAM_NAME
+FROM QSYS2.EXIT_POINT_INFO
+WHERE EXIT_POINT_NAME LIKE 'QIBM_QTMF%'
+   OR EXIT_POINT_NAME LIKE 'QIBM_QZDA%'
+   OR EXIT_POINT_NAME LIKE 'QIBM_QZSO%'
+ORDER BY EXIT_POINT_NAME</pre>
+
+Common exit points to cover:
+
+<ul>
+<li><code>QIBM_QTMF_FILE_REQ</code> — FTP file transfer requests</li>
+<li><code>QIBM_QTMF_SVR_REQ</code> — FTP server requests</li>
+<li><code>QIBM_QZDA_INIT</code> — DRDA/DDM database connections (JDBC, ODBC, client access)</li>
+<li><code>QIBM_QZDA_SQL1</code> / <code>QIBM_QZDA_SQL2</code> — SQL statements over database connections</li>
+<li><code>QIBM_QZSO_SIGNONSRV</code> — sign-on server (ACS, iSeries Navigator)</li>
+<li><code>QIBM_QPWFS_FILE_SERV</code> — NetServer file shares</li>
+</ul>
+
+A minimal exit program in RPG receives a data structure describing the connection request and sets an allow/deny indicator. Commercial tools (Powertech Exit Point Security, Assure Security) handle this without custom RPG. If you are writing your own, the IBM documentation for each exit point describes the format name and data structure.
+
+If your system has no exit programs registered on any of these exit points, every valid user profile can reach DB2, FTP, and the IFS from any network location. That is a common finding on IBM i systems that have never been through a security review.
+
+<h2>Network services — close what you are not using</h2>
+
+IBM i runs a significant number of network services by default. Many of them are unnecessary for most environments. Each open service is an attack surface.
+
+<strong>Check what is listening:</strong>
+
+<pre>-- Services configured to autostart
+SELECT SERVER_NAME, AUTOSTART, CURRENT_STATE
+FROM QSYS2.SERVER_SBS_ROUTING
+ORDER BY SERVER_NAME
+
+-- Active TCP/IP connections
+NETSTAT *CNN</pre>
+
+Services to evaluate for disabling if not in use:
+
+<ul>
+<li><strong>FTP (port 21)</strong> — Plain-text credentials. Disable unless you have a specific operational need. Use SFTP (port 22) instead.</li>
+<li><strong>Telnet (port 23)</strong> — Plain-text 5250 sessions. Disable in favour of TLS-encrypted 5250 over SSL Telnet (port 992) or SSH tunnelling.</li>
+<li><strong>DDM/DRDA (port 446/448)</strong> — Database access. Restrict via exit programs. Disable if not used for cross-system queries.</li>
+<li><strong>NetServer (SMB, ports 137/138/139/445)</strong> — File sharing. Disable if Windows file share access to the IFS is not required.</li>
+<li><strong>Management Central (ports 5555/5566)</strong> — Disable on any system not actively managed via iSeries Navigator endpoint management.</li>
+<li><strong>HTTP server admin (port 2001)</strong> — The web-based system administration interface. Restrict to management networks or disable if not used.</li>
+</ul>
+
+<strong>Disable a service:</strong>
+
+<pre>-- Example: disable FTP server autostart
+CHGFTPA AUTOSTART(*NO)
+
+-- Example: end an active FTP server instance
+ENDTCPSVR SERVER(*FTP)</pre>
+
+For services you keep running, ensure they are using TLS. IBM i's Digital Certificate Manager (DCM) manages certificates; configure each service to require encrypted connections and reject plain-text.
+
+<h2>User profile hygiene</h2>
+
+IBM i user profiles accumulate. Profiles are created for contractors, auditors, vendor support, batch jobs, and applications. When those people leave or those jobs change, the profiles often remain.
+
+<strong>Find profiles that have not been used recently:</strong>
+
+<pre>SELECT USER_NAME, TEXT_DESCRIPTION, STATUS,
+       PREVIOUS_SIGNON, DAYS_UNTIL_PASSWORD_EXPIRES,
+       NO_PASSWORD
+FROM QSYS2.USER_INFO
+WHERE STATUS = '*ENABLED'
+  AND (PREVIOUS_SIGNON IS NULL
+       OR PREVIOUS_SIGNON < CURRENT_TIMESTAMP - 90 DAYS)
+ORDER BY PREVIOUS_SIGNON NULLS FIRST</pre>
+
+<strong>Find profiles with no password (service profiles):</strong>
+
+<pre>SELECT USER_NAME, TEXT_DESCRIPTION, ALL_OBJECT, USER_CLASS
+FROM QSYS2.USER_INFO
+WHERE NO_PASSWORD = 'YES'
+  AND STATUS = '*ENABLED'
+ORDER BY ALL_OBJECT DESC, USER_NAME</pre>
+
+Profiles with no password cannot be signed into interactively but can still be used by programs with adopted authority or by batch jobs submitted under that profile. They need the same authority review as interactive profiles.
+
+<strong>Password policies:</strong>
+
+<pre>-- Check current password system values
+DSPSYSVAL SYSVAL(QPWDLVL)      -- Password level (3 = longer/complex passwords)
+DSPSYSVAL SYSVAL(QPWDMINLEN)   -- Minimum length
+DSPSYSVAL SYSVAL(QPWDMAXLEN)   -- Maximum length
+DSPSYSVAL SYSVAL(QPWDEXPITV)   -- Expiry interval in days
+DSPSYSVAL SYSVAL(QMAXSIGN)     -- Max failed sign-on attempts before lockout</pre>
+
+Recommended baseline:
+
+<pre>CHGSYSVAL SYSVAL(QPWDLVL) VALUE('3')       -- Long passwords, mixed case
+CHGSYSVAL SYSVAL(QPWDMINLEN) VALUE('12')
+CHGSYSVAL SYSVAL(QPWDEXPITV) VALUE('90')
+CHGSYSVAL SYSVAL(QMAXSIGN) VALUE('5')</pre>
+
+QPWDLVL 3 enables passwords up to 128 characters and is required before IBM i can participate in modern authentication schemes like Kerberos or password hash synchronisation with Active Directory.
+
+<h2>Auditing — QAUDJRN</h2>
+
+IBM i has a built-in security audit journal: QAUDJRN in QSYS. When auditing is configured, IBM i writes security-relevant events — sign-ons, authority failures, object access, program adoptions — to this journal. It is the primary forensic resource for any security incident.
+
+<strong>Enable the audit journal:</strong>
+
+<pre>-- Create the journal receiver and journal if they do not exist
+CRTJRNRCV JRNRCV(QSYS/QAUDJRN0001) THRESHOLD(100000)
+CRTJRN JRN(QSYS/QAUDJRN) JRNRCV(QSYS/QAUDJRN0001) MNGRCV(*SYSTEM)
+
+-- Configure system auditing
+CHGSYSVAL SYSVAL(QAUDCTL) VALUE('*AUDLVL *OBJAUD *NOQTEMP')
+CHGSYSVAL SYSVAL(QAUDLVL) VALUE('*AUTFAIL *CREATE *DELETE *OBJMGT *PGMFAIL *SAVRST *SECURITY *SERVICE *SYSMGT')</pre>
+
+<strong>Key audit entry types to monitor:</strong>
+
+<ul>
+<li><strong>AF (Authority Failure)</strong> — A user attempted to access an object they do not have authority to. High volume may indicate a misconfigured application or a probing attack.</li>
+<li><strong>CA (Change Authority)</strong> — Authority on an object was changed. Should match change control records.</li>
+<li><strong>CP (Change Profile)</strong> — A user profile was modified. Any change to *ALLOBJ or special authorities should be logged and reviewed.</li>
+<li><strong>PW (Password)</strong> — Failed password attempts. QMAXSIGN limits consecutive failures, but distributed attacks across multiple profiles will not trigger lockout.</li>
+<li><strong>SD (Start Debug)</strong> — Someone started a debug session. In production, this should be rare and authorised.</li>
+<li><strong>SK (Service Key Used)</strong> — A hardware service key or service tool was used. Should be extremely rare in production.</li>
+<li><strong>ZC (Authority Adopted)</strong> — A program adopted the owner's authority. Combined with AF entries, this helps trace privilege escalation paths.</li>
+</ul>
+
+<strong>Query recent authority failures:</strong>
+
+<pre>SELECT ENTRY_TIMESTAMP, USER_NAME, OBJECT_NAME, OBJECT_LIBRARY,
+       OBJECT_TYPE, VIOLATION_TYPE
+FROM TABLE(QSYS2.DISPLAY_JOURNAL(
+    JOURNAL_LIBRARY => 'QSYS',
+    JOURNAL_NAME    => 'QAUDJRN',
+    JOURNAL_ENTRY_TYPES => 'AF',
+    STARTING_TIMESTAMP => CURRENT_TIMESTAMP - 24 HOURS
+)) AS T
+ORDER BY ENTRY_TIMESTAMP DESC
+FETCH FIRST 100 ROWS ONLY</pre>
+
+If QAUDJRN does not exist on your system, you have no forensic trail for any security event that has ever occurred on it. Creating and configuring the audit journal is one of the highest-impact steps you can take.
+
+<h2>SSH and encrypted access</h2>
+
+IBM i has included an OpenSSH server in PASE since 7.1. If your users are still accessing 5250 over unencrypted Telnet, SSH tunnelling or TLS Telnet (port 992) is a straightforward improvement.
+
+<strong>Start the SSH daemon:</strong>
+
+<pre>STRTCPSVR SERVER(*SSHD)</pre>
+
+Configure <code>/QOpenSys/QIBM/UserData/SC1/OpenSSH/openssh/etc/sshd_config</code> with sensible defaults:
+
+<pre>PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+AllowUsers specific-admin-user another-admin
+MaxAuthTries 3
+ClientAliveInterval 300
+ClientAliveCountMax 2</pre>
+
+Key-based authentication with <code>PasswordAuthentication no</code> eliminates the password brute-force attack surface on SSH entirely.
+
+For ACS (Access Client Solutions) 5250 sessions, configure the connection profile to use SSL/TLS with a server certificate managed through DCM. This encrypts the session without changing the user experience.
+
+<h2>IFS permissions</h2>
+
+The IBM i Integrated File System (IFS) uses a POSIX-style permission model. The root of the IFS (<code>/</code>) on many systems is world-writable, which means any authenticated user can write to directories that applications read from.
+
+<strong>Check IFS root permissions:</strong>
+
+<pre>ls -la /</pre>
+
+<strong>Harden key IFS directories:</strong>
+
+<pre>CHGOWN OBJ('/') OWNER(QSYS)
+CHGAUT OBJ('/') USER(*PUBLIC) DTAAUT(*RX) SUBTREE(*ALL)</pre>
+
+Pay particular attention to:
+
+<ul>
+<li><code>/tmp</code> — Should be writable by all but not readable by all. Set sticky bit.</li>
+<li><code>/QIBM</code> — IBM system files. Should not be writable by application profiles.</li>
+<li>Any directory that your Node.js or PHP application reads configuration from — these should be owned by the service profile and not world-readable.</li>
+<li>Log directories — writable by the service profile, not readable by general users.</li>
+</ul>
+
+<h2>Practical hardening checklist</h2>
+
+A prioritised starting point for any IBM i security review:
+
+<strong>Immediate (highest risk, lowest effort):</strong>
+<ul>
+<li>Verify QSECURITY is 40 or above</li>
+<li>Find and review every profile with *ALLOBJ special authority</li>
+<li>Confirm QAUDJRN exists and QAUDCTL is configured</li>
+<li>Identify which network services are running and which exit points have no programs registered</li>
+</ul>
+
+<strong>Short-term (weeks):</strong>
+<ul>
+<li>Disable or lock unused user profiles (inactive for 90+ days)</li>
+<li>Revoke *PUBLIC *CHANGE authority from production libraries</li>
+<li>Disable FTP and Telnet if not operationally required</li>
+<li>Deploy exit programs on JDBC/ODBC, FTP, and sign-on exit points</li>
+<li>Enable SSH with key-based authentication for administrative access</li>
+</ul>
+
+<strong>Medium-term (months):</strong>
+<ul>
+<li>Implement QPWDLVL 3 and updated password system values</li>
+<li>Review adopted authority chains — programs owned by high-privilege profiles</li>
+<li>Harden IFS root permissions</li>
+<li>Configure TLS for all remaining network services</li>
+<li>Integrate QAUDJRN with a SIEM or log management platform</li>
+</ul>
+
+<h2>Security tools worth knowing</h2>
+
+<strong>IBM Security Guardium for IBM i</strong> — monitors DB2 activity and provides real-time alerting on sensitive data access. Enterprise-grade, enterprise cost.
+
+<strong>Powertech/Fortra Security Suite</strong> — commercial tools purpose-built for IBM i: exit point management, authority auditing, vulnerability scanning, and network access control. The most complete commercial option.
+
+<strong>Assure Security (Carbonetto)</strong> — another established commercial IBM i security platform with strong audit and compliance reporting.
+
+<strong>Open source / built-in:</strong> The SQL Services views in QSYS2 (<code>USER_INFO</code>, <code>OBJECT_STATISTICS</code>, <code>EXIT_POINT_INFO</code>, <code>DISPLAY_JOURNAL</code>) give you substantial visibility without any additional software. The queries in this post are all built on these views.
+
+IBM's own Security Reference documentation (available in IBM Documentation) remains the authoritative reference for every system value, exit point, and authority mechanism discussed here. It is dense but comprehensive.
+
+<h2>The realistic security posture</h2>
+
+IBM i security hardening is not a project with a finish line. It is a practice. Systems change — new applications install, new profiles are created, new services are enabled. What you configured today will drift without ongoing attention.
+
+The most effective thing most IBM i shops can do is not a comprehensive security programme — it is starting somewhere. Check QSECURITY. Query who has *ALLOBJ. Look at whether QAUDJRN exists. Those three checks take thirty minutes and will reveal the condition of almost any IBM i system's security configuration.
+
+The structural security of IBM i means that fixing these fundamentals has a significant impact. You do not need to solve everything at once. You need to know where you are before deciding where to go.
+
+<em>Next post: IBM i in a DevOps pipeline — source control with Git, automated builds with Bob or GNU Make, and what continuous integration looks like when your compilation target is QTEMP.</em>
