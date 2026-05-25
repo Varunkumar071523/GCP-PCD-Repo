@@ -1,0 +1,289 @@
+<p>The previous post covered calling external REST APIs from IBM i RPG using Scott Klement's HTTPAPI library — HTTP GET and POST, JSON parsing with YAJL, and handling OAuth 2.0 token flows from ILE RPG service programs. This post covers a topic that every IBM i administrator needs to understand thoroughly: system startup and shutdown procedures. Whether you are building a new IBM i environment, responding to an unplanned outage, or scheduling a maintenance window, knowing exactly what happens during an IPL and how to control it safely is essential operational knowledge.</p>
+
+<h2>The IBM i IPL Sequence</h2>
+
+<p>An IPL (Initial Programme Load) is the IBM i equivalent of a system boot. Unlike a PC restart, an IBM i IPL is a carefully orchestrated multi-phase process that initialises hardware, loads the Licensed Internal Code, starts the base operating system, and eventually hands control to your startup programme. Understanding each phase helps you diagnose failures precisely rather than guessing.</p>
+
+<p>The phases in order are:</p>
+<ul>
+  <li><strong>Hardware initialisation</strong> — The system processor, memory, and I/O bus are tested. Storage unit controllers are discovered. If hardware faults exist they surface here as SRC (System Reference Code) codes on the control panel.</li>
+  <li><strong>Licensed Internal Code (LIC)</strong> — The LIC is IBM i's microcode layer, analogous to firmware. It is loaded from the IPL source (A-side or B-side). The LIC establishes the technology-independent machine interface (TIMI) that insulates OS/400 from hardware specifics.</li>
+  <li><strong>OS/400 base operating system</strong> — The OS/400 kernel starts, QSYS library is mounted, and system objects (job queues, output queues, device descriptions, subsystem descriptions) are made available.</li>
+  <li><strong>Controlling subsystem start</strong> — The controlling subsystem (QCTL on most partitions, or QBASE on older configurations) is started by the OS. This subsystem handles the system console and provides the environment for further startup work.</li>
+  <li><strong>QSTRUP execution</strong> — The system value QSTRUPPGM points to a CL programme (default QSYS/QSTRUP) that is called as an autostart job. This is where TCP/IP, additional subsystems, and application environments are started.</li>
+</ul>
+
+<p>To see what happened during the last IPL, examine the QHST history log immediately after the system comes up:</p>
+
+<pre>DSPLOG LOG(QHST) PERIOD((*AVLRNG) (*AVLRNG)) OUTPUT(*PRINT)</pre>
+
+<p>You can also filter the history log to IPL-related messages specifically by piping through QSYSOPR messages with a time range matching the startup window.</p>
+
+<h2>IPL Modes and Types</h2>
+
+<p>IBM i supports several IPL modes, and choosing the wrong one can make a bad situation worse. The key distinctions are:</p>
+
+<ul>
+  <li><strong>Normal IPL</strong> — A clean, controlled restart. The previous shutdown completed successfully, journals were properly closed, and the system can start without disk repair work. This is what you get after <code>PWRDWNSYS OPTION(*CNTRLD)</code>.</li>
+  <li><strong>Abnormal IPL</strong> — Occurs after an uncontrolled power loss or a system hang that required a hard power-off. During an abnormal IPL, the OS performs journal recovery and disk synchronisation, which can take significantly longer than a normal IPL on systems with heavy journal activity.</li>
+  <li><strong>Attended IPL</strong> — The system pauses at the IPL options screen and waits for an operator to press Enter before proceeding. This allows you to change system values, start DST (Dedicated Service Tools), or select the IPL source before the OS loads. Set with <code>CHGIPLA ATTENDED(*YES)</code>.</li>
+  <li><strong>Unattended IPL</strong> — The system completes the IPL automatically without operator intervention. This is what you want for scheduled maintenance reboots. Set with <code>CHGIPLA ATTENDED(*NO)</code>.</li>
+  <li><strong>A-side vs B-side IPL source</strong> — IBM i keeps two copies of the LIC: the A-side (permanent copy, last IBM-applied) and the B-side (temporary, most recently applied PTF set). Normally you IPL from the B-side. If the B-side is corrupted, switching to the A-side (via <code>CHGIPLA IPLSRC(A)</code>) allows recovery.</li>
+  <li><strong>D-mode IPL (Dedicated Service Tools)</strong> — A special IPL mode that boots only DST, used for low-level disk recovery, password reset, and licenced internal code service. Triggered by setting the IPL source to D on the control panel.</li>
+  <li><strong>Remote IPL</strong> — Allows the system to be powered on via a network signal. Configured in the service attributes with <code>CHGSVCA RMTIPL(*ENABLED)</code>.</li>
+</ul>
+
+<p>To check and change IPL attributes without causing an immediate restart:</p>
+
+<pre>DSPSYSVAL SYSVAL(QIPLSTS)
+CHGIPLA ATTENDED(*NO) IPLSRC(B)</pre>
+
+<h2>QSTRUP — The System Startup Programme</h2>
+
+<p>QSTRUP is the programme name that IBM i calls as an autostart job in the controlling subsystem during IPL. By default it points to <code>QSYS/QSTRUP</code>, which starts QSYSWRK, QSERVER, QUSRWRK, and a few other IBM-supplied subsystems. The system value that controls this is <strong>QSTRUPPGM</strong>.</p>
+
+<p>You can point QSTRUPPGM to your own CL programme in any library:</p>
+
+<pre>CHGSYSVAL SYSVAL(QSTRUPPGM) VALUE('MYLIB/MYSTRUP')</pre>
+
+<p>The default QSYS/QSTRUP does not start TCP/IP, does not start application subsystems, and does not perform any site-specific initialisation. For any real production environment, you need a custom startup programme. The key principles for a good custom QSTRUP are:</p>
+<ul>
+  <li>Wait for dependent subsystems before starting those that depend on them.</li>
+  <li>Use <code>DLYJOB</code> sparingly — prefer checking subsystem status with <code>CHKOBJ</code> or a message wait loop.</li>
+  <li>Send a completion or failure message to QSYSOPR so operators know whether startup succeeded.</li>
+  <li>Log each step to a job log for post-IPL diagnostic review.</li>
+</ul>
+
+<h2>Starting TCP/IP at Startup</h2>
+
+<p>TCP/IP is not started automatically by the IBM i OS — it must be explicitly started in your QSTRUP programme or by an operator after IPL. The relevant commands and their correct order are:</p>
+
+<ul>
+  <li><strong>INZTCP</strong> — Initialises the TCP/IP stack, reads interface configuration from the system, and prepares the stack to accept STRTCP. This must run before STRTCP on a cold start to ensure a clean initialisation.</li>
+  <li><strong>STRTCP</strong> — Starts all active TCP/IP interfaces and routes. After STRTCP completes, the system is reachable on the network.</li>
+  <li><strong>STRTCPIFC INTNETADR('192.168.10.50')</strong> — Starts a single specific interface by IP address. Useful when you want to bring up interfaces selectively.</li>
+  <li><strong>STRHOSTSVR *ALL</strong> — Starts all IBM i host servers (database, data queue, file, print, network file, remote command, signon). These are used by Client Access, ACS, ODBC drivers, and iSeries Access for Windows.</li>
+</ul>
+
+<p>The correct startup sequence for TCP/IP in QSTRUP is:</p>
+
+<pre>/* Initialise then start TCP/IP */
+INZTCP
+STRTCP
+/* Start host servers for ACS and ODBC connections */
+STRHOSTSVR SERVER(*ALL)</pre>
+
+<p>If you omit INZTCP on systems that have been configured with multiple interfaces, you may find that some interfaces fail to start cleanly because the stack was left in a partially initialised state from the previous session. Always include INZTCP before STRTCP in an automated startup programme.</p>
+
+<h2>Starting Subsystems</h2>
+
+<p>IBM i uses subsystems to organise jobs into controlled environments. Each subsystem has its own routing entries, job queues, class definitions, and memory pool allocations. The startup sequence of subsystems matters because some subsystems depend on others.</p>
+
+<p>Key commands for subsystem management:</p>
+<ul>
+  <li><strong>STRSBS SBSD(library/subsystem)</strong> — Starts a subsystem using its subsystem description object.</li>
+  <li><strong>ENDSBS SBS(subsystem) OPTION(*CNTRLD) DELAY(seconds)</strong> — Ends a subsystem gracefully, allowing active jobs to finish within the delay period.</li>
+  <li><strong>WRKSBS</strong> — Interactive display of all active subsystems and their status.</li>
+  <li><strong>WRKSBSJOB SBS(subsystem)</strong> — Shows all active jobs within a specific subsystem.</li>
+</ul>
+
+<p>The typical startup order in a production IBM i environment is:</p>
+<ol>
+  <li>QSYSWRK — system work subsystem, required for host servers and many background jobs.</li>
+  <li>QSERVER — file server subsystem, required for IFS access and network file serving.</li>
+  <li>QUSRWRK — general interactive and batch user work subsystem.</li>
+  <li>TCP/IP (INZTCP, STRTCP, STRHOSTSVR).</li>
+  <li>Application subsystems — your own APPSBS or equivalent.</li>
+</ol>
+
+<p>To verify a subsystem has started before depending on it:</p>
+
+<pre>/* Check subsystem status before proceeding */
+CHKOBJ OBJ(QSYS/QSYSWRK) OBJTYPE(*SBSD)
+MONMSG MSGID(CPF9801) EXEC(GOTO CMDLBL(ERROREXIT))</pre>
+
+<h2>Complete Custom QSTRUP CL Programme</h2>
+
+<p>The following is a production-ready custom QSTRUP programme. Save this as source member MYSTRUP in a CL source file, then compile it with <code>CRTCLPGM PGM(MYLIB/MYSTRUP) SRCFILE(MYLIB/QCLSRC)</code> and point QSTRUPPGM to it.</p>
+
+<pre>/* ============================================================ */
+/* Programme:  MYSTRUP                                          */
+/* Library:    MYLIB                                            */
+/* Purpose:    Custom IBM i startup programme called by IPL     */
+/*             via system value QSTRUPPGM.                      */
+/* ============================================================ */
+PGM
+
+DCL VAR(&MSGDTA)  TYPE(*CHAR) LEN(256)
+DCL VAR(&SBSSTS)  TYPE(*CHAR) LEN(10)
+DCL VAR(&DELAY)   TYPE(*DEC)  LEN(5 0) VALUE(30)
+
+/* ── Step 1: Wait for QSYSWRK to be active ────────────────── */
+DLYJOB DLY(15)
+MONMSG MSGID(CPF0000)
+
+STRSBS SBSD(QSYS/QSYSWRK)
+MONMSG MSGID(CPF1010) /* Already active — not an error */
+
+DLYJOB DLY(5)
+
+/* ── Step 2: Start QSERVER (needed for IFS and file serving) ─ */
+STRSBS SBSD(QSYS/QSERVER)
+MONMSG MSGID(CPF1010)
+
+/* ── Step 3: Start QUSRWRK ───────────────────────────────── */
+STRSBS SBSD(QSYS/QUSRWRK)
+MONMSG MSGID(CPF1010)
+
+/* ── Step 4: Initialise and start TCP/IP ─────────────────── */
+INZTCP
+MONMSG MSGID(TCP0000 CPF0000)
+
+STRTCP
+MONMSG MSGID(TCP0000 CPF0000)
+
+DLYJOB DLY(10)
+
+/* ── Step 5: Start host servers for ACS and ODBC ────────── */
+STRHOSTSVR SERVER(*ALL)
+MONMSG MSGID(CPF0000 TCP0000)
+
+/* ── Step 6: Start application subsystem ────────────────── */
+STRSBS SBSD(APPLIB/APPSBS)
+MONMSG MSGID(CPF1010) /* Already active */
+MONMSG MSGID(CPF1021) EXEC(DO)
+    /* Subsystem description not found — log and continue */
+    CHGVAR VAR(&MSGDTA) VALUE('APPSBS subsystem description +
+        not found in APPLIB — skipping application startup')
+    SNDMSG MSG(&MSGDTA) TOMSGQ(QSYSOPR) MSGTYPE(*DIAG)
+ENDDO
+
+/* ── Step 7: Start FTP server ────────────────────────────── */
+STRTCPSVR SERVER(*FTP)
+MONMSG MSGID(CPF0000 TCP0000)
+
+/* ── Step 8: Confirm successful startup to QSYSOPR ──────── */
+SNDMSG MSG('IBM i custom startup complete: QSYSWRK, +
+    QSERVER, QUSRWRK, TCP/IP, STRHOSTSVR, APPSBS +
+    started successfully.') +
+    TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+
+RETURN
+
+ERROREXIT:
+SNDMSG MSG('IBM i startup WARNING: one or more startup +
+    steps failed. Review QSYSOPR and job log for details.') +
+    TOMSGQ(QSYSOPR) MSGTYPE(*DIAG)
+
+ENDPGM</pre>
+
+<p>After compiling and registering the programme, verify the system value has been updated correctly:</p>
+
+<pre>DSPSYSVAL SYSVAL(QSTRUPPGM)</pre>
+
+<p>The output should show <code>MYLIB/MYSTRUP</code>. To test the programme without performing an IPL, you can call it directly from a command line — it will simply attempt to start subsystems and TCP/IP, which will return "already active" messages rather than errors.</p>
+
+<h2>Controlled Shutdown with ENDSBS and PWRDWNSYS</h2>
+
+<p>Shutting down IBM i incorrectly is one of the most common causes of prolonged next-IPL recovery times. The controlled shutdown path should always be preferred over an immediate shutdown except in emergency situations.</p>
+
+<p>The shutdown sequence begins with subsystems. End application subsystems first, then the IBM-provided subsystems, then the controlling subsystem:</p>
+
+<pre>/* End application subsystem gracefully — allow 5 minutes */
+ENDSBS SBS(APPSBS) OPTION(*CNTRLD) DELAY(300)
+
+/* End QUSRWRK — allow interactive users 2 minutes to sign off */
+ENDSBS SBS(QUSRWRK) OPTION(*CNTRLD) DELAY(120)
+
+/* End all remaining subsystems with a 2-minute controlled delay */
+ENDSBS SBS(*ALL) OPTION(*CNTRLD) DELAY(120)</pre>
+
+<p>If you use <code>ENDSBS *ALL *CNTRLD</code> without first ending individual subsystems, the delay applies across all subsystems simultaneously, which is usually acceptable. However, for critical batch jobs you should end those subsystems individually with a longer delay.</p>
+
+<p>The difference between <code>OPTION(*CNTRLD)</code> and <code>OPTION(*IMMED)</code> is significant:</p>
+<ul>
+  <li><strong>*CNTRLD</strong> — Sends a controlled end request to all jobs in the subsystem. Jobs receive an OPM end-of-job indication and have the DELAY period to complete cleanly. Open files are flushed and closed. Journal entries are written. This produces a normal IPL next time.</li>
+  <li><strong>*IMMED</strong> — Terminates all jobs immediately without giving them time to clean up. Open files may have unflushed buffers. Journal recovery will be required at next IPL. Use only when *CNTRLD fails or in an emergency.</li>
+</ul>
+
+<p>Once subsystems are ended, power down the system:</p>
+
+<pre>/* Controlled power down — normal IPL next time */
+PWRDWNSYS OPTION(*CNTRLD) DELAY(120)
+
+/* Controlled power down with immediate restart (IPL) */
+PWRDWNSYS OPTION(*CNTRLD) DELAY(120) RESTART(*YES)
+
+/* Immediate power down — only for emergencies */
+PWRDWNSYS OPTION(*IMMED)</pre>
+
+<p><code>PWRDWNSYS RESTART(*YES)</code> ends the system and immediately begins an IPL — equivalent to a warm reboot. This is the standard command for applying PTFs or completing maintenance that requires a restart.</p>
+
+<h2>Scheduled Shutdown and Restart</h2>
+
+<p>Most production IBM i shops schedule a weekly or nightly IPL to apply PTFs, reclaim storage, and ensure the system performs a clean restart. The IBM i job scheduler (<code>ADDJOBSCDE</code>) handles this natively without any third-party tooling.</p>
+
+<p>To schedule a nightly maintenance IPL every Sunday at 02:00:</p>
+
+<pre>ADDJOBSCDE JOB(NIGHTLY_IPL) +
+    CMD(PWRDWNSYS OPTION(*CNTRLD) DELAY(300) RESTART(*YES)) +
+    FRQ(*WEEKLY) +
+    SCDDAY(*SUN) +
+    SCDTIME(020000) +
+    USER(QSECOFR) +
+    JOBD(QSYS/QPGMR) +
+    MSGQ(*USRPRF) +
+    TEXT('Weekly maintenance IPL — Sunday 02:00')</pre>
+
+<p>Before the PWRDWNSYS fires, it is good practice to run a pre-shutdown job that ends application subsystems gracefully first. You can achieve this with a two-step approach: schedule a subsystem-ending CL programme 30 minutes before the PWRDWNSYS job entry.</p>
+
+<pre>/* Schedule pre-shutdown job at 01:30 — ends application subsystem */
+ADDJOBSCDE JOB(PRESHUTDOWN) +
+    CMD(ENDSBS SBS(APPSBS) OPTION(*CNTRLD) DELAY(1200)) +
+    FRQ(*WEEKLY) +
+    SCDDAY(*SUN) +
+    SCDTIME(013000) +
+    USER(QSECOFR) +
+    TEXT('Pre-shutdown: end APPSBS before weekly IPL')</pre>
+
+<p>To verify the scheduled entries are configured correctly:</p>
+
+<pre>WRKJOBSCDE</pre>
+
+<p>This opens an interactive list of all job schedule entries. You can use option 6 to run a specific entry immediately for testing (it will execute the PWRDWNSYS command in a controlled test environment — be careful to test in a non-production partition first).</p>
+
+<h2>Startup Problems and Diagnosis</h2>
+
+<p>When an IBM i system does not start cleanly, the diagnostic path begins at the QSYSOPR message queue and the QHST log. Here are the most important diagnostic steps and common failure modes.</p>
+
+<p><strong>Check QSYSOPR after IPL:</strong></p>
+
+<pre>DSPMSG MSGQ(QSYS/QSYSOPR) MSGTYPE(*ALL)</pre>
+
+<p>Look for messages with severity 40 or above (critical errors) and messages from QSTRUP or subsystem start operations. Any CPF1021 (subsystem description not found) or CPF1013 (subsystem already active from previous session) errors indicate configuration problems to address.</p>
+
+<p><strong>Review the QHST history log for LIC-phase messages:</strong></p>
+
+<pre>DSPLOG LOG(QHST) MSGID(CPF0967)
+DSPLOG LOG(QHST) MSGID(CPF0968)</pre>
+
+<p>CPF0967 indicates the system detected an abnormal IPL and performed recovery. CPF0968 confirms recovery completed successfully. If you see CPF0967 without a subsequent CPF0968, disk recovery may still be in progress or may have failed.</p>
+
+<p><strong>Common startup failures and their solutions:</strong></p>
+<ul>
+  <li><strong>Subsystem description not found (CPF1021)</strong> — The SBSD object has been deleted or is in the wrong library. Restore it from the last save or recreate it with <code>CRTSBSD</code>. Ensure the library containing the SBSD is in the library list.</li>
+  <li><strong>Device allocation errors during controlling subsystem start</strong> — Usually means a display device or workstation controller is not responding. Check physical connections and use <code>WRKHDWRSC TYPE(*CMN)</code> to identify the controller status.</li>
+  <li><strong>QSTRUP ends abnormally (CPF0001 in QSTRUP job log)</strong> — Find the QSTRUP job log via <code>WRKJOB JOB(QSTRUP)</code> and examine the detailed message text. The most common cause is an unhandled error in a custom startup programme — add <code>MONMSG MSGID(CPF0000)</code> before key commands and ensure the programme ends with RETURN rather than falling through to an error condition.</li>
+  <li><strong>TCP/IP does not start</strong> — Check that the TCP/IP interface objects exist with <code>CFGTCP</code> option 1. Verify that the Ethernet adapter was recognised during IPL with <code>WRKHDWRSC TYPE(*CMN)</code>.</li>
+  <li><strong>Long abnormal IPL</strong> — Journal recovery on a large journal receiver can take hours. Monitor progress with <code>WRKACTJOB</code> looking for QJRN* system jobs that are actively processing. Do not interrupt an abnormal IPL; interrupting it will extend the recovery further.</li>
+</ul>
+
+<p><strong>Starting DST (Dedicated Service Tools) for low-level diagnosis:</strong></p>
+
+<pre>STRSST</pre>
+
+<p>DST provides access to disk configuration, LIC service functions, and system resource management outside the normal OS environment. From DST you can perform an SAVSYS restore, repair disk unit configuration, and examine hardware logs. DST requires the QSECOFR password or a dedicated DST user profile password.</p>
+
+<p>For systems that cannot complete an attended IPL to the QSTRUP stage, a D-mode IPL (booting to DST) is the recovery path. Set the control panel mode knob to Manual and select D as the IPL source, then power on. The system will boot to the DST menu where you can begin repairs without loading the full OS.</p>
+
+<em>Next post: AI-Assisted Legacy Code Documentation on IBM i — using large language models to generate inline documentation for RPG programs, extract business rules from legacy code, produce data dictionary entries from DDS field definitions, and build a searchable knowledge base from decades of IBM i source code.</em>

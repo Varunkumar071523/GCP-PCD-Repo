@@ -1,0 +1,644 @@
+The previous post covered Control Language — the command layer that controls the IBM i environment. This post moves to the language that handles the business logic: RPG.
+
+RPG has a reputation problem. Developers who have never worked on IBM i hear "RPG" and picture punch-card-era fixed-format code that counts columns and uses cryptic single-letter opcodes. That code exists in legacy systems, but it is not what RPG looks like today. Modern free-format RPG IV is a structured, readable language with prototyped procedures, embedded SQL, qualified data structures, and a binding model that supports proper modular design. The comparison is closer to COBOL versus modern Java than people expect.
+
+This post covers RPG from a current perspective: free-format structure, declarations, data structures, prototyped procedures, SQL integration, error handling, and what a modern RPG codebase actually looks like.
+
+<h2>A brief history worth knowing</h2>
+
+RPG has gone through several significant versions:
+
+<strong>RPG II / RPG III</strong> — fixed-format, column-dependent. Every specification type (F-spec, D-spec, C-spec, O-spec) occupied specific columns. Opcodes were two to six characters, padded. Readable only if you know the column positions. Still present in unmaintained legacy code.
+
+<strong>RPG IV (RPG/400, then ILE RPG)</strong> — introduced in V3R1. Still fixed-format by default but with longer names, better types, and the ILE binding model. Most IBM i shops have this vintage of RPG in production.
+
+<strong>Free-format RPG IV</strong> — introduced in stages from V5R1 onward, fully free-format (including H, F, D, P specs) from IBM i 7.1 TR7 / 7.2 TR3. This is current RPG. Source compiles with CRTBNDRPG or CRTRPGMOD using SRCSTMF for IFS-based source. File extension convention: <code>.rpgle</code> for fixed-format, <code>.sqlrpgle</code> for embedded SQL source.
+
+For any new development, write fully free-format RPG IV. Everything in this post uses free-format syntax.
+
+<h2>Program structure</h2>
+
+A minimal free-format RPG program:
+
+<pre>**FREE
+ctl-opt dftactgrp(*no) actgrp('ORDGRP') option(*srcstmt *nodebugio);
+
+dcl-f ORDHDR disk(*ext) keyed usage(*input);
+
+dcl-s ordNum  char(7);
+dcl-s custNum char(10);
+
+//---------------------------------------------------------
+// mainline
+//---------------------------------------------------------
+ordNum = 'ORD0143';
+chain (ordNum) ORDHDR;
+
+if %found(ORDHDR);
+  custNum = OHCUST;
+  dsply ('Order found for customer: ' + %trim(custNum));
+endif;
+
+*inlr = *on;
+return;</pre>
+
+<strong>Key structural elements:</strong>
+<ul>
+<li><code>**FREE</code> — signals fully free-format source; must be on line 1, column 1</li>
+<li><code>ctl-opt</code> — control options (replaces H-spec). <code>dftactgrp(*no)</code> is required for ILE programs; <code>actgrp</code> sets the activation group</li>
+<li><code>dcl-f</code> — file declaration (replaces F-spec)</li>
+<li><code>dcl-s</code> — standalone variable declaration (replaces D-spec with blank subtype)</li>
+<li><code>*inlr = *on</code> — "last record" indicator; setting it on before return closes files and ends the program cleanly</li>
+</ul>
+
+<h2>Data types and declarations</h2>
+
+<pre>**FREE
+
+// Standalone variables
+dcl-s custName   char(40);
+dcl-s ordAmt     packed(11:2);
+dcl-s lineCount  int(10);
+dcl-s isActive   ind;              // indicator (boolean)
+dcl-s ordDate    date(*iso);
+dcl-s procTime   time(*iso);
+dcl-s ordStamp   timestamp;
+dcl-s bigText    varchar(1000);
+dcl-s rawBytes   char(512) ccsid(*utf8);</pre>
+
+<strong>Common RPG data types:</strong>
+<ul>
+<li><code>char(n)</code> — fixed-length character, blank-padded</li>
+<li><code>varchar(n)</code> — variable-length character; length prefix stored with data</li>
+<li><code>packed(p:d)</code> — packed decimal, p digits total, d decimal places</li>
+<li><code>zoned(p:d)</code> — zoned decimal (less common in new code)</li>
+<li><code>int(n)</code> — integer; valid sizes are 3, 5, 10, 20 (bytes: 1, 2, 4, 8)</li>
+<li><code>uns(n)</code> — unsigned integer</li>
+<li><code>float(n)</code> — floating point; 4 or 8 bytes</li>
+<li><code>ind</code> — indicator; single character, <code>*on</code> (true) or <code>*off</code> (false)</li>
+<li><code>date</code>, <code>time</code>, <code>timestamp</code> — date/time types with format options</li>
+<li><code>pointer</code> — system pointer (for API calls)</li>
+</ul>
+
+<h2>Data structures</h2>
+
+Data structures are one of RPG's most powerful features. A data structure groups related fields and allows them to be treated as a unit.
+
+<strong>Basic data structure:</strong>
+
+<pre>dcl-ds orderHeader qualified;
+  ordNum    char(7);
+  custNum   char(10);
+  ordDate   date(*iso);
+  ordAmt    packed(11:2);
+  ordStatus char(2);
+end-ds;</pre>
+
+The <code>qualified</code> keyword means fields are accessed as <code>orderHeader.ordNum</code>, preventing naming conflicts in programs with multiple data structures.
+
+<strong>Data structure based on a file's record format:</strong>
+
+<pre>dcl-ds ordHdrRec likerec(ORDHDR:*input) qualified;</pre>
+
+<code>likerec</code> creates a data structure with the same fields as the specified file's record format — eliminates manual field declarations for database record work.
+
+<strong>Data structure based on another data structure (template):</strong>
+
+<pre>dcl-ds orderTemplate qualified template;
+  ordNum    char(7);
+  custNum   char(10);
+  ordAmt    packed(11:2);
+end-ds;
+
+// Create instances based on the template
+dcl-ds currentOrder likeds(orderTemplate);
+dcl-ds previousOrder likeds(orderTemplate);</pre>
+
+<strong>Arrays of data structures:</strong>
+
+<pre>dcl-ds lineItem qualified dim(100);
+  itemNum  char(10);
+  qty      int(10);
+  price    packed(9:2);
+  extended packed(11:2);
+end-ds;
+
+// Access via index
+lineItem(1).itemNum = 'ITM00001';
+lineItem(1).qty     = 3;
+lineItem(1).price   = 29.99;</pre>
+
+<strong>Subfield overlays (for data conversion and legacy interfaces):</strong>
+
+<pre>dcl-ds dateFields;
+  fullDate  char(8);
+  dateYear  char(4) pos(1);
+  dateMon   char(2) pos(5);
+  dateDay   char(2) pos(7);
+end-ds;</pre>
+
+<code>pos(n)</code> positions the subfield at a specific offset within the structure — useful when interfacing with fixed-format legacy record layouts.
+
+<h2>Prototyped procedures</h2>
+
+Prototyped procedures are the foundation of modular RPG design. A prototype (<code>dcl-pr</code>) declares the interface; a procedure interface (<code>dcl-pi</code>) defines it in the implementation.
+
+<strong>Declaring and defining a subprocedure:</strong>
+
+<pre>**FREE
+ctl-opt dftactgrp(*no) actgrp('ORDGRP') option(*srcstmt);
+
+// Prototype (declaration)
+dcl-pr calcDiscount packed(7:2) extproc('CALCDISCOUNT');
+  ordAmt    packed(11:2) const;
+  custClass char(2)      const;
+end-pr;
+
+//=============================================================
+// Subprocedure implementation
+//=============================================================
+dcl-proc calcDiscount;
+  dcl-pi *n packed(7:2);
+    ordAmt    packed(11:2) const;
+    custClass char(2)      const;
+  end-pi;
+
+  dcl-s discountRate packed(5:4);
+  dcl-s discountAmt  packed(7:2);
+
+  select;
+    when custClass = 'AA';
+      discountRate = 0.15;
+    when custClass = 'BB';
+      discountRate = 0.10;
+    other;
+      discountRate = 0.05;
+  endsl;
+
+  discountAmt = ordAmt * discountRate;
+  return discountAmt;
+
+end-proc;</pre>
+
+<strong>Key procedure concepts:</strong>
+<ul>
+<li><code>const</code> on a parameter means the procedure cannot modify the caller's variable — the RPG equivalent of pass-by-value for the caller's perspective</li>
+<li>Without <code>const</code>, parameters are passed by reference; the procedure can modify the caller's variable</li>
+<li><code>options(*omit)</code> makes a parameter optional</li>
+<li><code>value</code> passes by value (a copy is made)</li>
+<li>Procedures return a value via the <code>dcl-pi</code> return type and <code>return</code> statement</li>
+</ul>
+
+<strong>Calling a procedure in a service program:</strong>
+
+<pre>// Prototype for external procedure in service program ORDUTILS
+dcl-pr getCustomerClass char(2) extproc(*dclcase);
+  custNum char(10) const;
+end-pr;
+
+// Call is identical to a local procedure
+dcl-s custClass char(2);
+custClass = getCustomerClass('CUST00001');</pre>
+
+<code>extproc(*dclcase)</code> tells the compiler the external procedure name matches the prototype name exactly (respecting case), rather than being forced to uppercase.
+
+<h2>Control flow</h2>
+
+Modern free-format RPG uses readable structured control flow:
+
+<pre>// IF / ELSEIF / ELSE
+if ordAmt > 10000;
+  discountRate = 0.15;
+elseif ordAmt > 5000;
+  discountRate = 0.10;
+else;
+  discountRate = 0.05;
+endif;
+
+// SELECT / WHEN (like a switch statement)
+select;
+  when ordStatus = 'OP';
+    processOpenOrder();
+  when ordStatus = 'CL';
+    processClosedOrder();
+  when ordStatus = 'HL';
+    processHeldOrder();
+  other;
+    logUnknownStatus(ordStatus);
+endsl;
+
+// DOW (do while)
+dow lineCount > 0;
+  processLine(lineCount);
+  lineCount -= 1;
+enddo;
+
+// FOR (counted loop)
+for idx = 1 to %elem(lineItem);
+  if lineItem(idx).qty > 0;
+    processLineItem(lineItem(idx));
+  endif;
+endfor;
+
+// ITER and LEAVE (continue and break)
+for idx = 1 to %elem(lineItem);
+  if lineItem(idx).qty = 0;
+    iter;          // skip to next iteration
+  endif;
+  if lineItem(idx).itemNum = *blanks;
+    leave;         // exit the loop
+  endif;
+  processLineItem(lineItem(idx));
+endfor;</pre>
+
+<h2>Built-in functions</h2>
+
+RPG's built-in functions (BIFs) handle the operations that would require utility procedures in other languages:
+
+<pre>// String operations
+dcl-s fullName  varchar(80);
+dcl-s firstName char(40);
+dcl-s lastName  char(40);
+
+fullName  = %trim(firstName) + ' ' + %trim(lastName);
+lineCount = %len(%trim(fullName));
+
+// Numeric conversion
+dcl-s amtStr char(15);
+dcl-s amt    packed(11:2);
+
+amtStr = %char(amt);           // numeric to char
+amt    = %dec(amtStr : 11 : 2);// char to packed
+
+// Date operations
+dcl-s today     date(*iso);
+dcl-s dueDate   date(*iso);
+dcl-s daysUntil int(10);
+
+today     = %date();
+dueDate   = today + %days(30);
+daysUntil = %diff(dueDate : today : *days);
+
+// Array and data structure
+dcl-s arrSize int(10);
+arrSize = %elem(lineItem);     // number of elements
+
+// Error checking
+if %error();                   // true if last I/O or conversion had an error
+  // handle error
+endif;
+
+if %found(ORDHDR);             // true if last keyed read found a record
+  // process record
+endif;</pre>
+
+<h2>Embedded SQL (SQLRPGLE)</h2>
+
+When the source member type is <code>SQLRPGLE</code> (or the IFS file extension is <code>.sqlrpgle</code>), the SQL precompiler processes the source before the RPG compiler. This allows SQL statements to be embedded directly in RPG.
+
+<strong>Single-row fetch into host variables:</strong>
+
+<pre>**FREE
+ctl-opt dftactgrp(*no) actgrp('ORDGRP') option(*srcstmt);
+
+dcl-s custNum  char(10);
+dcl-s custName varchar(40);
+dcl-s creditLim packed(11:2);
+dcl-s sqlCode  int(10);
+
+custNum = 'CUST00001';
+
+exec sql
+  select CUSTNAME, CREDITLIM
+  into   :custName, :creditLim
+  from   CUSTLIB.CUSTOMER
+  where  CUSTNUM = :custNum;
+
+sqlCode = SQLCODE;
+
+if sqlCode = 0;
+  dsply ('Customer: ' + %trim(custName));
+elseif sqlCode = 100;
+  dsply 'Customer not found';
+else;
+  dsply ('SQL error: ' + %char(sqlCode));
+endif;
+
+*inlr = *on;</pre>
+
+Host variables in SQL statements are prefixed with a colon (<code>:custNum</code>). The SQL precompiler replaces them with proper parameter markers at compile time.
+
+<strong>Cursor for multi-row processing:</strong>
+
+<pre>dcl-s ordNum   char(7);
+dcl-s ordAmt   packed(11:2);
+dcl-s ordDate  date(*iso);
+dcl-s totalAmt packed(13:2) inz(0);
+
+exec sql declare ordCursor cursor for
+  select ORDNUM, ORDAMT, ORDDATE
+  from   ORDLIB.ORDHDR
+  where  ORDSTS = 'OP'
+    and  CUSTNUM = :custNum
+  order  by ORDDATE;
+
+exec sql open ordCursor;
+
+dow sqlcode = 0;
+  exec sql fetch ordCursor into :ordNum, :ordAmt, :ordDate;
+  if sqlcode <> 0;
+    leave;
+  endif;
+  totalAmt += ordAmt;
+  processOrder(ordNum);
+enddo;
+
+exec sql close ordCursor;</pre>
+
+<strong>Using SQLSTATE for portable error checking:</strong>
+
+<pre>dcl-s sqlState char(5);
+
+exec sql
+  update ORDLIB.ORDHDR
+  set    ORDSTS = 'CL',
+         CLSDAT = current_date
+  where  ORDNUM = :ordNum;
+
+sqlState = SQLSTATE;
+
+select;
+  when sqlState = '00000';
+    // success
+  when sqlState = '02000';
+    logMsg('Order not found for close: ' + ordNum);
+  other;
+    logMsg('SQL error ' + sqlState + ' closing order ' + ordNum);
+    // escalate
+endsl;</pre>
+
+<strong>Declaring a result set variable (for stored procedure output):</strong>
+
+<pre>dcl-ds custRow qualified;
+  custNum   char(10);
+  custName  varchar(40);
+  creditLim packed(11:2);
+  custClass char(2);
+end-ds;
+
+exec sql
+  select CUSTNUM, CUSTNAME, CREDITLIM, CUSTCLASS
+  into   :custRow
+  from   CUSTLIB.CUSTOMER
+  where  CUSTNUM = :searchCust
+  fetch first 1 rows only;</pre>
+
+Using a qualified data structure as a single SQL host variable is a clean pattern — all columns map to structure subfields without listing each variable separately.
+
+<h2>Error handling in RPG</h2>
+
+RPG uses a combination of indicators, built-in functions, and the <code>monitor</code> group for error handling.
+
+<strong>Monitor group (structured exception handling):</strong>
+
+<pre>monitor;
+  // Code that might fail
+  chain (ordNum) ORDHDR;
+  if not %found(ORDHDR);
+    logMsg('Order not found: ' + ordNum);
+    return;
+  endif;
+
+  // Process the record
+  processOrderHeader(ordHdrRec);
+
+on-error *file;
+  logMsg('File error accessing ORDHDR for order: ' + ordNum);
+  // do not re-raise — caller handles absence of result
+
+on-error *program;
+  logMsg('Program error in order processing');
+  // re-raise so caller knows something went wrong
+  callp %error();  // this form re-raises the current exception
+
+on-error;
+  // catch-all for any other error
+  logMsg('Unexpected error');
+endmon;</pre>
+
+<strong>Error subfile with <code>%error()</code> and <code>noopt</code>:</strong>
+
+<pre>dcl-s errFound ind;
+
+// Use *noopt annotation to prevent optimizer from removing error checks
+read(e) ORDHDR;      // (e) extender — error indicator instead of halt
+errFound = %error();
+
+if errFound;
+  logMsg('Read error on ORDHDR');
+  *inlr = *on;
+  return;
+endif;</pre>
+
+The <code>(e)</code> operation extender tells RPG to set the <code>%error()</code> BIF on I/O errors instead of halting the program. This gives more control than the default behaviour of abnormal program end on file errors.
+
+<h2>Service programs</h2>
+
+A service program is a compiled RPG module (or set of modules) bound together into a shareable library of procedures. It is the IBM i equivalent of a shared library or DLL.
+
+<strong>Creating a service program:</strong>
+
+<pre>// ORDUTILS.rpgle — module source
+**FREE
+ctl-opt nomain;   // no main procedure — this is a module, not a program
+
+dcl-pr getCustomerClass char(2) extproc(*dclcase);
+  custNum char(10) const;
+end-pr;
+
+dcl-pr formatOrderNum char(10) extproc(*dclcase);
+  numericId int(10) const;
+end-pr;
+
+dcl-proc getCustomerClass export;
+  dcl-pi *n char(2);
+    custNum char(10) const;
+  end-pi;
+  // ... implementation ...
+  return 'AA';
+end-proc;
+
+dcl-proc formatOrderNum export;
+  dcl-pi *n char(10);
+    numericId int(10) const;
+  end-pi;
+  return 'ORD' + %editc(numericId : 'X');
+end-proc;</pre>
+
+<code>nomain</code> on <code>ctl-opt</code> means the module has no mainline — it is a library of procedures only. <code>export</code> on each <code>dcl-proc</code> makes it available to bound programs.
+
+<strong>Binding to a service program:</strong>
+
+<pre>// CRTRPGMOD to compile the module
+CRTRPGMOD MODULE(ORDLIB/ORDUTILS) SRCSTMF('/repo/src/rpgle/ORDUTILS.rpgle') DBGVIEW(*SOURCE)
+
+// CRTSRVPGM to create the service program
+CRTSRVPGM SRVPGM(ORDLIB/ORDUTILS) MODULE(ORDLIB/ORDUTILS) EXPORT(*ALL)
+
+// CRTBNDRPG to create a calling program bound to the service program
+CRTBNDRPG PGM(ORDLIB/CRTORD) SRCSTMF('/repo/src/rpgle/CRTORD.rpgle') +
+          BNDDIR(ORDLIB/ORDUTILS)</pre>
+
+The binding directory (<code>BNDDIR</code>) points to a list of service programs to bind against. When the calling program is activated, the service program is also activated, and its exported procedures are available.
+
+<h2>Common patterns in modern RPG</h2>
+
+<strong>Passing data structures between procedures (avoiding long parameter lists):</strong>
+
+<pre>dcl-ds orderRequest qualified template;
+  custNum   char(10);
+  itemNum   char(10);
+  qty       int(10);
+  reqDate   date(*iso);
+  warehouse char(4);
+end-ds;
+
+dcl-pr createOrder char(7) extproc(*dclcase);
+  request likeds(orderRequest) const;
+end-pr;</pre>
+
+Grouping parameters into a data structure is the standard RPG pattern for procedures with many inputs. It is also forward-compatible — adding a field to the structure does not break the procedure's signature.
+
+<strong>Null-capable host variables for SQL:</strong>
+
+<pre>dcl-s shipDate   date(*iso);
+dcl-s shipDateNull int(5);   // null indicator: 0 = not null, -1 = null
+
+exec sql
+  select SHIPDATE
+  into   :shipDate :shipDateNull
+  from   ORDLIB.ORDHDR
+  where  ORDNUM = :ordNum;
+
+if shipDateNull = -1;
+  // order not yet shipped
+else;
+  dsply ('Shipped: ' + %char(shipDate));
+endif;</pre>
+
+The null indicator variable follows the host variable with a colon separator in the SQL statement. A value of <code>-1</code> means the column is null.
+
+<strong>Reading all records from a file with %eof:</strong>
+
+<pre>read ORDHDR;
+dow not %eof(ORDHDR);
+  processRecord();
+  read ORDHDR;
+enddo;</pre>
+
+<h2>What modern RPG actually looks like</h2>
+
+The narrative that RPG is unreadable does not survive contact with a modern SQLRPGLE program. Here is a realistic excerpt:
+
+<pre>**FREE
+ctl-opt dftactgrp(*no) actgrp('ORDGRP') option(*srcstmt *nodebugio);
+
+/copy ORDLIB/QRPGLECPY,ORDTYPES    // shared type definitions
+
+dcl-s custNum  char(10);
+dcl-s today    date(*iso);
+dcl-s totalAmt packed(13:2) inz(0);
+dcl-s errMsg   varchar(200);
+
+dcl-ds orderSummary qualified;
+  ordCount  int(10) inz(0);
+  totalAmt  packed(13:2) inz(0);
+  latestOrd char(7);
+end-ds;
+
+//=============================================================
+// Main entry
+//=============================================================
+dcl-proc main export;
+  dcl-pi *n ind;
+    inCustNum char(10) const;
+  end-pi;
+
+  custNum = inCustNum;
+  today   = %date();
+
+  if not loadCustomerOrders();
+    return *off;
+  endif;
+
+  return *on;
+end-proc;
+
+//=============================================================
+// Load open orders for a customer
+//=============================================================
+dcl-proc loadCustomerOrders;
+  dcl-pi *n ind;
+  end-pi;
+
+  dcl-s ordNum  char(7);
+  dcl-s ordAmt  packed(11:2);
+
+  exec sql declare custOrdCsr cursor for
+    select ORDNUM, ORDAMT
+    from   ORDLIB.ORDHDR
+    where  CUSTNUM = :custNum
+      and  ORDSTS  = 'OP'
+    order  by ORDDAT desc;
+
+  exec sql open custOrdCsr;
+
+  dow sqlcode = 0;
+    exec sql fetch custOrdCsr into :ordNum, :ordAmt;
+    if sqlcode = 100;
+      leave;
+    elseif sqlcode <> 0;
+      logError('Cursor fetch error: ' + %char(sqlcode));
+      exec sql close custOrdCsr;
+      return *off;
+    endif;
+
+    orderSummary.ordCount += 1;
+    orderSummary.totalAmt += ordAmt;
+    orderSummary.latestOrd = ordNum;
+  enddo;
+
+  exec sql close custOrdCsr;
+  return *on;
+end-proc;</pre>
+
+This is readable, structured, and directly comparable to code you would see in any other ILE language. The columns are gone. The cryptic opcodes are gone. The logic reads in sequence.
+
+<h2>Compiling modern RPG from the IFS</h2>
+
+In a proper DevOps pipeline (as covered in Post 17), RPG source lives in the IFS under Git and is compiled with commands that reference the IFS path:
+
+<pre>// Compile RPG module from IFS source
+CRTRPGMOD MODULE(ORDLIB/CRTORD) +
+           SRCSTMF('/home/build/project-repo/src/rpgle/CRTORD.rpgle') +
+           DBGVIEW(*SOURCE) +
+           OPTION(*SRCSTMT)
+
+// Compile bound RPG program (module + bind in one step)
+CRTBNDRPG PGM(ORDLIB/CRTORD) +
+           SRCSTMF('/home/build/project-repo/src/rpgle/CRTORD.rpgle') +
+           DBGVIEW(*SOURCE) +
+           BNDDIR(ORDLIB/ORDUTILS)
+
+// Compile SQL RPG
+CRTSQLRPGI OBJ(ORDLIB/ORDSUMRY) +
+            SRCSTMF('/home/build/project-repo/src/sqlrpgle/ORDSUMRY.sqlrpgle') +
+            COMMIT(*NONE) +
+            DBGVIEW(*SOURCE) +
+            OBJTYPE(*PGM)</pre>
+
+<code>DBGVIEW(*SOURCE)</code> embeds the source mapping in the compiled object so the IBM i debugger can show the actual source lines. <code>OPTION(*SRCSTMT)</code> enables statement-level debugging from IFS source. Both are essential for productive development.
+
+RPG is not the language that gets described when people say "we need to modernise away from AS/400." It is a capable ILE language with SQL integration, modern control flow, and a proper binding model. The modernisation question for RPG shops is not what language to replace it with — it is whether the existing RPG code uses the current language features, or whether it is fixed-format OPM code that could benefit from being rewritten in free-format ILE RPG with proper SQL integration and a clean service program architecture.
+
+<em>Next post: DB2 for i — how IBM i's integrated database actually works, why it is not just "a database running on AS/400," SQL system naming versus library naming, physical and logical files versus SQL tables and views, and the query optimizer features specific to DB2 for i.</em>

@@ -1,0 +1,387 @@
+The previous post covered RPG in 2026 — free-format ILE RPG IV with embedded SQL, prototyped procedures, and service programs. This post focuses on the database underneath it all: DB2 for i.
+
+DB2 for i is not a separate database product running alongside IBM i. It is integrated into the operating system. There is no database server process to start, no connection string to a port, no separate installation. The database is the file system — physical files, logical files, SQL tables, and SQL views are all objects in IBM i libraries, managed by the same security model and auditing framework that applies to programs and data areas. Understanding DB2 for i means understanding how IBM i stores and retrieves data, which is different in several important ways from standalone database servers like PostgreSQL, SQL Server, or Oracle.
+
+This post covers the architecture of DB2 for i, the dual-namespace reality of DDS physical/logical files alongside SQL tables and views, query optimisation features specific to the platform, and the SQL patterns that matter most for practical IBM i development.
+
+<h2>DB2 for i is not a standalone RDBMS</h2>
+
+On a conventional system, a database server is a process — you start it, connect to it via TCP, and it manages its own storage. DB2 for i is different: the database is implemented in the Licensed Internal Code (LIC), the lowest layer of the OS. Storage management, journalling, commitment control, and query execution are all operating system functions.
+
+<strong>Consequences of this architecture:</strong>
+<ul>
+<li>No separate database startup. IBM i starts, the database is available. There is no equivalent of <code>systemctl start postgresql</code>.</li>
+<li>Objects in libraries are database objects. A physical file is a table. A logical file is an index or view. A program is an object with the same security model as a table.</li>
+<li>Journalling (the IBM i equivalent of write-ahead logging) is a system service, not a database service. You can journal any object — programs, data areas, user-defined files — not just database tables.</li>
+<li>Commitment control (transactions) is also a system service. Programs commit and roll back without needing a database connection; the system manages it.</li>
+<li>Query execution uses the System Query Optimiser (SQO), which builds access plans based on statistics maintained at the system level and stored in the plan cache.</li>
+</ul>
+
+<h2>Two naming models: system naming and SQL naming</h2>
+
+IBM i has two ways to refer to database objects, and the difference matters constantly in practice.
+
+<strong>System naming</strong> uses the library/object format: <code>ORDLIB/ORDHDR</code>. This is the native IBM i convention. CL commands, RPG F-specs, and OPNQRYF all use system naming. The library list is searched when an unqualified name is used.
+
+<strong>SQL naming</strong> uses the schema.table format: <code>ORDLIB.ORDHDR</code>. SQL statements, JDBC connections, ODBC connections, and interactive SQL (STRSQL / ACS Run SQL Scripts) use SQL naming by default. The library list is not searched in SQL naming; unqualified names resolve to the default schema (the current user's profile name, unless CURRENT SCHEMA is set).
+
+<strong>Setting the current schema in SQL:</strong>
+
+<pre>SET CURRENT SCHEMA = 'ORDLIB';
+
+-- Now unqualified names resolve to ORDLIB
+SELECT * FROM ORDHDR WHERE ORDSTS = 'OP';</pre>
+
+<strong>Switching between models in JDBC:</strong>
+
+<pre>// System naming — library list used for unqualified names
+Connection conn = DriverManager.getConnection(
+    "jdbc:as400://mysystem;naming=system;libraries=ORDLIB,COMMLIB,QGPL"
+);
+
+// SQL naming — default schema used for unqualified names
+Connection conn = DriverManager.getConnection(
+    "jdbc:as400://mysystem;naming=sql;default schema=ORDLIB"
+);</pre>
+
+The naming= parameter on the IBM Toolbox for Java (jt400) JDBC URL controls which model is used. Getting this wrong is one of the most common sources of "table not found" errors when connecting external applications to IBM i.
+
+<h2>Physical files and logical files versus SQL tables and views</h2>
+
+IBM i has two object types for database storage, reflecting its history before SQL was added to the platform.
+
+<strong>Physical files (PF)</strong> are defined using DDS (Data Description Specifications) and created with CRTPF. They store data in records with fixed-length fields. Each physical file has at least one member — the default member has the same name as the file. Multiple members allow a single file to hold separate data sets (year-based partitioning, for example).
+
+<pre>-- Viewing a physical file's structure via SQL
+SELECT COLUMN_NAME, DATA_TYPE, LENGTH, NUMERIC_SCALE, IS_NULLABLE
+FROM   QSYS2.SYSCOLUMNS
+WHERE  TABLE_SCHEMA = 'ORDLIB'
+  AND  TABLE_NAME   = 'ORDHDR'
+ORDER  BY ORDINAL_POSITION;</pre>
+
+<strong>Logical files (LF)</strong> are defined with DDS over one or more physical files. They provide alternative access paths — keyed sequences, record selection (omit/select), field selection, and joins over multiple physical files. A logical file is the DDS equivalent of an SQL index plus a view in a single object.
+
+<strong>SQL tables</strong> created with <code>CREATE TABLE</code> are stored the same way as physical files at the LIC level — they are physical file objects. They do not use members by default; they use a single-member design. They support SQL data types including VARCHAR, DATE, TIMESTAMP, and DECFLOAT, which DDS physical files do not support natively.
+
+<strong>SQL views</strong> created with <code>CREATE VIEW</code> are stored as SQL objects but function like logical files — they define a query over one or more underlying tables and can be opened by RPG programs with an F-spec.
+
+<strong>SQL indexes</strong> created with <code>CREATE INDEX</code> are keyed access paths, similar to keyed logical files, but managed by the SQL layer and more likely to be used by the query optimiser for ad hoc SQL than DDS logical files are.
+
+The practical implication: in a modern IBM i shop, new tables should be defined with SQL DDL, not DDS. Existing DDS files continue to work and do not need to be migrated immediately, but new development benefits from SQL data types, named constraints, and optimiser statistics that work better with SQL-defined objects.
+
+<h2>Journalling and commitment control</h2>
+
+Journalling is the IBM i mechanism for transaction logging and replication. A journal receiver captures before-images and after-images of changes to journalled objects. This is distinct from the database log in a conventional RDBMS — journalling is a system service that works for any object type.
+
+<strong>Why journalling matters for SQL developers:</strong>
+<ul>
+<li>Commitment control (transactions with COMMIT/ROLLBACK) requires journalling to be active on the files involved</li>
+<li>IBM i replication products (IBM i native replication, Precisely MIMIX, Rocket iCluster) use journals to replicate data to standby systems or cloud targets</li>
+<li>Point-in-time recovery uses journal receivers to roll forward or back to a specific point</li>
+</ul>
+
+<strong>Checking if a table is journalled:</strong>
+
+<pre>SELECT TABLE_NAME, JOURNAL_NAME, JOURNAL_LIBRARY, JOURNAL_IMAGES
+FROM   QSYS2.SYSTABLEJOURNAL
+WHERE  TABLE_SCHEMA = 'ORDLIB'
+ORDER  BY TABLE_NAME;</pre>
+
+<strong>Starting journalling on a table:</strong>
+
+<pre>STRJRNPF FILE(ORDLIB/ORDHDR) JRN(ORDLIB/ORDJRN) IMAGES(*BOTH)</pre>
+
+<code>IMAGES(*BOTH)</code> journals both before-images and after-images — required for commitment control and replication. <code>IMAGES(*AFTER)</code> is sufficient for audit trails but not for rollback.
+
+<h2>The System Query Optimiser</h2>
+
+The IBM i System Query Optimiser (SQO) builds access plans for SQL queries. It uses index statistics, access path reuse, and a cost-based model similar to other database optimisers, but with some IBM i-specific characteristics.
+
+<strong>Plan cache:</strong> DB2 for i maintains a plan cache (called the SQL plan cache) of recently built access plans. Repeated identical queries reuse the cached plan rather than rebuilding it. This is transparent to the application but important for performance analysis.
+
+<strong>Viewing recent query plans:</strong>
+
+<pre>SELECT QUERY_TEXT, QUERY_GOAL, RUN_COUNT, TOTAL_TIME,
+       AVG_TIME_PER_RUN, ROWS_PROCESSED
+FROM   QSYS2.SYSQRYSLT
+ORDER  BY TOTAL_TIME DESC
+FETCH FIRST 20 ROWS ONLY;</pre>
+
+<strong>Visual Explain:</strong> IBM i Access Client Solutions (ACS) includes Visual Explain, which renders the access plan for a query as a diagram. This is the primary tool for understanding why a query is slow. Right-click a query in ACS Run SQL Scripts → Explain to open it.
+
+<strong>Common optimiser hints:</strong>
+
+<pre>-- Force index use (SQO ignores this if it has a better plan)
+SELECT /*+ INDEX(ORDHDR ORDHDRK1) */ ORDNUM, ORDAMT
+FROM   ORDLIB.ORDHDR
+WHERE  CUSTNUM = 'CUST00001';
+
+-- OPTIMIZE FOR N ROWS — tells the optimiser to favour fast first-row delivery
+SELECT ORDNUM, ORDAMT
+FROM   ORDLIB.ORDHDR
+WHERE  CUSTNUM = :custNum
+ORDER  BY ORDDAT DESC
+OPTIMIZE FOR 10 ROWS;
+
+-- FETCH FIRST N ROWS ONLY — limits result set; also signals the optimiser
+SELECT ORDNUM, ORDAMT
+FROM   ORDLIB.ORDHDR
+WHERE  ORDSTS = 'OP'
+ORDER  BY ORDDAT DESC
+FETCH FIRST 100 ROWS ONLY;</pre>
+
+<strong>Checking index usage:</strong>
+
+<pre>SELECT INDEX_NAME, INDEX_SCHEMA, LAST_USED, TIMES_USED,
+       ESTIMATED_ROWS_RETURNED
+FROM   QSYS2.SYSINDEXSTAT
+WHERE  TABLE_SCHEMA = 'ORDLIB'
+  AND  TABLE_NAME   = 'ORDHDR'
+ORDER  BY TIMES_USED DESC;</pre>
+
+<h2>Useful DB2 for i system views</h2>
+
+QSYS2 is the IBM i system schema. It contains views that expose system state through SQL — these are the starting point for database administration and monitoring.
+
+<strong>Table and column metadata:</strong>
+
+<pre>-- All tables in a library
+SELECT TABLE_NAME, TABLE_TYPE, NUMBER_ROWS, LAST_USED_TIMESTAMP
+FROM   QSYS2.SYSTABLES
+WHERE  TABLE_SCHEMA = 'ORDLIB'
+ORDER  BY TABLE_NAME;
+
+-- Column definitions
+SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, LENGTH,
+       NUMERIC_SCALE, IS_NULLABLE, COLUMN_DEFAULT
+FROM   QSYS2.SYSCOLUMNS
+WHERE  TABLE_SCHEMA = 'ORDLIB'
+ORDER  BY TABLE_NAME, ORDINAL_POSITION;
+
+-- Index definitions
+SELECT INDEX_NAME, TABLE_NAME, IS_UNIQUE, INDEX_TYPE
+FROM   QSYS2.SYSINDEXES
+WHERE  TABLE_SCHEMA = 'ORDLIB'
+ORDER  BY TABLE_NAME, INDEX_NAME;</pre>
+
+<strong>Active jobs and locks:</strong>
+
+<pre>-- Jobs currently holding locks on a specific table
+SELECT JOB_NAME, LOCK_STATE, LOCK_COUNT
+FROM   QSYS2.OBJECT_LOCK_INFO
+WHERE  OBJECT_LIBRARY = 'ORDLIB'
+  AND  OBJECT_NAME    = 'ORDHDR'
+  AND  OBJECT_TYPE    = '*FILE';
+
+-- Long-running SQL statements
+SELECT JOB_NAME, ELAPSED_TIME, QUERY_TEXT
+FROM   QSYS2.ACTIVE_JOB_INFO
+WHERE  JOB_STATUS = 'ACTIVE'
+  AND  ELAPSED_TIME > 60
+ORDER  BY ELAPSED_TIME DESC;</pre>
+
+<strong>Space usage:</strong>
+
+<pre>SELECT TABLE_NAME,
+       DATA_SIZE   / 1048576 AS DATA_MB,
+       INDEX_SIZE  / 1048576 AS INDEX_MB,
+       NUMBER_ROWS
+FROM   QSYS2.SYSTABLESTAT
+WHERE  TABLE_SCHEMA = 'ORDLIB'
+ORDER  BY DATA_SIZE DESC
+FETCH FIRST 20 ROWS ONLY;</pre>
+
+<h2>SQL DDL patterns for IBM i</h2>
+
+<strong>Creating a table with constraints:</strong>
+
+<pre>CREATE TABLE ORDLIB.ORDHDR (
+    ORDNUM    CHAR(7)         NOT NULL,
+    CUSTNUM   CHAR(10)        NOT NULL,
+    ORDDAT    DATE            NOT NULL DEFAULT CURRENT_DATE,
+    ORDAMT    DECIMAL(11,2)   NOT NULL DEFAULT 0,
+    ORDSTS    CHAR(2)         NOT NULL DEFAULT 'OP',
+    SHIPADR   VARCHAR(100),
+    LSTUPD    TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT ORDHDR_PK PRIMARY KEY (ORDNUM),
+    CONSTRAINT ORDHDR_CUST_FK FOREIGN KEY (CUSTNUM)
+        REFERENCES ORDLIB.CUSTOMER (CUSTNUM)
+        ON DELETE RESTRICT
+) RCDFMT ORDHDRR;</pre>
+
+<code>RCDFMT</code> sets the record format name — the name RPG F-specs use to reference fields. Without it, IBM i assigns one automatically, but setting it explicitly maintains compatibility with existing RPG programs that reference the format name.
+
+<strong>Creating an index:</strong>
+
+<pre>-- Keyed access path for order status + date queries
+CREATE INDEX ORDLIB.ORDHDR_STS_DAT
+    ON ORDLIB.ORDHDR (ORDSTS ASC, ORDDAT DESC);
+
+-- Unique index (alternative to unique constraint in DDL)
+CREATE UNIQUE INDEX ORDLIB.CUSTOMER_EMAIL_UX
+    ON ORDLIB.CUSTOMER (CUSTMAIL)
+    WHERE CUSTMAIL IS NOT NULL;</pre>
+
+<strong>Creating a view:</strong>
+
+<pre>CREATE VIEW ORDLIB.OPEN_ORDERS AS
+    SELECT H.ORDNUM,
+           H.CUSTNUM,
+           C.CUSTNAME,
+           H.ORDDAT,
+           H.ORDAMT,
+           SUM(L.QTYORD) AS TOTAL_QTY
+    FROM   ORDLIB.ORDHDR H
+    JOIN   ORDLIB.CUSTOMER C ON C.CUSTNUM = H.CUSTNUM
+    JOIN   ORDLIB.ORDLIN   L ON L.ORDNUM  = H.ORDNUM
+    WHERE  H.ORDSTS = 'OP'
+    GROUP  BY H.ORDNUM, H.CUSTNUM, C.CUSTNAME, H.ORDDAT, H.ORDAMT;</pre>
+
+<h2>Temporal tables and row change timestamps</h2>
+
+DB2 for i supports temporal tables — tables that automatically track when rows were inserted and updated — using the <code>ROW CHANGE TIMESTAMP</code> column type.
+
+<pre>ALTER TABLE ORDLIB.ORDHDR
+    ADD COLUMN ROW_CHANGED TIMESTAMP
+    NOT NULL GENERATED ALWAYS FOR EACH ROW ON UPDATE AS ROW CHANGE TIMESTAMP;</pre>
+
+This column is automatically maintained by the database — no application code needed to set it on INSERT or UPDATE. It is extremely useful for incremental data extracts and replication triggers.
+
+<strong>Querying changes since a timestamp:</strong>
+
+<pre>SELECT ORDNUM, CUSTNUM, ORDSTS, ORDAMT, ROW_CHANGED
+FROM   ORDLIB.ORDHDR
+WHERE  ROW_CHANGED > :lastExtractTimestamp
+ORDER  BY ROW_CHANGED;</pre>
+
+<h2>Common SQL patterns in IBM i applications</h2>
+
+<strong>Checking for existence without fetching data:</strong>
+
+<pre>DECLARE GLOBAL TEMPORARY TABLE SESSION.WORK_ORDERS
+    LIKE ORDLIB.ORDHDR
+    ON COMMIT PRESERVE ROWS
+    NOT LOGGED;
+
+-- Existence check
+SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END AS EXISTS_FLAG
+FROM   ORDLIB.CUSTOMER
+WHERE  CUSTNUM = :custNum
+FETCH FIRST 1 ROWS ONLY;</pre>
+
+<strong>Global temporary tables (QTEMP equivalent in SQL):</strong>
+
+<pre>DECLARE GLOBAL TEMPORARY TABLE SESSION.WORK_ORDERS (
+    ORDNUM   CHAR(7)      NOT NULL,
+    ORDAMT   DECIMAL(11,2) NOT NULL,
+    SELECTED IND          DEFAULT '0'
+)
+ON COMMIT PRESERVE ROWS
+NOT LOGGED;
+
+INSERT INTO SESSION.WORK_ORDERS (ORDNUM, ORDAMT)
+    SELECT ORDNUM, ORDAMT
+    FROM   ORDLIB.ORDHDR
+    WHERE  CUSTNUM = :custNum
+      AND  ORDSTS  = 'OP';</pre>
+
+<code>SESSION</code> is the schema for global temporary tables — it maps to QTEMP for the current job. The table exists only for the current connection/job and is automatically dropped when the connection ends.
+
+<strong>MERGE (upsert):</strong>
+
+<pre>MERGE INTO ORDLIB.CUSTSTAT T
+    USING (SELECT :custNum AS CUSTNUM,
+                  :ordAmt  AS LASTORDAMT,
+                  CURRENT_DATE AS LASTORDDAT) S
+    ON T.CUSTNUM = S.CUSTNUM
+    WHEN MATCHED THEN
+        UPDATE SET LASTORDAMT = S.LASTORDAMT,
+                   LASTORDDAT = S.LASTORDDAT
+    WHEN NOT MATCHED THEN
+        INSERT (CUSTNUM, LASTORDAMT, LASTORDDAT)
+        VALUES (S.CUSTNUM, S.LASTORDAMT, S.LASTORDDAT);</pre>
+
+<strong>Recursive CTEs for hierarchical data:</strong>
+
+<pre>-- Bill of materials explosion
+WITH RECURSIVE BOM (PARTNUM, PARENTNUM, LEVEL, QTY) AS (
+    -- anchor: top-level part
+    SELECT PARTNUM, CAST(NULL AS CHAR(10)), 0, DECIMAL(1,9,3)
+    FROM   INVLIB.PARTMAST
+    WHERE  PARTNUM = :topPart
+
+    UNION ALL
+
+    -- recursive: children
+    SELECT C.PARTNUM, C.PARENTPART, B.LEVEL + 1,
+           B.QTY * C.QTYPER
+    FROM   INVLIB.BOMMAST C
+    JOIN   BOM            B ON B.PARTNUM = C.PARENTPART
+    WHERE  B.LEVEL < 10    -- guard against circular references
+)
+SELECT PARTNUM, PARENTNUM, LEVEL, QTY
+FROM   BOM
+ORDER  BY LEVEL, PARTNUM;</pre>
+
+<h2>Accessing DB2 for i from external applications</h2>
+
+<strong>JDBC (jt400 / IBM Toolbox for Java):</strong>
+
+<pre>// Maven dependency: net.sf.jt400:jt400:20.0.7
+Connection conn = DriverManager.getConnection(
+    "jdbc:as400://mysystem/ORDLIB;naming=system;date format=iso",
+    "APIUSER", "password"
+);
+PreparedStatement ps = conn.prepareStatement(
+    "SELECT ORDNUM, ORDAMT FROM ORDHDR WHERE CUSTNUM = ? AND ORDSTS = 'OP'"
+);
+ps.setString(1, custNum);
+ResultSet rs = ps.executeQuery();</pre>
+
+<strong>ODBC (for .NET, Python, Power BI, etc.):</strong>
+
+<pre># Python with pyodbc
+import pyodbc
+conn = pyodbc.connect(
+    'DRIVER={IBM i Access ODBC Driver};'
+    'SYSTEM=mysystem;'
+    'UID=APIUSER;PWD=password;'
+    'DBQ=ORDLIB;'    # default library for unqualified names
+    'NAM=0;'         # 0 = SQL naming, 1 = system naming
+)
+cursor = conn.cursor()
+cursor.execute(
+    "SELECT ORDNUM, ORDAMT FROM ORDLIB.ORDHDR WHERE ORDSTS = ?", ('OP',)
+)</pre>
+
+<strong>Node.js with idb-connector (PASE-side, runs on IBM i itself):</strong>
+
+<pre>const db = require('/QOpenSys/pkgs/lib/nodejs/node_modules/idb-connector');
+const conn = new db.dbconn();
+conn.conn('*LOCAL');
+
+const stmt = new db.dbstmt(conn);
+stmt.exec(
+  "SELECT ORDNUM, ORDAMT FROM ORDLIB.ORDHDR WHERE ORDSTS = 'OP'",
+  (results, error) => {
+    if (error) throw error;
+    results.forEach(row => console.log(row.ORDNUM, row.ORDAMT));
+    stmt.close();
+    conn.disconn();
+    conn.close();
+  }
+);</pre>
+
+<h2>Key differences from other database platforms</h2>
+
+<ul>
+<li><strong>No schema hierarchy</strong> — IBM i libraries are flat. There is no database-within-a-database concept like SQL Server's <code>server.database.schema.table</code>. A library is a schema and a container for all objects.</li>
+<li><strong>Members</strong> — physical files can have multiple members. SQL tables normally have one member. Member-based partitioning is a legacy pattern; SQL PARTITION BY for range partitioning is the modern equivalent.</li>
+<li><strong>Object model security</strong> — access control is at the IBM i object level, not rows or columns by default. Row and column access control (RCAC) was added in IBM i 7.1 TR5 for SQL tables specifically.</li>
+<li><strong>No AUTOINCREMENT / SERIAL</strong> — IBM i uses <code>GENERATED ALWAYS AS IDENTITY</code> or sequences (<code>CREATE SEQUENCE</code>) for surrogate keys.</li>
+<li><strong>Data types</strong> — IBM i has GRAPHIC (fixed-width double-byte) and VARGRAPHIC types from its DBCS heritage. DECFLOAT is available for IEEE 754 decimal floating point. ROWID is a system-generated row identifier.</li>
+</ul>
+
+DB2 for i rewards developers who understand its integrated architecture. The query optimiser is sophisticated, the SQL feature set is current, and the QSYS2 system views give deep visibility into runtime behaviour without requiring external monitoring tools. The friction points are almost always at the integration boundary — external applications that assume a standalone RDBMS and use naming conventions or connection settings that do not account for the library list or the system naming model.
+
+<em>Next post: IBM i Security — authority, user profiles, object-level access, adopted authority, and the practical security patterns that IBM i shops use to control what programs and users can do.</em>

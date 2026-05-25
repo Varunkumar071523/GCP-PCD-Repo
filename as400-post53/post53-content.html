@@ -1,0 +1,317 @@
+<p>The previous post covered IBM i work management in depth — designing subsystem descriptions, configuring routing entries with ADDRTGE, setting class objects for CPU priority and time slice with CRTCLS, managing job queue concurrency with ADDJOBQE, understanding multi-threaded jobs, and diagnosing performance problems with WRKACTJOB and Collection Services. This post covers the modern IBM i developer workstation: IBM Merlin and the VS Code extension for IBM i — how to set up VS Code for RPG and CL editing with syntax highlighting, inline error feedback, Git integration, custom build actions, and AI coding assistance in 2026.</p>
+
+<h2>The IBM i Developer Tooling Problem</h2>
+
+<p>SEU (Source Entry Utility) has been the standard IBM i editor since the AS/400 was introduced in 1988. It is accessible from a 5250 green-screen session via PDM (Programming Development Manager) and STRSEU. SEU works, but it has significant limitations by 2026 standards:</p>
+<ul>
+  <li>No syntax highlighting — all source members display in a single colour</li>
+  <li>No code completion or IntelliSense — no suggestions for built-in functions, operation codes, or field names</li>
+  <li>No Git integration — source members live in QSYS.LIB, not in a Git repository</li>
+  <li>No pull request workflow — code review is informal or relies on separate change management tools</li>
+  <li>No linting or static analysis at edit time — errors only appear after compilation</li>
+  <li>Column-oriented fixed-format RPG is visible as a sequence of numbered columns (1–80), which is confusing for developers who learned on modern languages</li>
+</ul>
+
+<p>IBM Rational Developer for i (RDi) was the Eclipse-based successor for many shops, offering syntax highlighting and a GUI-based debugger. But RDi is licensed separately and is heavyweight for individual developers. The 2026 alternative is VS Code with the <strong>Code for IBM i</strong> extension, which is free, lightweight, and actively maintained by the open-source community.</p>
+
+<h2>Code for IBM i — the VS Code Extension</h2>
+
+<p><strong>Code for IBM i</strong> (extension ID: <code>HalcyonTechLtd.code-for-ibmi</code>) by Halcyon Technology is available from the VS Code Marketplace at no cost. It provides:</p>
+<ul>
+  <li><strong>SSH-based connection to IBM i</strong> — connects to the IBM i PASE shell over SSH (port 22); no separate middleware required</li>
+  <li><strong>IBM i Browser panel</strong> — a tree view of QSYS.LIB libraries, source physical files, and source members; IFS directory browsing; object list with filter by library and type</li>
+  <li><strong>Source member editing</strong> — open RPG, CL, DDS, and SQL source members directly in the VS Code editor; changes are saved back to the source physical file on IBM i</li>
+  <li><strong>Syntax highlighting</strong> — full syntax colouring for free-format RPG IV (/FREE), fixed-format RPG IV, CL, DDS, and SQL</li>
+  <li><strong>Actions (compile and run)</strong> — user-defined actions execute CL commands against the open member (CRTBNDRPG, CRTCLPGM, CRTSQLRPGI, etc.) and parse the resulting EVFEVENT file to display compilation errors inline in the editor</li>
+  <li><strong>EVFEVENT-based error feedback</strong> — after a compile action, errors from the EVFEVENT file appear as red squiggles and hover messages at the exact source line that caused the error</li>
+  <li><strong>Integrated terminal</strong> — a PASE SSH terminal directly in VS Code for running CL commands, SBMJOB, or PASE shell scripts without switching windows</li>
+</ul>
+
+<h2>Setting Up the VS Code Connection</h2>
+
+<p>Prerequisites on the IBM i before configuring VS Code:</p>
+<ul>
+  <li>SSH daemon running: <code>STRTCPSVR SERVER(*SSHD)</code> (and add to the autostart configuration)</li>
+  <li>PASE installed (5770-SS1 option 33)</li>
+  <li>An IBM i user profile with *ALLOBJ or at minimum authority to the source libraries to be edited</li>
+</ul>
+
+<p>In VS Code, install the extension, then open the IBM i connection panel (the power plug icon in the Activity Bar) and add a new connection:</p>
+
+<pre>
+Host:        my-ibm-i.company.com
+Port:        22
+Username:    DEVUSER
+Auth:        Password or SSH private key (recommended)
+</pre>
+
+<p>After connecting, configure the connection settings in VS Code (the gear icon next to the connection):</p>
+
+<pre>
+// .vscode/settings.json (or in VS Code user settings for this IBM i connection)
+{
+  "code-for-ibmi.connectionSettings": {
+    "libraryList": ["APPLIB", "SALESLIB", "ORDLIB", "QTEMP"],
+    "currentLibrary": "APPLIB",
+    "defaultDeploymentMethod": "compare",
+    "autoSaveBeforeAction": true,
+    "showDescInLibList": true
+  }
+}
+</pre>
+
+<p>Test the connection by opening the IBM i Browser and expanding a library to see its source physical files and members. Right-click any source member to open it in the editor.</p>
+
+<h2>Editing and Compiling RPG in VS Code</h2>
+
+<p>Open a free-format RPG IV member (RPGLE) from the IBM i Browser. The editor provides syntax highlighting, with keywords in one colour, built-in functions in another, and comments in a third. Error squiggles appear after each compile action.</p>
+
+<p>A simple free-format RPG service program procedure edited in VS Code:</p>
+
+<pre>
+**FREE
+// APPLIB/ORDSRV — Order validation service program
+// Compile: CRTBNDRPGM PGM(APPLIB/ORDSRV) SRCFILE(APPLIB/QRPGLESRC)
+//                     SRCMBR(ORDSRV) DFTACTGRP(*NO) ACTGRP(ORDGRP)
+
+ctl-opt nomain thread(*concurrent);
+
+dcl-pr ValidateOrder extproc('ValidateOrder');
+  pOrderNo    packed(9:0)  const;
+  pCustNo     packed(9:0)  const;
+  pOrderAmt   packed(13:2) const;
+  pRetCode    char(2);
+  pRetMsg     char(100);
+end-pr;
+
+dcl-proc ValidateOrder export;
+  dcl-pi *n;
+    pOrderNo    packed(9:0)  const;
+    pCustNo     packed(9:0)  const;
+    pOrderAmt   packed(13:2) const;
+    pRetCode    char(2);
+    pRetMsg     char(100);
+  end-pi;
+
+  dcl-s wCustSts  char(1);
+  dcl-s wCrdLmt   packed(13:2);
+
+  // Validate customer exists and is active
+  exec sql
+    SELECT CUSSTS, CRDLMT
+    INTO   :wCustSts, :wCrdLmt
+    FROM   ORDLIB.CUSTMST
+    WHERE  CUSNO = :pCustNo;
+
+  if sqlcode <> 0;
+    pRetCode = 'CE';
+    pRetMsg  = 'Customer not found or inactive';
+    return;
+  endif;
+
+  if wCustSts <> 'A';
+    pRetCode = 'CI';
+    pRetMsg  = 'Customer account is not active';
+    return;
+  endif;
+
+  if pOrderAmt > wCrdLmt;
+    pRetCode = 'CL';
+    pRetMsg  = 'Order amount exceeds customer credit limit';
+    return;
+  endif;
+
+  pRetCode = 'OK';
+  pRetMsg  = 'Order validated successfully';
+end-proc;
+</pre>
+
+<p>To compile from VS Code, right-click the member in the IBM i Browser or use the command palette (Ctrl+Shift+P) and select <strong>IBM i: Run Action</strong>. The built-in CRTBNDRPG action compiles the member and populates the Problems panel with any errors. Errors also appear as inline squiggles with hover text showing the IBM i compiler message.</p>
+
+<h2>IBM Merlin</h2>
+
+<p>IBM Merlin (full name: IBM Developer for z/OS and IBM i — Merlin edition) is IBM's enterprise-grade IDE for IBM i, built on an Eclipse Theia / VS Code foundation and deployed as a container workload (typically on OpenShift or a standalone Docker host). Developers access Merlin through a browser — no local VS Code installation required.</p>
+
+<p>What Merlin adds over plain VS Code with Code for IBM i:</p>
+<ul>
+  <li><strong>AI-assisted code completion for RPG</strong> — Merlin integrates with IBM watsonx Code Assistant for Z, which has been trained on RPG source. Completions include procedure calls, data structure declarations, and SQL embedded in RPG. Quality has improved significantly from 2024 to 2026 but still requires review for complex logic.</li>
+  <li><strong>RPG refactoring tools</strong> — extract procedure, rename field, convert fixed-format to free-format (the converter is more reliable than the standalone CVTRPGSRC command)</li>
+  <li><strong>Team administration features</strong> — centralised connection management means a single admin configures IBM i connections and all developers connect through Merlin without individual SSH key management</li>
+  <li><strong>ARCAD integration</strong> — Merlin integrates with ARCAD for IBM i for change management, impact analysis, and build orchestration in regulated environments (financial services, government)</li>
+  <li><strong>Built-in Git UI</strong> — a graphical Git interface for branching, committing, and pull request creation without command-line Git knowledge</li>
+</ul>
+
+<p>Who should use Merlin versus VS Code + Code for IBM i:</p>
+<ul>
+  <li><strong>Use Merlin</strong> — large teams (10+ IBM i developers), regulated industries needing ARCAD or formal change management, organisations that want to provide a browser-based IDE without individual workstation configuration, shops adopting watsonx Code Assistant for RPG modernisation</li>
+  <li><strong>Use VS Code + Code for IBM i</strong> — individual developers, small teams, open-source contributors, shops that want the full VS Code ecosystem (extensions, themes, keybindings) without a container deployment, developers already familiar with VS Code from other languages</li>
+</ul>
+
+<h2>Git Integration for IBM i Source</h2>
+
+<p>Putting IBM i source under Git version control is the single most impactful change a team can make for code quality and collaboration. There are two approaches:</p>
+
+<p><strong>Approach A: IFS stream files + SRCSTMF</strong> — store source as stream files in the IFS (e.g., <code>/home/devuser/project/src/ORDSRV.sqlrpgle</code>), edit in VS Code, and compile using the SRCSTMF parameter on CRTBNDRPG:</p>
+
+<pre>
+/* Compile from IFS stream file instead of a source physical file member */
+CRTBNDRPG PGM(APPLIB/ORDSRV)
+          SRCSTMF('/home/devuser/project/src/ORDSRV.sqlrpgle')
+          DFTACTGRP(*NO)
+          ACTGRP(ORDGRP)
+          DBGVIEW(*SOURCE)
+</pre>
+
+<p>With stream files, standard Git commands work in the PASE terminal or in VS Code's integrated Git panel:</p>
+
+<pre>
+# In a PASE SSH terminal (or VS Code terminal)
+cd /home/devuser/project
+git init
+git remote add origin git@github.com:mycompany/ibmi-app.git
+
+# After editing ORDSRV.sqlrpgle in VS Code:
+git add src/ORDSRV.sqlrpgle
+git commit -m "feat: add credit limit validation to ValidateOrder"
+git push origin main
+</pre>
+
+<p><strong>Approach B: Code for IBM i Git sync</strong> — use the built-in Git integration in Code for IBM i, which automatically mirrors member changes to a local Git working tree. The extension manages the conversion between source member records and stream file lines. This approach is simpler to set up but Approach A (SRCSTMF) is the cleaner long-term solution as it eliminates source physical files entirely.</p>
+
+<h2>Actions and Build Automation in VS Code</h2>
+
+<p>Code for IBM i actions are defined in <code>.vscode/actions.json</code> within the project directory (synced to IFS), or globally in the VS Code user settings. Each action is a CL command string with substitution variables that refer to the currently open member.</p>
+
+<pre>
+// .vscode/actions.json — custom IBM i actions for this project
+[
+  {
+    "name": "Compile RPGLE (CRTBNDRPG)",
+    "command": "CRTBNDRPG PGM(&LIBRARY/&NAME) SRCSTMF('&RELATIVEPATH') DFTACTGRP(*NO) ACTGRP(ORDGRP) DBGVIEW(*SOURCE) OPTION(*EVENTF)",
+    "environment": "ile",
+    "extensions": ["RPGLE", "SQLRPGLE"]
+  },
+  {
+    "name": "Compile CL Program (CRTCLPGM)",
+    "command": "CRTCLPGM PGM(&LIBRARY/&NAME) SRCSTMF('&RELATIVEPATH') OPTION(*EVENTF)",
+    "environment": "ile",
+    "extensions": ["CLP", "CLLE"]
+  },
+  {
+    "name": "Run RPGUnit Test Suite",
+    "command": "RUCALLTST TSTPGM(&LIBRARY/&NAME) RPTTYPE(*ALLWAYS) OUTPUT(*PRINT)",
+    "environment": "ile",
+    "extensions": ["RPGLE"]
+  },
+  {
+    "name": "Submit Batch Job",
+    "command": "SBMJOB JOB(&NAME) JOBQ(APPLIB/APPJOBQ) CMD(CALL PGM(&LIBRARY/&NAME)) JOBPTY(5)",
+    "environment": "ile",
+    "extensions": ["RPGLE"]
+  },
+  {
+    "name": "Deploy IFS project to APPLIB",
+    "command": "CPYFRMSTMF FROMSTMF('/home/devuser/project/deploy/&NAME.savf') TOMBR('/QSYS.LIB/APPLIB.LIB/&NAME.SAVF') MBROPT(*REPLACE)",
+    "environment": "ile",
+    "extensions": ["SAVF"]
+  }
+]
+</pre>
+
+<p>The <code>&LIBRARY</code>, <code>&NAME</code>, <code>&RELATIVEPATH</code>, and <code>&FULLPATH</code> substitution variables are replaced at runtime with values from the currently open file. This makes actions reusable across all members in the project without per-file configuration.</p>
+
+<h2>AI Coding Assistance for RPG</h2>
+
+<p>GitHub Copilot in VS Code provides code completion suggestions for RPG IV source files stored as stream files (.sqlrpgle, .rpgle). Because the files have standard extensions, Copilot treats them as source files and provides completions based on context. Copilot's training data contains less RPG than Python or JavaScript, so the quality of suggestions varies:</p>
+<ul>
+  <li><strong>Works well</strong> — data structure declarations, SQL embedded in RPG (Copilot has strong SQL training data), boilerplate procedure stubs, DCL-DS/DCL-PR/DCL-PI patterns, and common built-in functions like %TRIM, %EDITC, %DATE, %SUBST</li>
+  <li><strong>Needs review</strong> — complex business logic, indicator handling, legacy fixed-format constructs, program-to-program CALL patterns; completions may be syntactically plausible but logically incorrect</li>
+  <li><strong>Not reliable</strong> — ILE binding directory and activation group patterns, CL command parameters, DDS field definitions</li>
+</ul>
+
+<p>Enable GitHub Copilot for RPG in VS Code settings:</p>
+
+<pre>
+// In VS Code settings.json
+{
+  "github.copilot.enable": {
+    "*": true,
+    "rpgle": true,
+    "sqlrpgle": true,
+    "clle": true,
+    "clp": true
+  }
+}
+</pre>
+
+<p>IBM Merlin's watsonx Code Assistant integration provides <strong>RPG-specific AI explanations</strong> — select a procedure in Merlin and request an explanation of what it does. This is especially useful during modernisation projects where teams are reading legacy fixed-format RPG written by developers who left the organisation years ago.</p>
+
+<h2>The 2026 IBM i Developer Workstation</h2>
+
+<p>The recommended full setup for a modern IBM i development team in 2026:</p>
+<ul>
+  <li><strong>VS Code</strong> — primary editor on the developer's laptop (Windows, macOS, or Linux)</li>
+  <li><strong>Code for IBM i extension</strong> (<code>HalcyonTechLtd.code-for-ibmi</code>) — IBM i connection, source member browsing, and compile actions</li>
+  <li><strong>RPGUnit extension</strong> — run unit tests for RPG service programs directly from VS Code</li>
+  <li><strong>Git in PASE on IBM i</strong> — installed via yum (<code>yum install git</code>); manages the IFS source tree on the server side</li>
+  <li><strong>GitHub or GitLab</strong> — remote Git repository for source control, pull requests, and code review; use SSH key authentication from PASE</li>
+  <li><strong>Bob (Better Object Builder)</strong> — an open-source build tool for IBM i (github.com/ibm/ibmi-bob) that reads a <code>Rules.mk</code> file and compiles only changed members in dependency order; replaces manual CRTBNDRPG sequences in CI pipelines</li>
+  <li><strong>GitHub Actions or Jenkins CI</strong> with an IBM i runner — automated builds triggered by pull request merges; the runner connects to IBM i via SSH, runs Bob, and reports compile errors back to the pull request</li>
+</ul>
+
+<p>A minimal Bob <code>Rules.mk</code> for an application with RPG service programs and a main program:</p>
+
+<pre>
+# Rules.mk — Bob build rules for APPLIB application
+# Bob reads this file and resolves compile order from dependencies
+
+ORDSRV.SRVPGM: ORDSRV.RPGLE
+	$(CRTBNDRPG) DFTACTGRP(*NO) ACTGRP(ORDGRP) DBGVIEW(*SOURCE)
+
+CUSTSRV.SRVPGM: CUSTSRV.RPGLE
+	$(CRTBNDRPG) DFTACTGRP(*NO) ACTGRP(ORDGRP) DBGVIEW(*SOURCE)
+
+ORDAPP.PGM: ORDAPP.RPGLE ORDSRV.SRVPGM CUSTSRV.SRVPGM
+	$(CRTBNDRPG) DFTACTGRP(*NO) ACTGRP(ORDGRP) BNDDIR(APPLIB/ORDBNDD) DBGVIEW(*SOURCE)
+</pre>
+
+<p>A GitHub Actions workflow that compiles on every push to main:</p>
+
+<pre>
+# .github/workflows/ibmi-build.yml
+name: IBM i Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: self-hosted   # IBM i runner registered as a GitHub Actions runner
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Copy source to IFS
+        run: |
+          rsync -av src/ /home/ciuser/project/src/
+
+      - name: Run Bob build
+        working-directory: /home/ciuser/project
+        run: |
+          /QOpenSys/usr/local/bin/makei build
+        env:
+          CURLIB: APPLIB
+
+      - name: Run RPGUnit tests
+        working-directory: /home/ciuser/project
+        run: |
+          system "RUCALLTST TSTPGM(APPLIB/ORDSRVTST) RPTTYPE(*ALLWAYS)"
+</pre>
+
+<p>This setup — VS Code editing RPG stream files, Git for source control, Bob for automated builds, and GitHub Actions for CI — gives IBM i a development workflow indistinguishable from a modern web application project. The platform that started in 1988 now supports pull requests, code review, automated testing, and continuous integration using the same tools as any other language in 2026.</p>
+
+<em>Next post: IBM i PASE Deep Dive — understanding the PASE runtime environment, AIX binary compatibility, PASE vs QShell (QSH), environment variables, PASE process management, shared libraries, and how PASE integrates with the IBM i job structure and ILE activation groups.</em>

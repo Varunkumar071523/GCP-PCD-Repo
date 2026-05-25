@@ -1,0 +1,508 @@
+<p>The previous post covered IBM i save and restore strategy — SAVLIB, SAVOBJ, SAV for IFS, GO SAVE options, virtual optical media with IMGCLG, and building a layered backup schedule with BRMS. This post covers a genuinely modern topic: vector search and text embeddings on IBM i. This is not theoretical — IBM i databases hold decades of business knowledge in text fields, and converting that text into vectors enables semantic search, recommendation systems, and Retrieval Augmented Generation (RAG) pipelines that keyword search simply cannot match.</p>
+
+<h2>What Embeddings Are — The Concept</h2>
+
+<p>A text embedding is a list of floating-point numbers that represents the semantic meaning of a piece of text. A sentence, a product description, a customer complaint, or a job log entry can each be converted into a vector of 768, 1536, or 3072 floats depending on the embedding model used. The key property is that semantically similar texts produce numerically similar vectors — their vectors are close together in the high-dimensional space.</p>
+
+<p>This means you can search by meaning rather than by exact keyword match. A query like "damaged packaging" will surface records containing "box was crushed", "carton arrived dented", and "wrapping torn on delivery" — none of which contain the word "damaged" — because those phrases are semantically close to the query vector.</p>
+
+<p>Contrast this with a SQL LIKE search:</p>
+
+<pre>/* Keyword search — misses synonyms and paraphrases */
+SELECT ORDNUM, NOTES
+FROM ORDLIB.ORDNOTES
+WHERE NOTES LIKE '%damaged%'
+   OR NOTES LIKE '%broken%';</pre>
+
+<p>This misses "crushed", "dented", "torn", "cracked", and dozens of other ways customers describe the same problem. Embedding-based semantic search catches all of them.</p>
+
+<h2>Why This Matters for IBM i</h2>
+
+<p>IBM i databases are filled with business-critical text. Common examples:</p>
+
+<ul>
+  <li><strong>Product descriptions</strong> — item master files with verbose, inconsistently written descriptions accumulated over decades.</li>
+  <li><strong>Customer notes and CRM records</strong> — free-text fields written by customer service staff describing issues, complaints, and requests.</li>
+  <li><strong>Order and invoice comments</strong> — delivery instructions, special handling notes, dispute records.</li>
+  <li><strong>Job and error logs</strong> — QSYS2.JOBLOG_INFO and message files containing operational text.</li>
+  <li><strong>HR and training records</strong> — competency descriptions, appraisal notes, job requirements.</li>
+</ul>
+
+<p>Converting these fields to embeddings once (on insert or in a batch job) and storing the vectors alongside the records transforms a legacy DB2 for i database into a semantic search engine — without migrating data anywhere.</p>
+
+<h2>Generating Embeddings with OpenAI from Python on IBM i</h2>
+
+<p>Python 3 runs in IBM i PASE. The <code>openai</code> library installs via pip and calls the OpenAI embeddings API over HTTPS. The result is a list of 1536 floats (for text-embedding-3-small) or 3072 floats (for text-embedding-3-large).</p>
+
+<p>Install the library in PASE:</p>
+
+<pre>pip3 install openai pyodbc</pre>
+
+<p>A script to embed a batch of product descriptions from DB2 for i and store the results back:</p>
+
+<pre>#!/QOpenSys/pkgs/bin/python3
+"""
+embed_products.py
+Reads unembedded product descriptions from DB2 for i,
+calls the OpenAI embeddings API in batches,
+and stores the resulting vectors as JSON in DB2.
+"""
+
+import json
+import pyodbc
+import openai
+import os
+
+openai.api_key = os.environ['OPENAI_API_KEY']
+
+EMBED_MODEL  = 'text-embedding-3-small'   # 1536 dimensions
+BATCH_SIZE   = 100
+DSN          = 'IBMI_LOCAL'               # ODBC DSN for local DB2
+
+conn   = pyodbc.connect(f'DSN={DSN}')
+cursor = conn.cursor()
+
+# Fetch rows that have not yet been embedded
+cursor.execute("""
+    SELECT ITEMNUM, DESCRIPTION
+    FROM ORDLIB.ITEMMASTER
+    WHERE EMBEDDING IS NULL
+      AND DESCRIPTION IS NOT NULL
+      AND TRIM(DESCRIPTION) <> ''
+    FETCH FIRST 500 ROWS ONLY
+""")
+rows = cursor.fetchall()
+
+if not rows:
+    print('No rows to embed.')
+    conn.close()
+    exit(0)
+
+# Process in batches to stay within API rate limits
+for i in range(0, len(rows), BATCH_SIZE):
+    batch = rows[i : i + BATCH_SIZE]
+    texts = [row[1].strip() for row in batch]
+
+    response = openai.embeddings.create(
+        input=texts,
+        model=EMBED_MODEL,
+    )
+
+    for j, item in enumerate(response.data):
+        itemnum   = batch[j][0]
+        vector    = item.embedding          # list of 1536 floats
+        vec_json  = json.dumps(vector)      # store as JSON string
+
+        cursor.execute("""
+            UPDATE ORDLIB.ITEMMASTER
+            SET EMBEDDING = ?
+            WHERE ITEMNUM = ?
+        """, (vec_json, itemnum))
+
+    conn.commit()
+    print(f'Embedded rows {i+1} to {i+len(batch)}')
+
+conn.close()
+print('Done.')
+</pre>
+
+<p>The EMBEDDING column is added to the table as a CLOB or large VARCHAR. Adding the column if it does not exist:</p>
+
+<pre>ALTER TABLE ORDLIB.ITEMMASTER
+    ADD COLUMN EMBEDDING CLOB(32000)
+    DEFAULT NULL;</pre>
+
+<h2>Generating Embeddings with watsonx.ai</h2>
+
+<p>For organisations that cannot send data to the OpenAI API due to data residency or security policy, IBM watsonx.ai provides embedding models that can run on IBM Cloud or on-premises via Cloud Pak for Data. The <code>ibm-watsonx-ai</code> Python library provides the same interface.</p>
+
+<pre>pip3 install ibm-watsonx-ai</pre>
+
+<pre>#!/QOpenSys/pkgs/bin/python3
+"""
+embed_watsonx.py
+Generates embeddings using ibm/slate-30m-english-rtrvr
+via IBM watsonx.ai.
+"""
+
+import json
+import pyodbc
+import os
+from ibm_watsonx_ai import Credentials
+from ibm_watsonx_ai.foundation_models import Embeddings
+from ibm_watsonx_ai.foundation_models.utils.enums import EmbeddingTypes
+
+credentials = Credentials(
+    url    = os.environ['WATSONX_URL'],
+    api_key= os.environ['WATSONX_APIKEY'],
+)
+project_id = os.environ['WATSONX_PROJECT_ID']
+
+embed_model = Embeddings(
+    model_id    = EmbeddingTypes.IBM_SLATE_30M_ENG,
+    credentials = credentials,
+    project_id  = project_id,
+)
+
+DSN    = 'IBMI_LOCAL'
+conn   = pyodbc.connect(f'DSN={DSN}')
+cursor = conn.cursor()
+
+cursor.execute("""
+    SELECT ITEMNUM, DESCRIPTION
+    FROM ORDLIB.ITEMMASTER
+    WHERE EMBEDDING IS NULL
+      AND DESCRIPTION IS NOT NULL
+    FETCH FIRST 500 ROWS ONLY
+""")
+rows = cursor.fetchall()
+
+BATCH_SIZE = 20   # watsonx.ai has lower batch limits than OpenAI
+
+for i in range(0, len(rows), BATCH_SIZE):
+    batch  = rows[i : i + BATCH_SIZE]
+    texts  = [row[1].strip() for row in batch]
+
+    result = embed_model.embed_documents(texts=texts)
+
+    for j, vector in enumerate(result):
+        itemnum  = batch[j][0]
+        vec_json = json.dumps(vector)
+        cursor.execute(
+            "UPDATE ORDLIB.ITEMMASTER SET EMBEDDING = ? WHERE ITEMNUM = ?",
+            (vec_json, itemnum)
+        )
+
+    conn.commit()
+    print(f'watsonx embedded {i+1} to {i+len(batch)}')
+
+conn.close()
+</pre>
+
+<p>The <code>ibm/slate-30m-english-rtrvr</code> model produces 384-dimensional vectors — smaller than OpenAI's 1536, which means less storage and faster similarity computation at some cost to retrieval quality. For large IBM i tables this trade-off is often worthwhile.</p>
+
+<h2>Storing Vectors in DB2 for i</h2>
+
+<p>DB2 for i (as of 7.5 in 2026) does not have a native VECTOR column type like pgvector in PostgreSQL. You store vectors using one of three approaches, each with trade-offs.</p>
+
+<p><strong>Approach 1 — JSON string in CLOB (recommended for flexibility)</strong></p>
+
+<pre>ALTER TABLE ORDLIB.ITEMMASTER
+    ADD COLUMN EMBEDDING      CLOB(32000) DEFAULT NULL,
+    ADD COLUMN EMBED_MODEL    VARCHAR(50)  DEFAULT NULL,
+    ADD COLUMN EMBED_DIM      INTEGER      DEFAULT NULL,
+    ADD COLUMN EMBED_CREATED  TIMESTAMP    DEFAULT NULL;</pre>
+
+<p>Pros: easy to read back with <code>json_parse</code>, model-agnostic, no fixed dimension constraint. Cons: parsing JSON on every similarity computation adds overhead.</p>
+
+<p><strong>Approach 2 — VARBINARY serialisation</strong></p>
+
+<p>Serialise the float array to IEEE 754 binary representation and store as VARBINARY. A 1536-float vector at 4 bytes per float requires 6144 bytes.</p>
+
+<pre>ALTER TABLE ORDLIB.ITEMMASTER
+    ADD COLUMN EMBEDDING_BIN VARBINARY(12288) DEFAULT NULL;</pre>
+
+<p>Python serialisation using struct:</p>
+
+<pre>import struct
+
+def floats_to_bytes(vector: list) -> bytes:
+    return struct.pack(f'{len(vector)}f', *vector)
+
+def bytes_to_floats(data: bytes) -> list:
+    count = len(data) // 4
+    return list(struct.unpack(f'{count}f', data))
+
+# Store
+vec_bytes = floats_to_bytes(embedding_vector)
+cursor.execute(
+    "UPDATE ORDLIB.ITEMMASTER SET EMBEDDING_BIN = ? WHERE ITEMNUM = ?",
+    (pyodbc.Binary(vec_bytes), itemnum)
+)
+</pre>
+
+<p>Pros: compact, no JSON parsing overhead. Cons: requires Python struct unpacking before SQL computation; not human-readable.</p>
+
+<p><strong>Approach 3 — DECFLOAT array via separate table (normalised)</strong></p>
+
+<p>Store each dimension as a separate row in a child table. Allows SQL aggregation but is impractical for cosine similarity at scale due to the join cost.</p>
+
+<pre>CREATE TABLE ORDLIB.ITEM_VECTORS (
+    ITEMNUM    CHAR(15)    NOT NULL,
+    DIM_IDX    INTEGER     NOT NULL,
+    DIM_VALUE  DECFLOAT(16) NOT NULL,
+    CONSTRAINT PK_ITEMVEC PRIMARY KEY (ITEMNUM, DIM_IDX)
+) RCDFMT ITMVECR;</pre>
+
+<p>This approach is only practical for very small vectors (under 64 dimensions) or for prototype work.</p>
+
+<p>The JSON CLOB approach is recommended for most IBM i deployments in 2026 — it is simple, requires no binary serialisation code, and DB2 for i JSON functions can parse it within SQL.</p>
+
+<h2>Cosine Similarity in SQL</h2>
+
+<p>Cosine similarity measures the angle between two vectors. A value of 1.0 means identical direction (maximum similarity); 0.0 means orthogonal (unrelated); negative values indicate opposite meaning. For normalised embedding vectors (unit vectors, as OpenAI and most models produce), cosine similarity equals the dot product.</p>
+
+<p>DB2 for i does not have a built-in cosine similarity function, but you can implement one as a scalar UDF or compute it inline using JSON_TABLE to expand the stored JSON arrays into rows.</p>
+
+<p>First, create a helper function that computes the dot product of two JSON-encoded float arrays:</p>
+
+<pre>-- Cosine similarity UDF for DB2 for i
+-- Assumes both vectors are unit-normalised (as OpenAI produces)
+-- so cosine similarity = dot product
+
+CREATE OR REPLACE FUNCTION ORDLIB.COSINE_SIM(
+    VEC_A CLOB(32000),
+    VEC_B CLOB(32000)
+)
+RETURNS DECFLOAT(34)
+LANGUAGE SQL
+DETERMINISTIC
+NO EXTERNAL ACTION
+CONTAINS SQL
+BEGIN
+    DECLARE dot_product DECFLOAT(34) DEFAULT 0;
+
+    SELECT SUM(CAST(a.val AS DECFLOAT(34)) *
+               CAST(b.val AS DECFLOAT(34)))
+    INTO dot_product
+    FROM
+        JSON_TABLE(VEC_A, '$[*]'
+            COLUMNS (
+                idx  FOR ORDINALITY,
+                val  VARCHAR(30)  PATH '$'
+            )
+        ) AS a
+        JOIN
+        JSON_TABLE(VEC_B, '$[*]'
+            COLUMNS (
+                idx  FOR ORDINALITY,
+                val  VARCHAR(30)  PATH '$'
+            )
+        ) AS b ON a.idx = b.idx;
+
+    RETURN COALESCE(dot_product, 0);
+END;</pre>
+
+<p>This UDF works correctly for unit-normalised vectors. For non-normalised vectors, you would additionally compute the magnitude of each vector and divide — but OpenAI and most production embedding models return unit vectors by default.</p>
+
+<p>A note on performance: this UDF expands two JSON arrays into rows and joins them, which is computationally expensive for large tables. It is suitable for tables up to tens of thousands of rows with query-time filtering. For millions of rows, pre-filter to a candidate set first (see the end-to-end example below).</p>
+
+<h2>End-to-End Semantic Search Example</h2>
+
+<p>The full pipeline: embed a search query in Python, pass the query vector to SQL, return the top-N most similar product descriptions.</p>
+
+<p>Step 1 — embed the search query in Python:</p>
+
+<pre>#!/QOpenSys/pkgs/bin/python3
+"""
+semantic_search.py
+Semantic search over ORDLIB.ITEMMASTER using stored embeddings.
+"""
+
+import json
+import pyodbc
+import openai
+import os
+
+openai.api_key = os.environ['OPENAI_API_KEY']
+DSN = 'IBMI_LOCAL'
+
+def embed_query(query_text: str) -> str:
+    """Return JSON-encoded embedding for a query string."""
+    response = openai.embeddings.create(
+        input=[query_text],
+        model='text-embedding-3-small',
+    )
+    return json.dumps(response.data[0].embedding)
+
+def semantic_search(query: str, top_n: int = 10) -> list:
+    query_vec_json = embed_query(query)
+
+    conn   = pyodbc.connect(f'DSN={DSN}')
+    cursor = conn.cursor()
+
+    # Pass query vector as a parameter — avoids SQL injection
+    sql = """
+        SELECT
+            ITEMNUM,
+            DESCRIPTION,
+            ORDLIB.COSINE_SIM(EMBEDDING, ?) AS SIMILARITY
+        FROM ORDLIB.ITEMMASTER
+        WHERE EMBEDDING IS NOT NULL
+        ORDER BY SIMILARITY DESC
+        FETCH FIRST ? ROWS ONLY
+    """
+    cursor.execute(sql, (query_vec_json, top_n))
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+# Example usage
+if __name__ == '__main__':
+    hits = semantic_search('damaged packaging on delivery', top_n=5)
+    for row in hits:
+        print(f'{row[0]:15s}  sim={float(row[2]):.4f}  {row[1][:80]}')
+</pre>
+
+<p>Sample output:</p>
+
+<pre>ITEM-00042       sim=0.8731  Corrugated outer box, double-wall, for fragile items
+ITEM-00198       sim=0.8614  Protective foam insert, anti-crush, electronics
+ITEM-00301       sim=0.8502  Tamper-evident seal for cartons, moisture resistant
+ITEM-00087       sim=0.8341  Bubble wrap roll, 500mm wide, shock absorption
+ITEM-00512       sim=0.8129  Dunnage bag, inflatable, pallet load stabiliser</pre>
+
+<p>None of these descriptions contain the word "damaged" or "packaging" — the similarity is semantic, not lexical.</p>
+
+<p><strong>Pre-filtering for performance</strong></p>
+
+<p>On a 500,000-row table, running COSINE_SIM against every row is slow. Pre-filter to a candidate set using conventional SQL predicates before computing similarity:</p>
+
+<pre>SELECT
+    ITEMNUM,
+    DESCRIPTION,
+    ORDLIB.COSINE_SIM(EMBEDDING, ?) AS SIMILARITY
+FROM ORDLIB.ITEMMASTER
+WHERE EMBEDDING  IS NOT NULL
+  AND ITEMCLASS  IN ('PACKAGING', 'MATERIALS')   -- conventional filter
+  AND ACTIVEIND  = 'Y'
+ORDER BY SIMILARITY DESC
+FETCH FIRST 10 ROWS ONLY;</pre>
+
+<p>Reducing the candidate set from 500,000 to 5,000 rows makes the UDF computation 100x faster with no change to the similarity logic.</p>
+
+<h2>RAG Pattern on IBM i</h2>
+
+<p>Retrieval Augmented Generation (RAG) combines semantic search with an LLM. Instead of asking an LLM to answer a question from memory (which may hallucinate), you first retrieve relevant IBM i data using semantic search, then pass that data as context to the LLM, grounding the answer in your actual business records.</p>
+
+<pre>#!/QOpenSys/pkgs/bin/python3
+"""
+rag_ibmi.py
+RAG pipeline: retrieve relevant IBM i records via semantic search,
+then generate a grounded answer using GPT-4o.
+"""
+
+import json
+import pyodbc
+import openai
+import os
+
+openai.api_key = os.environ['OPENAI_API_KEY']
+DSN = 'IBMI_LOCAL'
+
+def embed_query(text: str) -> str:
+    resp = openai.embeddings.create(
+        input=[text], model='text-embedding-3-small'
+    )
+    return json.dumps(resp.data[0].embedding)
+
+def retrieve_context(query: str, top_n: int = 5) -> list[dict]:
+    vec_json = embed_query(query)
+    conn     = pyodbc.connect(f'DSN={DSN}')
+    cursor   = conn.cursor()
+    cursor.execute("""
+        SELECT
+            ORDNUM,
+            CUSTNAME,
+            NOTES,
+            ORDLIB.COSINE_SIM(EMBEDDING, ?) AS SIM
+        FROM ORDLIB.ORDNOTES
+        WHERE EMBEDDING IS NOT NULL
+        ORDER BY SIM DESC
+        FETCH FIRST ? ROWS ONLY
+    """, (vec_json, top_n))
+    rows = cursor.fetchall()
+    conn.close()
+    return [
+        {'ordnum': r[0], 'customer': r[1], 'notes': r[2], 'sim': float(r[3])}
+        for r in rows
+    ]
+
+def rag_answer(question: str) -> str:
+    context_records = retrieve_context(question, top_n=5)
+
+    context_text = '\n'.join(
+        f"Order {r['ordnum']} ({r['customer']}): {r['notes']}"
+        for r in context_records
+    )
+
+    system_prompt = (
+        "You are an IBM i customer service assistant. "
+        "Answer questions using ONLY the order notes provided. "
+        "If the answer is not in the notes, say so clearly. "
+        "Do not invent or assume information."
+    )
+
+    user_prompt = (
+        f"Question: {question}\n\n"
+        f"Relevant order notes from IBM i DB2:\n{context_text}"
+    )
+
+    response = openai.chat.completions.create(
+        model='gpt-4o',
+        messages=[
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user',   'content': user_prompt},
+        ],
+        temperature=0.1,
+    )
+    return response.choices[0].message.content
+
+if __name__ == '__main__':
+    answer = rag_answer('Which orders had complaints about damaged packaging?')
+    print(answer)
+</pre>
+
+<p>The LLM receives actual IBM i order notes as context and generates a factual answer grounded in your data. It cannot hallucinate records that do not exist in DB2, because you are providing the records explicitly.</p>
+
+<h2>Triggering Embedding on Insert</h2>
+
+<p>Rather than running a batch job to embed new records, you can trigger embedding automatically when a row is inserted. On IBM i, the cleanest approach is a data queue trigger or a scheduled PASE job polling for unembedded rows, rather than a SQL trigger calling an external API (which would add network latency to every insert).</p>
+
+<p>A lightweight polling approach using a scheduled CL job:</p>
+
+<pre>/* CL — EMBDNEWITM — run every 5 minutes via ADDJOBSCDE */
+PGM
+  STRQSH CMD('/QOpenSys/pkgs/bin/python3 /home/ibmiuser/embed_products.py')
+ENDPGM</pre>
+
+<p>Schedule it:</p>
+
+<pre>ADDJOBSCDE JOB(EMBDITEMS)
+            CMD(CALL PGM(ORDLIB/EMBDNEWITM))
+            FRQ(*WEEKLY)
+            SCDDATE(*ALL)
+            SCDDAY(*ALL)
+            SCDTIME('*EVERY')
+            RPTINTVL('00:05:00')</pre>
+
+<p>Alternatively, use a SQL trigger to write the ITEMNUM to a work table on insert, and have the Python embedding job consume that work table:</p>
+
+<pre>CREATE OR REPLACE TRIGGER ORDLIB.EMBED_QUEUE_TRG
+AFTER INSERT ON ORDLIB.ITEMMASTER
+REFERENCING NEW AS N
+FOR EACH ROW
+BEGIN ATOMIC
+    INSERT INTO ORDLIB.EMBED_QUEUE (ITEMNUM, QUEUED_AT)
+    VALUES (N.ITEMNUM, CURRENT_TIMESTAMP);
+END;</pre>
+
+<p>The Python job then queries EMBED_QUEUE for pending items, embeds them, updates ITEMMASTER, and deletes the processed queue entries — decoupling embedding latency from the insert path entirely.</p>
+
+<h2>Performance Considerations</h2>
+
+<p>Several factors determine the practical limits of brute-force cosine similarity search in DB2 for i:</p>
+
+<ul>
+  <li><strong>Row count</strong> — brute-force similarity scan is O(n). Up to ~50,000 rows with pre-filtering, the COSINE_SIM UDF approach is practical with sub-second response. For 500,000+ rows, aggressive pre-filtering (ITEMCLASS, ACTIVEIND, date ranges) is essential to keep the candidate set under 10,000 rows.</li>
+  <li><strong>Vector dimension</strong> — 384-dimensional watsonx.ai vectors compute roughly 4x faster than 1536-dimensional OpenAI vectors. For large tables, the smaller model is a worthwhile trade-off.</li>
+  <li><strong>JSON parsing overhead</strong> — the JSON_TABLE expansion in the COSINE_SIM UDF parses the JSON string on every call. Storing vectors as VARBINARY and unpacking in Python before the SQL call reduces this overhead for bulk operations.</li>
+  <li><strong>Caching query embeddings</strong> — if the same semantic queries recur (e.g., a fixed set of category searches), cache the query vectors in a small DB2 table rather than calling the API on every search.</li>
+  <li><strong>Embedding once, search many times</strong> — the cost of embedding is paid once at insert time. Search is cheap because the vectors are already stored. The batch embedding approach (daily or on-insert via queue) is always preferable to embedding at query time.</li>
+</ul>
+
+<h2>Summary</h2>
+
+<p>Vector search and text embeddings are available today on IBM i using Python in PASE, OpenAI or watsonx.ai embedding APIs, and standard DB2 for i SQL with a custom COSINE_SIM UDF. The pattern is straightforward: generate embeddings for existing text fields in a batch job, store the float arrays as JSON CLOBs alongside the source data, embed search queries at query time, and rank results by cosine similarity. For RAG, add a second step that passes the retrieved IBM i records as context to GPT-4o or IBM Granite, producing factual answers grounded in your actual business data. IBM i's decades of accumulated text data become a semantic search resource without any migration, without any new infrastructure beyond PASE Python, and without replacing a single line of existing RPG or CL code.</p>
+
+<em>Next post: IBM i Application Modernisation Roadmap — evaluating modernisation strategies for IBM i applications in 2026, from screen scraping and API wrapping to full rewrite, choosing the right approach for your organisation, and the tools and frameworks available today.</em>

@@ -1,0 +1,303 @@
+<p>The previous post covered IBM i integration with Microsoft Azure — streaming DB2 for i data to Azure Event Hubs, offloading data to Azure Blob Storage, reliable messaging with Azure Service Bus, and connecting to Azure SQL Database from PASE using the Python Azure SDK and pyodbc with ODBC Driver 18 for SQL Server. This post covers IBM i work management in depth: the architecture of subsystem descriptions, routing entries, class objects, job queue entries, multi-threaded jobs, and how to diagnose performance problems with WRKACTJOB and Collection Services.</p>
+
+<h2>Work Management Concepts</h2>
+
+<p>Every unit of work on IBM i — interactive sessions, submitted batch jobs, autostart jobs, prestart jobs, and server jobs — runs inside a <strong>subsystem</strong>. The subsystem is the container that controls what work can enter, how much system resource that work receives, and how many concurrent jobs can run. Understanding the work management architecture is a prerequisite for performance tuning and for building reliable, predictable batch environments.</p>
+
+<p>IBM i ships with several default subsystems:</p>
+<ul>
+  <li><strong>QINTER</strong> — interactive workstation jobs (5250 sessions, TN5250 emulators)</li>
+  <li><strong>QBATCH</strong> — general-purpose batch processing; most SBMJOB commands target QBATCH by default</li>
+  <li><strong>QSYSWRK</strong> — system work including database server jobs, data queue servers, and spool writers</li>
+  <li><strong>QSERVER</strong> — file server and DDM server jobs</li>
+  <li><strong>QUSRWRK</strong> — user server jobs including DDM, DRDA, and program-to-program connections</li>
+</ul>
+
+<p>Using only the default subsystems causes all application batch jobs to compete in the same QBATCH queue, which makes it impossible to guarantee that high-priority batch finishes before low-priority background work. The solution is to create application-specific subsystems with dedicated job queues, routing entries, and class objects.</p>
+
+<h2>Subsystem Description Components</h2>
+
+<p>A subsystem description (SBSD object) is made up of five key elements. Understanding all five is essential before creating a custom subsystem.</p>
+<ul>
+  <li><strong>Work entries</strong> — define how jobs enter the subsystem: autostart job entries (jobs that start when the subsystem starts), workstation entries (interactive jobs from named or generic display devices), job queue entries (batch jobs submitted to a job queue), prestart job entries (pre-initialised program instances waiting to accept work), and communication entries (APPC/TCP server jobs)</li>
+  <li><strong>Routing entries</strong> — determine where a job goes inside the subsystem once it has entered; the subsystem compares a routing data value from the job against comparison values in the routing table, and the first match determines which program starts the job and which class object governs it</li>
+  <li><strong>Job queue entries</strong> — associate a job queue object (JOBQ) with the subsystem; the MAXACT parameter controls how many batch jobs from that queue can run simultaneously</li>
+  <li><strong>Class objects</strong> — specify the resource limits for jobs matched by a routing entry: run priority (RUNPTY), time slice (TIMESLICE), default wait time (DFTWAIT), maximum CPU percentage (MAXCPU), and whether the job is eligible for purging from main storage (PURGE)</li>
+  <li><strong>Prestart job entries</strong> — pre-initialise a set of program instances so that incoming server calls do not incur the overhead of a full job initialisation; used for IBM i Access server jobs and high-volume application servers</li>
+</ul>
+
+<h2>Creating a Custom Subsystem</h2>
+
+<p>This example creates <strong>APPSBS</strong> in <strong>APPLIB</strong> — a dedicated subsystem for application batch jobs, separate from the interactive QINTER and general QBATCH subsystems. All commands are CL.</p>
+
+<pre>
+/* Step 1: Create the subsystem description */
+CRTSBSD SBSD(APPLIB/APPSBS)
+        POOLS((1 *BASE))
+        TEXT('Application batch subsystem')
+
+/* Step 2: Create the application job queue */
+CRTJOBQ JOBQ(APPLIB/APPJOBQ)
+        TEXT('Application batch job queue')
+
+/* Step 3: Create a high-priority class object for critical batch */
+CRTCLS CLS(APPLIB/APPHICLS)
+       RUNPTY(30)
+       TIMESLICE(2000)
+       DFTWAIT(30)
+       PURGE(*YES)
+       MAXCPU(80)
+       TEXT('High-priority application batch class')
+
+/* Step 4: Create a standard class object for normal batch */
+CRTCLS CLS(APPLIB/APPSTDCLS)
+       RUNPTY(50)
+       TIMESLICE(2000)
+       DFTWAIT(30)
+       PURGE(*YES)
+       MAXCPU(40)
+       TEXT('Standard application batch class')
+
+/* Step 5: Add the job queue entry — max 5 concurrent jobs from APPJOBQ */
+ADDJOBQE SBSD(APPLIB/APPSBS)
+         JOBQ(APPLIB/APPJOBQ)
+         MAXACT(5)
+         SEQNBR(10)
+
+/* Step 6: Add routing entry for high-priority jobs (routing data = APPHIGH) */
+ADDRTGE SBSD(APPLIB/APPSBS)
+        SEQNBR(10)
+        CMPVAL('APPHIGH' 1)
+        PGM(QSYS/QCMD)
+        CLS(APPLIB/APPHICLS)
+
+/* Step 7: Add routing entry for standard jobs (catch-all *ANY) */
+ADDRTGE SBSD(APPLIB/APPSBS)
+        SEQNBR(9999)
+        CMPVAL(*ANY)
+        PGM(QSYS/QCMD)
+        CLS(APPLIB/APPSTDCLS)
+
+/* Step 8: Start the subsystem */
+STRSBS SBSD(APPLIB/APPSBS)
+</pre>
+
+<p>Submit a high-priority job to the new subsystem by specifying both the job queue and the routing data:</p>
+
+<pre>
+/* Submit a critical batch job to run in the high-priority class */
+SBMJOB JOB(CRITBATCH) JOBD(APPLIB/APPJOBD) JOBQ(APPLIB/APPJOBQ) +
+       RTGDTA('APPHIGH') CMD(CALL PGM(APPLIB/CRITBPGM))
+</pre>
+
+<p>Jobs submitted without explicit RTGDTA will match the *ANY routing entry (sequence 9999) and run under the standard class.</p>
+
+<h2>Routing Entries (ADDRTGE)</h2>
+
+<p>Routing entries are the mechanism that maps a job to a class and a program. The <strong>comparison value</strong> (CMPVAL) is compared against characters in the job's routing data (RTGDTA), starting at the position specified. The first routing entry whose comparison value matches — in ascending sequence number order — wins.</p>
+
+<pre>
+/* Interactive workstation entry: matches any routing data from QINTER */
+ADDRTGE SBSD(APPLIB/APPSBS)
+        SEQNBR(5)
+        CMPVAL('QCMDI' 1)
+        PGM(QSYS/QCMD)
+        CLS(APPLIB/APPSTDCLS)
+
+/* PASE jobs use routing data starting with 'QPASE' */
+ADDRTGE SBSD(APPLIB/APPSBS)
+        SEQNBR(20)
+        CMPVAL('QPASE' 1)
+        PGM(QSH/QPASEINIT)
+        CLS(APPLIB/APPSTDCLS)
+
+/* Named program routing: jobs running ORDRPG get high priority */
+ADDRTGE SBSD(APPLIB/APPSBS)
+        SEQNBR(30)
+        CMPVAL('ORDRPG' 1)
+        PGM(QSYS/QCMD)
+        CLS(APPLIB/APPHICLS)
+
+/* Default: everything else runs under standard class */
+ADDRTGE SBSD(APPLIB/APPSBS)
+        SEQNBR(9999)
+        CMPVAL(*ANY)
+        PGM(QSYS/QCMD)
+        CLS(APPLIB/APPSTDCLS)
+</pre>
+
+<p>Display all routing entries for a subsystem:</p>
+
+<pre>
+DSPSBSD SBSD(APPLIB/APPSBS) OUTPUT(*PRINT) TYPE(*RTE)
+</pre>
+
+<p>The routing data for a submitted job comes from the RTGDTA parameter of SBMJOB, or from the job description (JOBD) if RTGDTA(*JOBD) is specified on SBMJOB. Interactive jobs receive their routing data from the QPGMNAME/QPARM in the workstation entry, which defaults to QCMDI.</p>
+
+<h2>Class Objects (CRTCLS)</h2>
+
+<p>Class objects govern the resource profile for any job running under that routing entry. The key parameters and their effects:</p>
+<ul>
+  <li><strong>RUNPTY</strong> (1–99, lower = higher priority) — the run priority determines how frequently the dispatcher gives CPU time to the job; interactive jobs at priority 20, critical batch at 30, standard batch at 50, background at 70</li>
+  <li><strong>TIMESLICE</strong> (1–9999999 ms) — maximum uninterrupted CPU time before the job is preempted; 2000 ms (2 seconds) is a common default; very short values (100 ms) increase context-switch overhead</li>
+  <li><strong>DFTWAIT</strong> (1–9999 seconds, *NOMAX) — default wait time for lock requests; if a job waits longer than this for a record lock or object lock it receives a CPF1222 message; 30 seconds is typical for interactive, longer for batch</li>
+  <li><strong>PURGE(*YES/*NO)</strong> — whether the job's data pages can be moved to auxiliary storage (paged out) when main storage is under pressure; *YES for batch, *NO for latency-sensitive interactive</li>
+  <li><strong>MAXCPU(1–100, *NOMAX)</strong> — maximum CPU percentage this job can consume over any 30-second period; prevents a runaway batch job from consuming all CPU; set *NOMAX for jobs where throughput must not be throttled</li>
+</ul>
+
+<pre>
+/* Create a class for interactive jobs — high priority, no CPU cap, no purge */
+CRTCLS CLS(APPLIB/APPINTCLS)
+       RUNPTY(20)
+       TIMESLICE(500)
+       DFTWAIT(30)
+       PURGE(*NO)
+       MAXCPU(*NOMAX)
+       TEXT('Interactive class — fast response, no throttle')
+
+/* Change a class object while the subsystem is active */
+CHGCLS CLS(APPLIB/APPSTDCLS) RUNPTY(55) MAXCPU(30)
+
+/* Display class object details */
+DSPCLS CLS(APPLIB/APPHICLS)
+</pre>
+
+<p>CHGCLS takes effect for new jobs matching that routing entry. Jobs already running are not affected until they terminate and restart — to change a running job's priority immediately, use CHGJOB:</p>
+
+<pre>
+/* Change the run priority of a specific active job immediately */
+CHGJOB JOB(123456/APIUSER/CRITBATCH) RUNPTY(25)
+</pre>
+
+<h2>Job Queue Entries (ADDJOBQE)</h2>
+
+<p>Job queue entries connect a JOBQ object to a subsystem and specify the maximum number of batch jobs from that queue that can be active simultaneously.</p>
+
+<pre>
+/* Add a second job queue for low-priority background jobs */
+CRTJOBQ JOBQ(APPLIB/APPBKGJOBQ)
+        TEXT('Low-priority background job queue')
+
+ADDJOBQE SBSD(APPLIB/APPSBS)
+         JOBQ(APPLIB/APPBKGJOBQ)
+         MAXACT(2)
+         SEQNBR(20)
+
+/* Unlimited concurrent jobs from the high-priority queue */
+CRTJOBQ JOBQ(APPLIB/APPHIJOBQ) TEXT('High-priority job queue')
+
+ADDJOBQE SBSD(APPLIB/APPSBS)
+         JOBQ(APPLIB/APPHIJOBQ)
+         MAXACT(*NOMAX)
+         SEQNBR(5)
+</pre>
+
+<p>When a job queue reaches its MAXACT limit, additional submitted jobs wait in JOBQ status until an active job completes. This is the primary mechanism for controlling concurrency in batch environments — for example, limiting the number of simultaneous report generation jobs to avoid saturating disk I/O.</p>
+
+<p>Display jobs currently waiting in a job queue:</p>
+
+<pre>
+WRKJOBQ JOBQ(APPLIB/APPJOBQ)
+</pre>
+
+<p>Move a waiting job to a different queue or change its scheduling priority:</p>
+
+<pre>
+/* Move a job from standard queue to high-priority queue */
+CHGJOB JOB(123456/APIUSER/RPTJOB) JOBQ(APPLIB/APPHIJOBQ)
+</pre>
+
+<h2>Multi-Threaded Jobs on IBM i</h2>
+
+<p>IBM i creates multiple threads automatically for several workloads:</p>
+<ul>
+  <li><strong>SQL parallel processing</strong> — DB2 for i uses multiple database server threads for parallel query execution when the query benefits from parallelism; controlled by the DEGREE parameter in QAQQINI or SET CURRENT DEGREE in SQL</li>
+  <li><strong>Java jobs</strong> — the JVM creates threads for garbage collection, JIT compilation, and application threads</li>
+  <li><strong>PASE Node.js and Python</strong> — Node.js runs a libuv I/O thread pool alongside the event loop; Python multiprocessing creates OS threads in PASE</li>
+  <li><strong>ILE service programs with ACTGRPINIT(*CALLER) activation groups</strong> — share the initial thread's activation group</li>
+</ul>
+
+<p>The RUNPTY and SCDPTY on CHGJOB apply to the <strong>initial thread</strong>. Secondary threads inherit the initial thread's run priority but can be changed individually only via Java or PASE system calls — not from CL.</p>
+
+<p>Monitor thread activity for a specific job:</p>
+
+<pre>
+/* Display all threads within a job */
+WRKJOB JOB(123456/APIUSER/NODEJOB) OPTION(*THREAD)
+</pre>
+
+<p>Commitment control in multi-threaded jobs has important restrictions: a commitment definition is local to a thread on IBM i. If multiple threads in a single job need transactional consistency, each thread must manage its own commit boundary — they cannot share a commitment definition. This is a common trap when migrating single-threaded RPG programs to a multi-threaded PASE environment.</p>
+
+<p>ILE activation groups and multi-threading: each thread in an ILE job has its own call stack, but activation groups are job-scoped (not thread-scoped) unless created with ACTGRP(*NEW) from the thread. Service programs activated in the initial thread are visible to all threads, which can cause unexpected sharing of static storage in non-threadsafe procedures. Mark service programs as threadsafe with CHGBNDSRVPGM PGMTHD(*THREAD) only if all procedures are written to be reentrant.</p>
+
+<h2>Diagnosing Performance with WRKACTJOB and Collection Services</h2>
+
+<p>The first tool for real-time IBM i performance diagnosis is WRKACTJOB — it shows all active jobs across all subsystems with CPU%, elapsed time, and job type.</p>
+
+<pre>
+/* Show active jobs in a specific subsystem, refreshed every 10 seconds */
+WRKACTJOB SBS(APPSBS) RESET(*YES) SRTFLD(*CPUPCT)
+
+/* Print a performance snapshot to a spool file */
+WRKACTJOB OUTPUT(*PRINT)
+
+/* Show all active jobs sorted by CPU percentage (highest first) */
+WRKACTJOB SRTFLD(*CPUPCT)
+</pre>
+
+<p>Key WRKACTJOB columns to monitor:</p>
+<ul>
+  <li><strong>CPU%</strong> — percentage of system CPU consumed by this job in the collection interval; consistently high values indicate CPU-bound work</li>
+  <li><strong>PRT (Priority)</strong> — run priority; compare against expected class priority to confirm routing is correct</li>
+  <li><strong>STS (Status)</strong> — JVAW means the job is waiting on a Java lock; LCKW means a record or object lock wait; DKYW means waiting for disk I/O</li>
+  <li><strong>MEM</strong> — main storage pages allocated</li>
+</ul>
+
+<p>For sustained performance monitoring, use <strong>Collection Services</strong> (formerly Performance Monitor). Collection Services records hundreds of performance metrics at configurable intervals and stores them in a Performance Data library for later analysis.</p>
+
+<pre>
+/* Start Collection Services with 5-minute collection interval */
+STRPFRCOL INTERVAL(5) COLLLIB(PERFDATA) CYCLIC(*YES) DAYSTOKEEP(7)
+
+/* Stop Collection Services */
+ENDPFRCOL
+
+/* Convert performance data to database files for custom SQL analysis */
+CRTPFRDTA FROMLIB(PERFDATA) TOLIB(PERFANL) FROMSYS(*LCL)
+</pre>
+
+<p>After converting the performance data, query the resulting database tables from SQL to identify bottlenecks:</p>
+
+<pre>
+-- Top CPU-consuming jobs in the last 24 hours
+SELECT
+    JBNAME   AS JOB_NAME,
+    JBUSER   AS JOB_USER,
+    JBSBS    AS SUBSYSTEM,
+    SUM(JPCTCPU) AS TOTAL_CPU_PCT,
+    AVG(JPCTCPU) AS AVG_CPU_PCT,
+    MAX(JPCTCPU) AS PEAK_CPU_PCT,
+    COUNT(*)     AS INTERVALS
+FROM PERFANL.QJOBMI
+WHERE INTSTTIM >= CURRENT_TIMESTAMP - 24 HOURS
+GROUP BY JBNAME, JBUSER, JBSBS
+ORDER BY TOTAL_CPU_PCT DESC
+FETCH FIRST 20 ROWS ONLY;
+
+-- Interactive response time trend by hour
+SELECT
+    HOUR(INTSTTIM) AS HOUR_OF_DAY,
+    AVG(AVGRSP)    AS AVG_RESPONSE_MS,
+    MAX(AVGRSP)    AS PEAK_RESPONSE_MS,
+    SUM(TRNCNT)    AS TRANSACTION_COUNT
+FROM PERFANL.QSYSMI
+WHERE DATE(INTSTTIM) = CURRENT DATE - 1 DAY
+GROUP BY HOUR(INTSTTIM)
+ORDER BY HOUR_OF_DAY;
+</pre>
+
+<p>In IBM i Navigator (the browser-based management interface), the <strong>Performance Data Investigator (PDI)</strong> provides pre-built interactive charts for CPU utilisation, disk arm utilisation, interactive response time, and batch throughput — useful for presenting performance trends to management without writing custom SQL.</p>
+
+<p>The combination of a custom subsystem (APPSBS with dedicated routing entries, class objects, and job queues) and Collection Services monitoring gives you both control over workload behaviour and visibility into what is actually happening — the two essentials for running IBM i at predictable performance levels in production.</p>
+
+<em>Next post: IBM Merlin and VS Code for IBM i Development — IBM Merlin IDE for IBM i, the IBM i extension for VS Code, editing RPG and CL source in VS Code with syntax highlighting and error feedback, Git integration for IBM i source, and the modern IBM i developer workstation setup in 2026.</em>

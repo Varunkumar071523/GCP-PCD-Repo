@@ -1,0 +1,474 @@
+<p>The previous post covered IBM i message files and exception handling in CL — message types (<strong>*ESCAPE</strong>, <strong>*STATUS</strong>, <strong>*NOTIFY</strong>), <strong>SNDPGMMSG</strong>, <strong>MONMSG</strong> structured exception handling, <strong>RCVMSG</strong> for retrieving message data, and building a complete CL error handling pattern with audit logging. This post covers the ILE binding and activation group model in depth: how modules, programs, service programs, and binding directories relate to each other, how <strong>CRTPGM</strong> and <strong>CRTSRVPGM</strong> work, what the difference between <strong>*NEW</strong>, <strong>*CALLER</strong>, and named activation groups means for your runtime behaviour, and how to design reusable service programs that survive upgrades without recompiling callers.</p>
+
+<h2>The ILE Object Model Recap</h2>
+
+<p>ILE (Integrated Language Environment) introduces a layered object model that is quite different from the older OPM (Original Program Model). Understanding the four building blocks is essential before touching any compile commands.</p>
+
+<ul>
+  <li><strong>Module (*MODULE)</strong> — the compiled output of a single source member. Created with <strong>CRTRPGMOD</strong> (RPG IV), <strong>CRTCMOD</strong> (C), or <strong>CRTCLMOD</strong> (CL). A module is not executable on its own; it contains compiled procedures and their object code, plus a table of unresolved external references.</li>
+  <li><strong>Program (*PGM)</strong> — an executable object created by binding one or more modules together with <strong>CRTPGM</strong>. The linker resolves all external references at bind time. Only one module may be the entry module (containing the program entry procedure, PEP).</li>
+  <li><strong>Service Program (*SRVPGM)</strong> — a shared library of exported procedures. Created with <strong>CRTSRVPGM</strong>. A service program has no entry point; instead, callers bind to the procedures it exports. Multiple programs can bind to the same service program, sharing its code but each getting their own activation.</li>
+  <li><strong>Binding Directory (*BNDDIR)</strong> — an ordered list of service programs and modules that the system searches when resolving unresolved references during <strong>CRTPGM</strong> or <strong>CRTBNDRPG</strong>. It does not contain the objects themselves — it is merely a name list pointing to where they live.</li>
+</ul>
+
+<p>The relationship is: source &rarr; module (CRTRPGMOD) &rarr; program (CRTPGM binding modules) or service program (CRTSRVPGM). Binding directories make it convenient to tell CRTPGM where to search without listing every service program explicitly.</p>
+
+<h2>CRTPGM and Module Binding</h2>
+
+<p><strong>CRTPGM</strong> is the linker for IBM i ILE. It takes one or more modules, resolves all unresolved procedure calls between them, and produces a single executable *PGM object. Here is a realistic example binding an order processing program from three modules:</p>
+
+<pre>
+CRTPGM PGM(ORDLIB/ORDPRC)
+       MODULE(ORDLIB/ORDPRC ORDLIB/ORDVAL ORDLIB/ORDCALC)
+       BNDDIR(ORDLIB/ORDBD)
+       ACTGRP(*NEW)
+       DETAIL(*EXTENDED)
+       TEXT('Order processing - main entry')
+</pre>
+
+<p>In this command:</p>
+<ul>
+  <li><strong>MODULE</strong> lists the modules to bind, in order. The first module listed is the entry module unless you specify <strong>ENTMOD</strong> explicitly.</li>
+  <li><strong>BNDDIR</strong> lists binding directories to search for any references not satisfied by the explicitly listed modules. <code>ORDLIB/ORDBD</code> might contain <code>ORDSVC</code> and <code>DBSVC</code> service programs.</li>
+  <li><strong>ACTGRP(*NEW)</strong> assigns the activation group for the program at runtime (discussed below).</li>
+  <li><strong>DETAIL(*EXTENDED)</strong> writes a detailed binding listing to the job log, showing every module considered, every procedure reference resolved, and which service program satisfied each reference — invaluable for diagnosing unresolved reference errors.</li>
+</ul>
+
+<p>To create the individual modules first:</p>
+
+<pre>
+CRTRPGMOD MODULE(ORDLIB/ORDPRC)  SRCFILE(ORDLIB/QRPGLESRC) SRCMBR(ORDPRC)
+CRTRPGMOD MODULE(ORDLIB/ORDVAL)  SRCFILE(ORDLIB/QRPGLESRC) SRCMBR(ORDVAL)
+CRTRPGMOD MODULE(ORDLIB/ORDCALC) SRCFILE(ORDLIB/QRPGLESRC) SRCMBR(ORDCALC)
+</pre>
+
+<p>Alternatively, <strong>CRTBNDRPG</strong> compiles a single-source RPG program in one step (source &rarr; module &rarr; program), which is convenient for simple programs but bypasses the opportunity to share modules across programs. For production service-oriented design, prefer <strong>CRTRPGMOD</strong> followed by <strong>CRTPGM</strong>.</p>
+
+<p>Use <strong>DSPPGM</strong> to inspect a bound program after creation:</p>
+
+<pre>
+DSPPGM PGM(ORDLIB/ORDPRC) DETAIL(*MODULE)
+</pre>
+
+<p>This shows every module bound into the program, plus which service programs are referenced and their current signature. Keep this output when debugging signature mismatch errors after updating a service program.</p>
+
+<h2>Service Programs (CRTSRVPGM)</h2>
+
+<p>A <strong>*SRVPGM</strong> is the IBM i equivalent of a shared library (DLL on Windows, .so on Linux). It exposes a set of procedures that calling programs bind to at compile time. The key distinction from a *PGM: there is no entry point, so it cannot be called directly; callers use <strong>CALLPRC</strong> (in CL) or a procedure call (in RPG free-format) to invoke its exported procedures.</p>
+
+<p>Creating a service program requires an <strong>export list</strong> — a source file member that lists the exact procedure names to make public. By convention this file has extension <code>.exp</code> or is a member in <code>QSRVSRC</code>:</p>
+
+<pre>
+/* ORDLIB/QSRVSRC(ORDSVC) - export list for ORDSVC service program */
+STRPGMEXP PGMLVL(*CURRENT) SIGNATURE('ORDSVC_V1')
+  EXPORT SYMBOL('GETORDER')
+  EXPORT SYMBOL('VALIDATEORDER')
+  EXPORT SYMBOL('SAVEORDER')
+  EXPORT SYMBOL('CANCELORDER')
+ENDPGMEXP
+</pre>
+
+<p>Then create the service program:</p>
+
+<pre>
+CRTSRVPGM SRVPGM(ORDLIB/ORDSVC)
+          MODULE(ORDLIB/ORDSVC)
+          SRCFILE(ORDLIB/QSRVSRC)
+          SRCMBR(ORDSVC)
+          ACTGRP(*CALLER)
+          TEXT('Order service program - V1')
+</pre>
+
+<p><strong>Signature management</strong> is the most important concept for long-term service program maintenance. When you create a service program, IBM i computes a signature from the export list. Every program that binds to the service program records that signature. If you later recreate the service program with a changed or new export list, the signature changes, and all bound callers fail at activation time with a signature mismatch error.</p>
+
+<p>The solution is to use <strong>*CURRENT</strong> and <strong>*COMPATIBLE</strong> in the export source:</p>
+
+<pre>
+/* Adding a new procedure - backward compatible upgrade */
+STRPGMEXP PGMLVL(*CURRENT) SIGNATURE('ORDSVC_V2')
+  EXPORT SYMBOL('GETORDER')
+  EXPORT SYMBOL('VALIDATEORDER')
+  EXPORT SYMBOL('SAVEORDER')
+  EXPORT SYMBOL('CANCELORDER')
+  EXPORT SYMBOL('GETORDERLINES')   /* new in V2 */
+ENDPGMEXP
+
+STRPGMEXP PGMLVL(*PRV) SIGNATURE('ORDSVC_V1')
+  EXPORT SYMBOL('GETORDER')
+  EXPORT SYMBOL('VALIDATEORDER')
+  EXPORT SYMBOL('SAVEORDER')
+  EXPORT SYMBOL('CANCELORDER')
+ENDPGMEXP
+</pre>
+
+<p>With this two-block export source, <strong>CRTSRVPGM</strong> creates a service program with two signatures. Programs bound to <code>ORDSVC_V1</code> continue to work without recompilation; new programs can bind to <code>ORDSVC_V2</code> and call <code>GETORDERLINES</code> as well. Use <strong>UPDSRVPGM</strong> to update an existing service program in place, preserving its object identity:</p>
+
+<pre>
+UPDSRVPGM SRVPGM(ORDLIB/ORDSVC)
+          MODULE(ORDLIB/ORDSVC)
+          SRCFILE(ORDLIB/QSRVSRC)
+          SRCMBR(ORDSVC)
+</pre>
+
+<p>Inspect a service program's exports and signature with:</p>
+
+<pre>
+DSPSRVPGM SRVPGM(ORDLIB/ORDSVC) DETAIL(*PROCEXP)
+</pre>
+
+<h2>Binding Directories (CRTBNDDIR / ADDBNDIRE)</h2>
+
+<p>A binding directory is a lightweight catalogue: it maps service program and module names to their libraries so that <strong>CRTPGM</strong> and <strong>CRTBNDRPG</strong> can find them automatically without requiring you to list every dependency on the command line.</p>
+
+<pre>
+/* Create the binding directory */
+CRTBNDDIR BNDDIR(ORDLIB/ORDBD) TEXT('Order system binding directory')
+
+/* Add service programs to it */
+ADDBNDIRE BNDDIR(ORDLIB/ORDBD) OBJ((ORDLIB/ORDSVC *SRVPGM))
+ADDBNDIRE BNDDIR(ORDLIB/ORDBD) OBJ((ORDLIB/DBSVC  *SRVPGM))
+ADDBNDIRE BNDDIR(ORDLIB/ORDBD) OBJ((ORDLIB/LOGSVC *SRVPGM))
+
+/* Optionally add a utility module */
+ADDBNDIRE BNDDIR(ORDLIB/ORDBD) OBJ((ORDLIB/STRUTIL *MODULE))
+</pre>
+
+<p>Now any CRTPGM or CRTBNDRPG command that specifies <code>BNDDIR(ORDLIB/ORDBD)</code> will automatically search for unresolved references in those three service programs and the utility module, in the listed order. You can specify multiple binding directories:</p>
+
+<pre>
+CRTPGM PGM(ORDLIB/ORDPRC)
+       MODULE(ORDLIB/ORDPRC)
+       BNDDIR(ORDLIB/ORDBD QSYS/QC2LE)
+</pre>
+
+<p><code>QC2LE</code> is the IBM-supplied binding directory for C runtime functions; including it is standard practice for any program that indirectly uses C library procedures through utility service programs.</p>
+
+<p>Display the contents of a binding directory:</p>
+
+<pre>
+DSPBNDDIR BNDDIR(ORDLIB/ORDBD)
+</pre>
+
+<h2>Activation Groups</h2>
+
+<p>An <strong>activation group</strong> is a runtime container within a job. It holds the storage, open file handles, and commitment control state for the ILE programs and service programs running within it. Understanding activation groups is critical because they control resource sharing and isolation between programs.</p>
+
+<h2>*NEW Activation Group</h2>
+
+<p>When a program is compiled with <code>ACTGRP(*NEW)</code>, each call to that program creates a brand-new activation group. When the program returns or ends normally, the activation group is destroyed — open files are closed, storage is released, and any uncommitted transactions in that group are rolled back.</p>
+
+<pre>
+CRTPGM PGM(ORDLIB/ORPUTIL)
+       MODULE(ORDLIB/ORPUTIL)
+       ACTGRP(*NEW)
+</pre>
+
+<p>Use <code>*NEW</code> for:</p>
+<ul>
+  <li>Utility programs that must not share state with the caller</li>
+  <li>Programs that manage their own files and must ensure clean-up on exit</li>
+  <li>Interactive programs submitted to batch where isolation is required</li>
+</ul>
+
+<p>The drawback of <code>*NEW</code> is overhead: creating and destroying an activation group for every call is expensive. If a utility is called thousands of times in a batch loop, this overhead accumulates.</p>
+
+<h2>*CALLER Activation Group</h2>
+
+<p>With <code>ACTGRP(*CALLER)</code>, the called program or service program runs inside whatever activation group the caller is already using. It shares the caller's open files, storage, and — most importantly — the caller's commitment control scope.</p>
+
+<pre>
+CRTSRVPGM SRVPGM(ORDLIB/ORDSVC)
+          MODULE(ORDLIB/ORDSVC)
+          SRCFILE(ORDLIB/QSRVSRC)
+          SRCMBR(ORDSVC)
+          ACTGRP(*CALLER)
+</pre>
+
+<p>Use <code>*CALLER</code> for service programs that:</p>
+<ul>
+  <li>Participate in the caller's database transaction (so their INSERT/UPDATE is part of the same COMMIT)</li>
+  <li>Are called very frequently and must avoid activation group overhead</li>
+  <li>Need to share open database files with the caller for performance</li>
+</ul>
+
+<p><strong>Note:</strong> <code>*CALLER</code> is the recommended activation group for most service programs in a transaction-processing environment. If a service program uses <code>*NEW</code>, its database changes are in a separate commitment control scope and will not be rolled back if the caller issues a ROLLBACK — a common source of partial-commit bugs.</p>
+
+<h2>Named Activation Groups</h2>
+
+<p>A named activation group is created the first time a program with that activation group name is activated in a job. It persists across calls — the activation group is not destroyed when the program returns. This makes it ideal for stateful resources: database connection pools, cached data, or service programs that maintain internal state between calls.</p>
+
+<pre>
+CRTPGM PGM(ORDLIB/CONPOOL)
+       MODULE(ORDLIB/CONPOOL)
+       ACTGRP(ORDGRP)
+</pre>
+
+<pre>
+CRTSRVPGM SRVPGM(ORDLIB/CACHESVC)
+          MODULE(ORDLIB/CACHESVC)
+          SRCFILE(ORDLIB/QSRVSRC)
+          SRCMBR(CACHESVC)
+          ACTGRP(ORDGRP)
+</pre>
+
+<p>Both objects run in the named activation group <code>ORDGRP</code>. Data written to static storage in <code>CACHESVC</code> on one call is still there on the next call. To explicitly end a named activation group from RPG, use the <strong>DEALLOC(E)</strong> built-in or from CL use <strong>RCLACTGRP</strong>:</p>
+
+<pre>
+RCLACTGRP ACTGRP(ORDGRP)
+</pre>
+
+<h2>Commitment Control and Activation Groups</h2>
+
+<p>Commitment control scope is tied directly to the activation group. When you issue <strong>STRCMTCTL</strong>, you start commitment control for the current activation group. Every database change made by programs running in that activation group is part of the same transaction until you issue <strong>COMMIT</strong> or <strong>ROLLBACK</strong>.</p>
+
+<pre>
+STRCMTCTL LCKLVL(*CHG) CMTSCOPE(*ACTGRP)
+</pre>
+
+<p>The <code>CMTSCOPE(*ACTGRP)</code> parameter specifies that the commitment control scope applies to the current activation group only. This is the default and the recommended setting for ILE programs.</p>
+
+<p>The critical danger is mixing <code>*NEW</code> programs with commitment control when you expect unified transaction semantics. Consider this scenario:</p>
+
+<ul>
+  <li>Program A (ACTGRP named <code>ORDGRP</code>) starts a transaction and calls Program B</li>
+  <li>Program B was compiled with <code>ACTGRP(*NEW)</code> and also does database writes</li>
+  <li>Program A then issues a ROLLBACK</li>
+</ul>
+
+<p>Result: Program B's writes are in a separate activation group, so they are <strong>not</strong> rolled back by Program A's ROLLBACK. This partial-commit bug is silent and very hard to detect in production. The fix is to compile Program B with <code>ACTGRP(*CALLER)</code> so it participates in Program A's transaction.</p>
+
+<pre>
+/* RPG IV example showing commitment control in a service program */
+**FREE
+ctl-opt actgrp(*caller) dftactgrp(*no);
+
+dcl-proc SaveOrder export;
+  dcl-pi *n ind;
+    pOrderNum varchar(10) const;
+    pCustNum  varchar(10) const;
+    pAmt      packed(11:2) const;
+  end-pi;
+
+  exec sql
+    INSERT INTO ORDLIB.ORDHDR
+      (ORDNUM, CUSTNUM, ORDAMT, ORDDTE)
+    VALUES
+      (:pOrderNum, :pCustNum, :pAmt, CURRENT_DATE);
+
+  if sqlcode < 0;
+    return *off;  /* caller will rollback its activation group */
+  endif;
+
+  return *on;
+end-proc;
+</pre>
+
+<p>Because this service program uses <code>ACTGRP(*CALLER)</code>, the INSERT is part of whatever transaction the calling program started. If the caller rolls back, this INSERT is rolled back too.</p>
+
+<h2>Practical Service Program Design — A Complete Example</h2>
+
+<p>This section walks through the complete lifecycle of the <code>ORDLIB/ORDSVC</code> service program: source, export list, compile, binding directory, and a calling program.</p>
+
+<p><strong>Step 1: Write the service program source (ORDLIB/QRPGLESRC/ORDSVC)</strong></p>
+
+<pre>
+**FREE
+ctl-opt nomain actgrp(*caller) dftactgrp(*no);
+
+/copy ORDLIB/QCPYSRC,ORDSPECS        /* shared data structure prototypes */
+
+dcl-proc GetOrder export;
+  dcl-pi *n ind;
+    pOrderNum varchar(10)  const;
+    pOrder    likeDs(orderDs) options(*exact);
+  end-pi;
+
+  exec sql
+    SELECT ORDNUM, CUSTNUM, ORDAMT, ORDSTS, ORDDTE
+      INTO :pOrder
+      FROM ORDLIB.ORDHDR
+     WHERE ORDNUM = :pOrderNum
+       AND ORDSTS <> 'X';
+
+  return (sqlcode = 0);
+end-proc;
+
+dcl-proc ValidateOrder export;
+  dcl-pi *n ind;
+    pOrder likeDs(orderDs) const;
+  end-pi;
+
+  dcl-s custExists ind inz(*off);
+
+  exec sql
+    SELECT 1 INTO :custExists
+      FROM ORDLIB.CUSTMST
+     WHERE CUSTNUM = :pOrder.custNum
+       AND CUSSTS  = 'A';
+
+  if not custExists;
+    return *off;
+  endif;
+
+  if pOrder.ordAmt <= 0;
+    return *off;
+  endif;
+
+  return *on;
+end-proc;
+
+dcl-proc SaveOrder export;
+  dcl-pi *n ind;
+    pOrder likeDs(orderDs) const;
+  end-pi;
+
+  exec sql
+    INSERT INTO ORDLIB.ORDHDR
+      (ORDNUM, CUSTNUM, ORDAMT, ORDSTS, ORDDTE)
+    VALUES
+      (:pOrder.ordNum, :pOrder.custNum,
+       :pOrder.ordAmt, 'N', CURRENT_DATE);
+
+  return (sqlcode = 0);
+end-proc;
+</pre>
+
+<p><strong>Step 2: Create the export list (ORDLIB/QSRVSRC/ORDSVC)</strong></p>
+
+<pre>
+STRPGMEXP PGMLVL(*CURRENT) SIGNATURE('ORDSVC_V1')
+  EXPORT SYMBOL('GETORDER')
+  EXPORT SYMBOL('VALIDATEORDER')
+  EXPORT SYMBOL('SAVEORDER')
+ENDPGMEXP
+</pre>
+
+<p><strong>Step 3: Compile module and create service program</strong></p>
+
+<pre>
+CRTRPGMOD MODULE(ORDLIB/ORDSVC)
+          SRCFILE(ORDLIB/QRPGLESRC)
+          SRCMBR(ORDSVC)
+          DBGVIEW(*LIST)
+
+CRTSRVPGM SRVPGM(ORDLIB/ORDSVC)
+          MODULE(ORDLIB/ORDSVC)
+          SRCFILE(ORDLIB/QSRVSRC)
+          SRCMBR(ORDSVC)
+          ACTGRP(*CALLER)
+          TEXT('Order service program V1')
+</pre>
+
+<p><strong>Step 4: Create the binding directory and add ORDSVC</strong></p>
+
+<pre>
+CRTBNDDIR BNDDIR(ORDLIB/ORDBD)
+          TEXT('Order system binding directory')
+
+ADDBNDIRE BNDDIR(ORDLIB/ORDBD)
+          OBJ((ORDLIB/ORDSVC *SRVPGM))
+</pre>
+
+<p><strong>Step 5: Write a calling RPG program that binds via BNDDIR</strong></p>
+
+<pre>
+**FREE
+ctl-opt actgrp(*new) dftactgrp(*no) bnddir('ORDLIB/ORDBD');
+
+/copy ORDLIB/QCPYSRC,ORDSPECS
+
+dcl-s orderNum varchar(10);
+dcl-ds order   likeDs(orderDs);
+dcl-s ok       ind;
+
+orderNum = 'ORD001234';
+
+ok = GetOrder(orderNum : order);
+if not ok;
+  dsply ('Order not found: ' + orderNum);
+  *inlr = *on;
+  return;
+endif;
+
+ok = ValidateOrder(order);
+if not ok;
+  dsply ('Order validation failed for: ' + orderNum);
+  *inlr = *on;
+  return;
+endif;
+
+dsply ('Order loaded: cust=' + order.custNum);
+*inlr = *on;
+</pre>
+
+<p>Compile this calling program:</p>
+
+<pre>
+CRTBNDRPG PGM(ORDLIB/ORDMAIN)
+          SRCFILE(ORDLIB/QRPGLESRC)
+          SRCMBR(ORDMAIN)
+          BNDDIR(ORDLIB/ORDBD)
+          ACTGRP(*NEW)
+</pre>
+
+<h2>Debugging ILE Binding Problems</h2>
+
+<p>Binding and activation group problems surface in a handful of recurring patterns. Here are the most common errors and their diagnostic approaches.</p>
+
+<p><strong>RNQ0202 — Unresolved external reference</strong></p>
+<p>This compile-time error means the linker could not find a procedure that one of your modules calls. Diagnose with <code>DETAIL(*EXTENDED)</code> on CRTPGM, which lists every unresolved symbol. Check that:</p>
+<ul>
+  <li>The procedure name in the CALLPRC or RPG prototype exactly matches the EXPORT SYMBOL in the service program's export list (case-sensitive on some platform configurations)</li>
+  <li>The service program is listed in the BNDDIR or MODULE parameter</li>
+  <li>The service program exists in the library specified in the BNDDIR entry</li>
+</ul>
+
+<pre>
+CRTPGM PGM(ORDLIB/ORDPRC)
+       MODULE(ORDLIB/ORDPRC)
+       BNDDIR(ORDLIB/ORDBD)
+       DETAIL(*EXTENDED)    /* write full binding map to job log */
+</pre>
+
+<p><strong>Signature mismatch at activation time</strong></p>
+<p>If a service program is recreated (CRTSRVPGM without a *PRV export block), its signature changes. Any bound caller then fails at activation with message <code>MCH4431</code> or a service program not found error. Diagnose with DSPPGM on the calling program to see what signature it recorded at bind time, then DSPSRVPGM to see the current signatures on the service program:</p>
+
+<pre>
+DSPPGM    PGM(ORDLIB/ORDPRC)     DETAIL(*SRVPGM)
+DSPSRVPGM SRVPGM(ORDLIB/ORDSVC) DETAIL(*SIGNATURE)
+</pre>
+
+<p>If the signatures do not match, you must either recompile the calling program (to pick up the new signature) or use the *PRV export block technique described above so both old and new signatures coexist in the service program.</p>
+
+<p><strong>*CALLER activation group used with commitment control — partial commit</strong></p>
+<p>As described earlier, mixing *NEW and *CALLER programs in a transaction causes partial commits. Use the following SQL to audit which programs in a library use *NEW versus *CALLER activation groups:</p>
+
+<pre>
+SELECT PROGRAM_NAME, ACTIVATION_GROUP_ATTRIBUTE
+  FROM QSYS2.PROGRAM_INFO
+ WHERE PROGRAM_LIBRARY = 'ORDLIB'
+   AND PROGRAM_TYPE    = '*PGM'
+ ORDER BY PROGRAM_NAME;
+</pre>
+
+<p>For service programs:</p>
+
+<pre>
+SELECT SERVICE_PROGRAM_NAME, ACTIVATION_GROUP_ATTRIBUTE
+  FROM QSYS2.SERVICE_PROGRAM_INFO
+ WHERE SERVICE_PROGRAM_LIBRARY = 'ORDLIB'
+ ORDER BY SERVICE_PROGRAM_NAME;
+</pre>
+
+<p>Any service program that does database writes and shows <code>*NEW</code> in the activation group attribute is a candidate for a partial-commit bug if it is called from within a transaction managed by the caller.</p>
+
+<p><strong>Summary of activation group guidance:</strong></p>
+<ul>
+  <li>Service programs that participate in caller transactions: use <strong>*CALLER</strong></li>
+  <li>Standalone utility programs that manage their own resources: use <strong>*NEW</strong></li>
+  <li>Stateful or connection-pool service programs: use a <strong>named</strong> activation group</li>
+  <li>Interactive programs (menus, displays): typically <strong>*NEW</strong> for isolation</li>
+  <li>Never mix *NEW with commitment control where you expect unified rollback semantics</li>
+</ul>
+
+<em>Next post: DB2 for i JSON and XML Support — JSON_VALUE, JSON_QUERY, JSON_TABLE for shredding JSON into rows, FOR JSON to produce JSON output from SQL, XMLTABLE for XML parsing, and building JSON REST responses directly in DB2 for i SQL.</em>

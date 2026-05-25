@@ -1,0 +1,588 @@
+<p>The previous post covered IBM i security hardening — QSECURITY levels, user profile auditing with QSYS2.USER_INFO, object authority management, the QAUDJRN audit journal, network security settings, and Row and Column Access Control in DB2 for i. This post covers a topic every CL programmer needs to master: IBM i message files and structured exception handling. Without a deliberate error handling strategy, CL programmes leave jobs in unpredictable states, swallow errors silently, and make support debugging extremely difficult. This post works through the full architecture — from message file creation to a complete, production-ready CL error handling template.</p>
+
+<h2>IBM i Message Architecture</h2>
+
+<p>Understanding the plumbing before writing code saves significant time when debugging. IBM i messages flow through a layered architecture:</p>
+
+<ul>
+  <li><strong>Message file (MSGF object)</strong> — a physical object in a library that stores named message descriptions. IBM ships hundreds of system message files in QSYS (QCPFMSG, QRPGMSG, QSQLMSG, etc.). Application teams create their own in APPLIB or a dedicated MSGLIB.</li>
+  <li><strong>Message description</strong> — an individual message within a message file, identified by a seven-character message ID (e.g., APP0001). Includes first-level text (short), second-level text (detailed help), and a definition of replacement variable slots (&amp;1, &amp;2, etc.).</li>
+  <li><strong>Job message queue</strong> — every job has a private message queue. Messages sent to *SAME or *PRV within a call stack go here. It is the primary conduit for inter-programme communication and error propagation.</li>
+  <li><strong>External message queue (*EXT)</strong> — the interactive workstation's message queue. SNDPGMMSG to *EXT sends a message to the bottom of the user's screen. Used for user notifications from batch jobs transferred interactively.</li>
+  <li><strong>QSYSOPR message queue</strong> — the system operator's message queue. Inquiry messages (*INQ) sent here require an operator response. Used for escalation from batch programmes.</li>
+  <li><strong>Call message queue stack</strong> — IBM i maintains a separate message queue for every programme in the call stack. When a programme calls another programme, the callee has its own message queue. *ESCAPE messages sent by the callee are received by the caller's MONMSG. This stack-based propagation is the foundation of structured exception handling.</li>
+</ul>
+
+<h2>Message Types</h2>
+
+<p>The message type is the most important parameter in SNDPGMMSG. Choosing the wrong type is the most common mistake in CL error handling.</p>
+
+<ul>
+  <li><strong>*ESCAPE</strong> — The most severe type. Causes the programme that receives it to be removed from the call stack and returns control to the next caller that has a MONMSG for it. If nothing catches it, the job ends abnormally. Use *ESCAPE when a condition is unrecoverable — a required file is missing, a mandatory parameter is invalid, a database error occurred that cannot be retried.</li>
+  <li><strong>*STATUS</strong> — Sent to the *EXT message queue (the user's screen) as an informational status line. Does not halt execution. Used to report progress during long-running interactive programmes ("Processing order 10,432 of 50,000..."). Has no effect in batch jobs.</li>
+  <li><strong>*NOTIFY</strong> — Sent to the calling programme's message queue. The caller can choose to handle it or ignore it. If ignored, it is automatically converted to *ESCAPE. Used when the callee detects a problem but wants to give the caller the option to recover.</li>
+  <li><strong>*INFO</strong> — Informational message. Does not halt execution, does not require a response. Sent to the programme or operator message queue for logging purposes. The safest type — use it for audit trail messages and operational logging.</li>
+  <li><strong>*COMP</strong> — Completion message. Signals that a unit of work completed successfully. Displayed in green in interactive sessions. Used as a final confirmation message at the end of a batch programme.</li>
+  <li><strong>*DIAG</strong> — Diagnostic message. Sent to the caller's message queue along with an *ESCAPE. Used to provide additional context about what went wrong before the *ESCAPE message terminates the programme. You often see a series of *DIAG messages followed by one *ESCAPE in system error sequences.</li>
+</ul>
+
+<h2>SNDPGMMSG — Syntax and Practical Examples</h2>
+
+<p>The <strong>SNDPGMMSG</strong> command sends a message to a programme, user, or operator message queue. Its key parameters are:</p>
+
+<pre>
+SNDPGMMSG MSG('Literal message text')
+          TOPGMQ(*SAME)
+          MSGTYPE(*INFO)
+</pre>
+
+<p>Send an *INFO message to the operator message queue for audit logging:</p>
+
+<pre>
+PGM
+
+DCL VAR(&ORDNUM) TYPE(*CHAR) LEN(10)
+DCL VAR(&MSGTEXT) TYPE(*CHAR) LEN(100)
+
+/* ... processing ... */
+
+/* Log completion to QSYSOPR */
+CHGVAR VAR(&MSGTEXT) +
+       VALUE('Order processing complete. Orders processed: ' *CAT &ORDNUM)
+SNDPGMMSG MSG(&MSGTEXT) +
+          TOMSGQ(QSYSOPR) +
+          MSGTYPE(*INFO)
+
+ENDPGM
+</pre>
+
+<p>Send a *STATUS message to the interactive user's screen during processing:</p>
+
+<pre>
+DCL VAR(&COUNTER) TYPE(*DEC) LEN(7 0)
+DCL VAR(&COUNTSTR) TYPE(*CHAR) LEN(7)
+DCL VAR(&STATUSMSG) TYPE(*CHAR) LEN(50)
+
+CHGVAR VAR(&COUNTSTR) VALUE(&COUNTER)
+CHGVAR VAR(&STATUSMSG) +
+       VALUE('Processing record ' *CAT %TRIM(&COUNTSTR) *CAT ' ...')
+SNDPGMMSG MSG(&STATUSMSG) +
+          TOPGMQ(*EXT) +
+          MSGTYPE(*STATUS)
+</pre>
+
+<p>Send an *ESCAPE message to the calling programme when an unrecoverable error occurs:</p>
+
+<pre>
+/* Send escape to the programme one level up the call stack */
+SNDPGMMSG MSG('Required file APPLIB/ORDERS not found. Processing cancelled.') +
+          TOPGMQ(*PRV) +
+          MSGTYPE(*ESCAPE)
+</pre>
+
+<p>Send a *NOTIFY message to give the caller a choice:</p>
+
+<pre>
+/* Notify caller of a data quality issue — caller can choose to handle or ignore */
+SNDPGMMSG MSG('Customer record 10234 has no email address. Skipping email notification.') +
+          TOPGMQ(*PRV) +
+          MSGTYPE(*NOTIFY)
+</pre>
+
+<h2>Creating a Message File with CRTMSGF and ADDMSGD</h2>
+
+<p>Storing message text in a message file rather than hard-coding it in programme source has several advantages: messages can be translated, updated without recompiling, and reused across multiple programmes.</p>
+
+<p>Create the message file:</p>
+
+<pre>
+/* Create the application message file in APPLIB */
+CRTMSGF MSGF(APPLIB/APPMSG)
+        TEXT('Application message file for order processing system')
+</pre>
+
+<p>Add message descriptions with replacement variables:</p>
+
+<pre>
+/* APP0001 — order not found (one replacement variable: order number) */
+ADDMSGD MSGID(APP0001)
+        MSGF(APPLIB/APPMSG)
+        MSG('Order &1 was not found in the orders file.')
+        SECLVL('The order number &1 could not be located in APPLIB/ORDERS. +
+                Verify the order number is correct and that the ORDERS file +
+                is accessible from the current library list. +
+                Contact the application support team if the problem persists.')
+        FMT((*CHAR 10))
+        SEV(40)
+
+/* APP0002 — duplicate order detected (two replacement variables) */
+ADDMSGD MSGID(APP0002)
+        MSGF(APPLIB/APPMSG)
+        MSG('Duplicate order detected. Order &1 already exists for customer &2.')
+        SECLVL('A duplicate order was detected. Order number &1 for customer &2 +
+                already exists in the ORDERS file. The new order has not been created.')
+        FMT((*CHAR 10) (*CHAR 8))
+        SEV(50)
+
+/* APP0003 — informational: order created successfully */
+ADDMSGD MSGID(APP0003)
+        MSGF(APPLIB/APPMSG)
+        MSG('Order &1 created successfully for customer &2. Total value: &3.')
+        SECLVL('Order &1 has been created and written to APPLIB/ORDERS.')
+        FMT((*CHAR 10) (*CHAR 8) (*CHAR 15))
+        SEV(0)
+</pre>
+
+<p>Update an existing message description and review it:</p>
+
+<pre>
+/* Update the first-level text of APP0001 */
+CHGMSGD MSGID(APP0001)
+        MSGF(APPLIB/APPMSG)
+        MSG('Order number &1 was not found. Please verify and retry.')
+
+/* Display the message description */
+DSPMSGD RANGE(APP0001 APP0003) +
+        MSGF(APPLIB/APPMSG)
+</pre>
+
+<h2>Sending a Message File Message with SNDPGMMSG</h2>
+
+<p>Once message descriptions exist in a message file, send them by MSGID rather than by literal text. This supports translation and centralised maintenance.</p>
+
+<pre>
+PGM        PARM(&ORDNUM &CUSTID)
+
+DCL VAR(&ORDNUM)  TYPE(*CHAR) LEN(10)
+DCL VAR(&CUSTID)  TYPE(*CHAR) LEN(8)
+DCL VAR(&FOUND)   TYPE(*LGL)
+
+/* ... attempt to locate the order ... */
+
+/* If order not found, send *ESCAPE from message file */
+IF COND(&FOUND *EQ '0') THEN(DO)
+    SNDPGMMSG MSGID(APP0001)      /* Order &1 not found */
+              MSGF(APPLIB/APPMSG)
+              MSGDTA(&ORDNUM)     /* &1 replacement variable */
+              TOPGMQ(*PRV)        /* Send to calling programme */
+              MSGTYPE(*ESCAPE)
+ENDDO
+
+/* If order exists, send *COMP confirmation from message file */
+SNDPGMMSG MSGID(APP0003)
+          MSGF(APPLIB/APPMSG)
+          MSGDTA(&ORDNUM *CAT &CUSTID *CAT '          15,432.00 GBP')
+          TOPGMQ(*SAME)
+          MSGTYPE(*COMP)
+
+ENDPGM
+</pre>
+
+<p>When the message data spans multiple replacement variables, concatenate them to the required total length. Each variable occupies exactly the number of characters defined in the ADDMSGD FMT parameter, padded with spaces if necessary:</p>
+
+<pre>
+DCL VAR(&ORDNUM)  TYPE(*CHAR) LEN(10)
+DCL VAR(&CUSTID)  TYPE(*CHAR) LEN(8)
+DCL VAR(&MSGDTA)  TYPE(*CHAR) LEN(18)  /* 10 + 8 = 18 */
+
+CHGVAR VAR(&MSGDTA) VALUE(&ORDNUM *CAT &CUSTID)
+
+SNDPGMMSG MSGID(APP0002)
+          MSGF(APPLIB/APPMSG)
+          MSGDTA(&MSGDTA)
+          TOPGMQ(*PRV)
+          MSGTYPE(*ESCAPE)
+</pre>
+
+<h2>MONMSG — Structured Exception Handling</h2>
+
+<p><strong>MONMSG</strong> is CL's structured exception handler. It intercepts *ESCAPE messages sent to the current programme and routes execution to a recovery label. There are two forms: a command-level MONMSG (immediately follows a single command) and a programme-level MONMSG (specified once near the top of the programme, acts as a catch-all).</p>
+
+<p>The <strong>critical rule</strong>: a command-level MONMSG must appear immediately after the command it monitors, with no intervening commands. Any command between the monitored command and the MONMSG breaks the association.</p>
+
+<pre>
+PGM
+
+/* Programme-level catch-all — must appear near the top, before any commands */
+MONMSG MSGID(CPF0000) EXEC(GOTO CMDLBL(GLOBALERR))
+
+DCL VAR(&ORDFILE) TYPE(*CHAR) LEN(21) VALUE('APPLIB    ORDERS     ')
+DCL VAR(&MSGID)   TYPE(*CHAR) LEN(7)
+DCL VAR(&MSGTEXT) TYPE(*CHAR) LEN(256)
+DCL VAR(&MSGDTA)  TYPE(*CHAR) LEN(256)
+
+/* ── OVRDBF with command-level MONMSG ─────────────────────── */
+OVRDBF FILE(ORDERS) TOFILE(APPLIB/ORDERS) OVRSCOPE(*JOB)
+MONMSG MSGID(CPF0000) EXEC(GOTO CMDLBL(OVERRIDEFAILED))
+
+/* ── OPNQRYF with command-level MONMSG ───────────────────── */
+OPNQRYF FILE((APPLIB/ORDERS)) QRYSLT('STATUS = ''OPEN''')
+MONMSG MSGID(CPF0000) EXEC(GOTO CMDLBL(OPNFAILED))
+
+/* ── Main processing ─────────────────────────────────────── */
+CALL PGM(APPLIB/ORDPROCESS)
+MONMSG MSGID(CPF0000 APP0000) EXEC(GOTO CMDLBL(CALLFAILED))
+
+GOTO CMDLBL(NORMALEND)
+
+/* ── Recovery labels ─────────────────────────────────────── */
+OVERRIDEFAILED:
+    SNDPGMMSG MSG('OVRDBF for ORDERS failed — check library list.') +
+              TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+    GOTO CMDLBL(GLOBALERR)
+
+OPNFAILED:
+    SNDPGMMSG MSG('OPNQRYF on ORDERS failed — QRYSLT syntax error.') +
+              TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+    GOTO CMDLBL(GLOBALERR)
+
+CALLFAILED:
+    SNDPGMMSG MSG('ORDPROCESS returned an error — see following messages.') +
+              TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+    GOTO CMDLBL(GLOBALERR)
+
+GLOBALERR:
+    /* Retrieve the exception message — see RCVMSG section */
+    GOTO CMDLBL(ENDPGM)
+
+NORMALEND:
+    SNDPGMMSG MSG('Order processing completed normally.') +
+              TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+
+ENDPGM:
+ENDPGM
+</pre>
+
+<p>Monitor for a specific CPF message ID rather than the entire CPF prefix:</p>
+
+<pre>
+/* CPF1236 — file member not found */
+OPNDBF FILE(APPLIB/ORDERS) OPTION(*INP)
+MONMSG MSGID(CPF1236) EXEC(DO)
+    SNDPGMMSG MSG('ORDERS file member not found — creating default member.') +
+              TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+    ADDPFM FILE(APPLIB/ORDERS) MBR(*FIRST)
+ENDDO
+
+/* MCH1211 — decimal data error */
+CALL PGM(APPLIB/CALCVAT) PARM(&AMOUNT)
+MONMSG MSGID(MCH1211) EXEC(DO)
+    SNDPGMMSG MSG('Decimal data error in CALCVAT — amount field contains non-numeric data.') +
+              TOMSGQ(QSYSOPR) MSGTYPE(*DIAG)
+    SNDPGMMSG MSG('VAT calculation failed for record — review CALCVAT input data.') +
+              TOPGMQ(*PRV) MSGTYPE(*ESCAPE)
+ENDDO
+</pre>
+
+<h2>RCVMSG — Retrieving Message Data</h2>
+
+<p><strong>RCVMSG</strong> retrieves a message from a programme message queue and makes its data available in CL variables. It is the mechanism used in error handlers to find out exactly which exception occurred and what data accompanied it.</p>
+
+<pre>
+PGM
+
+DCL VAR(&MSGID)    TYPE(*CHAR) LEN(7)
+DCL VAR(&MSGTEXT)  TYPE(*CHAR) LEN(256)
+DCL VAR(&MSGDTA)   TYPE(*CHAR) LEN(256)
+DCL VAR(&MSGFLIB)  TYPE(*CHAR) LEN(10)
+DCL VAR(&SNDMSGFQ) TYPE(*CHAR) LEN(20)
+DCL VAR(&SNDJOB)   TYPE(*CHAR) LEN(10)
+
+/* ... main processing ... */
+GOTO CMDLBL(NORMALEND)
+
+ERRORHANDLER:
+    /* Retrieve the exception message from the current programme's message queue */
+    /* PGMQ(*SAME) = this programme's queue                                       */
+    /* MSGTYPE(*EXCP) = retrieve the exception (unhandled *ESCAPE) message        */
+    /* RMV(*NO) = leave the message in the queue (so we can resend it)            */
+    RCVMSG PGMQ(*SAME)         +
+           MSGTYPE(*EXCP)      +
+           MSGID(&MSGID)       +
+           MSG(&MSGTEXT)       +
+           MSGDTA(&MSGDTA)     +
+           SNDMSGFQ(&SNDMSGFQ) +
+           RMV(*NO)
+
+    /* If no exception message was found, set defaults */
+    IF COND(&MSGID *EQ ' ') THEN(DO)
+        CHGVAR VAR(&MSGID)   VALUE('CPF9898')
+        CHGVAR VAR(&MSGTEXT) VALUE('Unknown error — no exception message found.')
+    ENDDO
+
+    /* Log the message ID and text */
+    SNDPGMMSG MSG('Error in ORDPROCESS: ' *CAT %TRIM(&MSGID) *CAT ' — ' *CAT &MSGTEXT) +
+              TOMSGQ(QSYSOPR) +
+              MSGTYPE(*INFO)
+
+    /* Resend as *ESCAPE to propagate to the caller */
+    SNDPGMMSG MSGID(&MSGID)      +
+              MSGF(QCPFMSG)      +
+              MSGDTA(&MSGDTA)    +
+              TOPGMQ(*PRV)       +
+              MSGTYPE(*ESCAPE)
+
+NORMALEND:
+    SNDPGMMSG MSG('Processing complete.') +
+              TOPGMQ(*SAME) MSGTYPE(*COMP)
+
+ENDPGM
+</pre>
+
+<p>Retrieve the most recent *DIAG message to get secondary diagnostic context:</p>
+
+<pre>
+/* Retrieve the most recent diagnostic message sent before the escape */
+RCVMSG PGMQ(*SAME)         +
+       MSGTYPE(*LAST)       +
+       MSGID(&MSGID)        +
+       MSG(&MSGTEXT)        +
+       RMV(*YES)
+</pre>
+
+<h2>Complete CL Error Handling Pattern</h2>
+
+<p>The following is a complete, production-ready CL programme template. It incorporates: a global MONMSG catch-all, command-level MONMSG on every fallible command, an ERROR label that retrieves the exception message, logs it to a DB2 audit table via RUNSQL, sends notification to QSYSOPR, and propagates the error to the caller as *ESCAPE.</p>
+
+<pre>
+/* ============================================================ */
+/* APPLIB/ORDMAIN — Main order processing programme             */
+/* Demonstrates production CL error handling pattern            */
+/* ============================================================ */
+PGM        PARM(&INORDNUM)
+
+/* ── Parameters ────────────────────────────────────────────── */
+DCL VAR(&INORDNUM) TYPE(*CHAR) LEN(10)
+
+/* ── Error handling variables ──────────────────────────────── */
+DCL VAR(&MSGID)    TYPE(*CHAR) LEN(7)
+DCL VAR(&MSGTEXT)  TYPE(*CHAR) LEN(256)
+DCL VAR(&MSGDTA)   TYPE(*CHAR) LEN(256)
+DCL VAR(&SNDMSGFQ) TYPE(*CHAR) LEN(20)
+DCL VAR(&ERRFLAG)  TYPE(*LGL)  VALUE('0')
+
+/* ── Working variables ──────────────────────────────────────── */
+DCL VAR(&SQLSTMT)  TYPE(*CHAR) LEN(512)
+DCL VAR(&JOBNAME)  TYPE(*CHAR) LEN(10)
+DCL VAR(&JOBUSR)   TYPE(*CHAR) LEN(10)
+DCL VAR(&JOBNBR)   TYPE(*CHAR) LEN(6)
+
+/* ── Programme-level catch-all MONMSG ─────────────────────── */
+MONMSG MSGID(CPF0000 MCH0000) EXEC(GOTO CMDLBL(ERROR))
+
+/* ── Retrieve job identification for audit logging ─────────── */
+RTVJOBA JOB(&JOBNAME) USER(&JOBUSR) NBR(&JOBNBR)
+
+/* ── Validate input parameter ──────────────────────────────── */
+IF COND(&INORDNUM *EQ ' ') THEN(DO)
+    SNDPGMMSG MSGID(APP0001)
+              MSGF(APPLIB/APPMSG)
+              MSGDTA(&INORDNUM)
+              TOPGMQ(*PRV)
+              MSGTYPE(*ESCAPE)
+ENDDO
+
+/* ── Set library list ────────────────────────────────────────── */
+ADDLIBLE LIB(APPLIB) POSITION(*FIRST)
+MONMSG MSGID(CPF2103) /* Library already in list — not an error */
+
+/* ── Override to the correct orders file ─────────────────────── */
+OVRDBF FILE(ORDERS) TOFILE(APPLIB/ORDERS) OVRSCOPE(*JOB)
+MONMSG MSGID(CPF0000) EXEC(GOTO CMDLBL(ERROR))
+
+/* ── Call the order validation sub-programme ─────────────────── */
+CALL PGM(APPLIB/ORDVALID) PARM(&INORDNUM)
+MONMSG MSGID(CPF0000 APP0000) EXEC(GOTO CMDLBL(ERROR))
+
+/* ── Call the order posting sub-programme ────────────────────── */
+CALL PGM(APPLIB/ORDPOST) PARM(&INORDNUM)
+MONMSG MSGID(CPF0000 APP0000) EXEC(GOTO CMDLBL(ERROR))
+
+/* ── Send completion message ─────────────────────────────────── */
+SNDPGMMSG MSGID(APP0003)
+          MSGF(APPLIB/APPMSG)
+          MSGDTA(&INORDNUM)
+          TOPGMQ(*SAME)
+          MSGTYPE(*COMP)
+
+GOTO CMDLBL(ENDPGM)
+
+/* ================================================================ */
+/* ERROR — Exception handler                                        */
+/* ================================================================ */
+ERROR:
+    IF COND(&ERRFLAG) THEN(GOTO CMDLBL(ENDPGM))
+    CHGVAR VAR(&ERRFLAG) VALUE('1')
+
+    /* Retrieve the exception message */
+    RCVMSG PGMQ(*SAME)         +
+           MSGTYPE(*EXCP)      +
+           MSGID(&MSGID)       +
+           MSG(&MSGTEXT)       +
+           MSGDTA(&MSGDTA)     +
+           SNDMSGFQ(&SNDMSGFQ) +
+           RMV(*NO)
+
+    IF COND(&MSGID *EQ ' ') THEN(DO)
+        CHGVAR VAR(&MSGID)   VALUE('CPF9898')
+        CHGVAR VAR(&MSGTEXT) VALUE('Error in ORDMAIN — no exception message captured.')
+    ENDDO
+
+    /* Log error to DB2 audit table via RUNSQL */
+    CHGVAR VAR(&SQLSTMT) VALUE('INSERT INTO APPLIB.ERRLOG +
+        (JOB_NAME, JOB_USER, JOB_NUMBER, PROGRAM_NAME, +
+         MSG_ID, MSG_TEXT, LOG_TIMESTAMP) +
+        VALUES(''' *CAT %TRIM(&JOBNAME) *CAT ''', ''' +
+               *CAT %TRIM(&JOBUSR)  *CAT ''', ''' +
+               *CAT %TRIM(&JOBNBR)  *CAT ''', +
+               ''ORDMAIN'', ''' +
+               *CAT %TRIM(&MSGID)   *CAT ''', ''' +
+               *CAT %TRIM(&MSGTEXT) *CAT ''', +
+               CURRENT_TIMESTAMP)')
+
+    RUNSQL SQL(&SQLSTMT) COMMIT(*NONE)
+    MONMSG MSGID(CPF0000) /* Do not let logging failure mask original error */
+
+    /* Notify operator */
+    SNDPGMMSG MSG('ORDMAIN error for order ' *CAT %TRIM(&INORDNUM) +
+                  ': ' *CAT %TRIM(&MSGID) *CAT ' — ' *CAT %TRIM(&MSGTEXT)) +
+              TOMSGQ(QSYSOPR) +
+              MSGTYPE(*INFO)
+
+    /* Resend the original escape message to the caller */
+    SNDPGMMSG MSGID(&MSGID)    +
+              MSGF(QCPFMSG)    +
+              MSGDTA(&MSGDTA)  +
+              TOPGMQ(*PRV)     +
+              MSGTYPE(*ESCAPE)
+    MONMSG MSGID(CPF0000) /* If resend fails (e.g. message ID not in QCPFMSG), send generic */
+
+    /* Fallback generic escape */
+    SNDPGMMSG MSG(&MSGTEXT)    +
+              TOPGMQ(*PRV)     +
+              MSGTYPE(*ESCAPE)
+
+ENDPGM:
+ENDPGM
+</pre>
+
+<p>The DB2 audit table referenced in the RUNSQL statement should be created once and maintained indefinitely:</p>
+
+<pre>
+-- Create the error log table (run once from ACS Run SQL Scripts)
+CREATE TABLE APPLIB.ERRLOG (
+    LOG_ID         INTEGER     GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    JOB_NAME       CHAR(10)    NOT NULL DEFAULT ' ',
+    JOB_USER       CHAR(10)    NOT NULL DEFAULT ' ',
+    JOB_NUMBER     CHAR(6)     NOT NULL DEFAULT ' ',
+    PROGRAM_NAME   CHAR(10)    NOT NULL DEFAULT ' ',
+    MSG_ID         CHAR(7)     NOT NULL DEFAULT ' ',
+    MSG_TEXT       VARCHAR(256) NOT NULL DEFAULT ' ',
+    LOG_TIMESTAMP  TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX APPLIB.ERRLOG_IDX1
+    ON APPLIB.ERRLOG (LOG_TIMESTAMP DESC);
+</pre>
+
+<h2>Handling Errors in RPG Programs</h2>
+
+<p>IBM i RPG programmes participate in the same message architecture as CL programmes. There are two RPG-native mechanisms, and both connect to the same job message queue stack.</p>
+
+<p>The <strong>RPG MONITOR/ON-ERROR/ENDMON</strong> block is the modern ILE RPG approach (equivalent to MONMSG in CL):</p>
+
+<pre>
+// ILE RPG — MONITOR block for structured exception handling
+dcl-proc ProcessOrder;
+  dcl-pi *n;
+    ordNum  char(10) const;
+  end-pi;
+
+  dcl-s sqlStmt  varchar(500);
+  dcl-s errMsg   varchar(256);
+
+  monitor;
+    // ── Attempt the operation ────────────────────────────
+    exec sql
+      INSERT INTO APPLIB.ORDERS (ORD_NUM, ORD_DATE, STATUS)
+      VALUES (:ordNum, CURRENT_DATE, 'OPEN');
+
+    if sqlcode < 0;
+      errMsg = 'SQL error ' + %char(sqlcode) + ' inserting order ' + ordNum;
+      callp SendEscapeMsg(errMsg);
+      return;
+    endif;
+
+  on-error *all;
+    // ── Catch any runtime error ────────────────────────
+    errMsg = 'Runtime error in ProcessOrder for order ' + ordNum;
+    callp SendEscapeMsg(errMsg);
+    return;
+
+  endmon;
+
+end-proc;
+</pre>
+
+<p>The <strong>*PSSR (Programme Status Subroutine)</strong> is the legacy RPG approach. It fires automatically when an unhandled exception occurs. In modern ILE RPG, MONITOR is preferred, but *PSSR is still widely used in older codebases:</p>
+
+<pre>
+// Legacy RPG *PSSR — triggered on unhandled exceptions
+     C     *PSSR         BEGSR
+     C                   MOVE      *PROGRAM  PGMNAME         10
+     C                   MOVE      *STATUS   ERRSTAT          5
+     C                   MOVEL     'Error in '  ERRMSG       50
+     C                   CAT       PGMNAME:1    ERRMSG
+     C                   SNDPGMMSG MSG(ERRMSG) TOPGMQ(*PRV) MSGTYPE(*ESCAPE)
+     C                   ENDSR     '*CANCL'
+</pre>
+
+<p>For sending a message file message from RPG, use the <strong>QMHSNDPM API</strong> directly. This gives RPG programmes access to the full message file infrastructure without requiring a CALLB to a CL wrapper:</p>
+
+<pre>
+// ILE RPG — Send a message file message using QMHSNDPM API
+dcl-proc SendMsgFileMsg;
+  dcl-pi *n;
+    msgId    char(7)      const;
+    msgFile  char(20)     const;   // e.g. 'APPMSG    APPLIB    '
+    msgData  varchar(256) const;
+    msgType  char(10)     const;   // e.g. '*ESCAPE   '
+  end-pi;
+
+  dcl-pr QMHSNDPM extpgm('QMHSNDPM');
+    p_msgId      char(7);
+    p_msgFile    char(20);
+    p_msgData    char(256);
+    p_msgDataLen int(10);
+    p_msgType    char(10);
+    p_callStackE char(10);
+    p_callStackC int(10);
+    p_msgKey     char(4);
+    p_errCode    char(16);
+  end-pr;
+
+  dcl-s paddedData  char(256);
+  dcl-s msgKey      char(4);
+  dcl-s errCode     char(16)  inz(*allx'00');
+  dcl-s callStackE  char(10)  inz('*PGMBDY   ');
+  dcl-s callStackC  int(10)   inz(1);
+
+  paddedData = msgData;
+
+  QMHSNDPM(msgId : msgFile : paddedData : %len(%trim(msgData)) :
+            msgType : callStackE : callStackC : msgKey : errCode);
+
+end-proc;
+</pre>
+
+<p>Call this procedure to send an *ESCAPE message from a message file:</p>
+
+<pre>
+// Send APP0001 as *ESCAPE from APPLIB/APPMSG
+SendMsgFileMsg('APP0001' : 'APPMSG    APPLIB    ' :
+               ordNum : '*ESCAPE   ');
+</pre>
+
+<p>Using QMHSNDPM from RPG means error messages are standardised in the message file, translatable, and consistent with what operators see when monitoring QSYSOPR — exactly the same messages whether the error originated in CL or RPG.</p>
+
+<em>Next post: IBM i ILE Binding, Activation Groups, and Service Programs — binding directories, CRTPGM with BNDDIR, activation group types (*NEW, *CALLER, named), commitment control scope across activation groups, and designing service programs for maximum reuse.</em>

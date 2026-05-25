@@ -1,0 +1,514 @@
+<p>The previous post covered DB2 for i triggers — SQL and external triggers, BEFORE and AFTER timing, using the trigger buffer in RPG programs, audit logging patterns, and validation triggers using SIGNAL. This post covers the reverse direction: calling external REST APIs from IBM i RPG programs using Scott Klement's widely used HTTPAPI open source library. Where triggers push logic down into the database, HTTPAPI pushes IBM i outward — allowing ILE RPG programs to retrieve shipping rates, authorise payments, validate addresses, or interact with any HTTP-based service without leaving the IBM i transaction.</p>
+
+<h2>Why Call External REST APIs from RPG</h2>
+
+<p>The business case is straightforward. Modern business ecosystems depend on services that are only available over HTTP. When your RPG order-entry program needs to do any of the following, it must make an outbound HTTP call:</p>
+
+<ul>
+  <li><strong>Shipping rate calculation</strong> — courier APIs (FedEx, UPS, DHL, Australia Post) accept order weight, dimensions, and destination and return rate options in real time</li>
+  <li><strong>Payment authorisation</strong> — Stripe, Braintree, and bank payment gateways require an HTTPS POST with card or token details before an order can be confirmed</li>
+  <li><strong>Address validation</strong> — Google Maps, Loqate, and similar APIs verify and normalise a postal address at data-entry time</li>
+  <li><strong>Weather data for agriculture and logistics</strong> — free APIs such as Open-Meteo supply current conditions or forecasts that influence dispatch decisions</li>
+  <li><strong>Outbound webhooks</strong> — notifying a CRM, ERP, or e-commerce platform that an order has shipped by posting a JSON payload to their webhook endpoint</li>
+</ul>
+
+<p>The alternative — writing an intermediate Java or Python microservice that IBM i calls via a stored procedure or data queue — adds an extra moving part. HTTPAPI lets the RPG program make the call directly, keeping the logic in one place.</p>
+
+<h2>HTTPAPI Overview</h2>
+
+<p><strong>HTTPAPI</strong> (also known as HTTP API for ILE) is an open source ILE service program library written and maintained by Scott Klement. It wraps IBM i's native socket and SSL/TLS layers and exposes a clean set of RPG-callable procedure prototypes for HTTP GET, POST, PUT, DELETE, and more. The library has been maintained since the early 2000s and is widely deployed on production IBM i systems across every release from V5R1 to IBM i 7.5.</p>
+
+<p>Key characteristics:</p>
+<ul>
+  <li>Pure ILE — compiles to a *SRVPGM and is called from any ILE language (RPG, COBOL, CL, C)</li>
+  <li>Uses IBM i's own SSL stack (GSKit) — no third-party SSL dependency</li>
+  <li>Supports chunked transfer encoding, redirects, cookies, and custom headers</li>
+  <li>Response data can be written to a stream file in the IFS or returned directly to a memory buffer</li>
+  <li>Source is hosted at <code>https://github.com/ScottKlement/httpapi</code> and on SourceForge</li>
+</ul>
+
+<p><strong>YAJL</strong> (Yet Another JSON Library), also by Scott Klement, is the companion JSON parser and generator. It wraps the C YAJL library and exposes RPG-callable procedures for both parsing incoming JSON and generating outgoing JSON payloads. HTTPAPI and YAJL are typically installed and used together.</p>
+
+<h2>Installing HTTPAPI and YAJL</h2>
+
+<p>The recommended installation method in 2026 is to download the pre-built save files from the GitHub releases page or compile from source. The steps below cover compilation from source, which gives you the latest version.</p>
+
+<p>Download the source archives from GitHub and transfer them to the IFS:</p>
+
+<pre>
+-- On a workstation, download:
+--   https://github.com/ScottKlement/httpapi/archive/refs/heads/master.zip
+--   https://github.com/ScottKlement/yajl/archive/refs/heads/master.zip
+-- Transfer to IBM i IFS via FTP binary mode or ACS IFS explorer:
+--   /home/MYUSR/httpapi-master.zip
+--   /home/MYUSR/yajl-master.zip
+</pre>
+
+<p>Unzip and compile YAJL first (HTTPAPI depends on it):</p>
+
+<pre>
+CALL QSYS/RSTOBJ OBJ(*ALL) SAVLIB(YAJL) DEV(*SAVF) SAVF(QGPL/YAJLSAVF)
+</pre>
+
+<p>If compiling from source using the provided build CL:</p>
+
+<pre>
+/* Create a build library */
+CRTLIB LIB(YAJL) TEXT('YAJL JSON library')
+
+/* Run the build CL script supplied in the source */
+CALL YAJLBLD/BLDYAJL
+
+/* Repeat for HTTPAPI */
+CRTLIB LIB(HTTPAPI) TEXT('HTTPAPI HTTP client library')
+CALL HTTAPIBLD/BLDHTTP
+</pre>
+
+<p>After a successful build, the library <code>HTTPAPI</code> contains:</p>
+<ul>
+  <li><code>HTTPAPI</code> — the main HTTP service program (*SRVPGM)</li>
+  <li><code>HTTPAPI_H</code> — the binding directory (*BNDDIR) to reference in your RPG compile</li>
+  <li><code>YAJL</code> — the JSON service program (*SRVPGM)</li>
+  <li><code>YAJL_H</code> — the binding directory for YAJL</li>
+</ul>
+
+<p>Add HTTPAPI to your library list or use qualified names. Reference the binding directories in your program compile:</p>
+
+<pre>
+CRTRPGMOD MODULE(MYLIB/MYMOD) SRCFILE(MYLIB/QRPGLESRC)
+CRTPGM    PGM(MYLIB/MYPGM)   MODULE(MYLIB/MYMOD)
+          BNDDIR(HTTPAPI/HTTPAPI_H HTTPAPI/YAJL_H)
+</pre>
+
+<h2>Making an HTTP GET Request</h2>
+
+<p>The core HTTPAPI procedure for GET requests is <code>http_get()</code>. It takes a URL and writes the response to a location you specify. The simplest form writes the response to a stream file in the IFS:</p>
+
+<pre>
+http_get( URL    : '/tmp/response.json' );
+</pre>
+
+<p>HTTPAPI includes a comprehensive set of copybooks (copy source members) that contain all procedure prototypes. Include the main copybook at the top of your RPG source:</p>
+
+<pre>
+/COPY HTTPAPI/QRPGLESRC,HTTPAPI_H
+</pre>
+
+<p>Error handling uses <code>http_error()</code> which returns a descriptive error string, and the return code of <code>http_get()</code> itself (0 = success, negative = error):</p>
+
+<pre>
+DCL-S rc       INT(10);
+DCL-S errMsg   VARCHAR(256);
+
+rc = http_get('https://api.example.com/resource' : '/tmp/response.json');
+IF rc &lt; 0;
+  errMsg = http_error();
+  // Handle error — log to message queue, set error flag, etc.
+ENDIF;
+</pre>
+
+<h2>Complete GET Example — Calling a Weather API</h2>
+
+<p>This example calls the free Open-Meteo API (<code>api.open-meteo.com</code>) to retrieve the current temperature for a given latitude and longitude, then parses the JSON response with YAJL to extract the temperature value. The result is stored in a DB2 for i table for downstream use.</p>
+
+<pre>
+**FREE
+// ─────────────────────────────────────────────────────────────────────
+//  GETWEATHER  –  Fetch current temperature from Open-Meteo API
+//  Stores result in MYLIB.WTHRLOG
+// ─────────────────────────────────────────────────────────────────────
+CTL-OPT DFTACTGRP(*NO) ACTGRP('GETWEATHER') BNDDIR('HTTPAPI_H':'YAJL_H');
+
+/COPY HTTPAPI/QRPGLESRC,HTTPAPI_H
+/COPY HTTPAPI/QRPGLESRC,YAJL_H
+
+DCL-S URL        VARCHAR(512);
+DCL-S RespFile   VARCHAR(128) INZ('/tmp/weather_resp.json');
+DCL-S rc         INT(10);
+DCL-S errMsg     VARCHAR(256);
+DCL-S Temperature PACKED(7:2);
+DCL-S EventType  INT(10);
+DCL-S StringVal  VARCHAR(512);
+DCL-S yHandle    POINTER;
+DCL-S InTemp     IND INZ(*OFF);
+
+// ── Build the API URL ─────────────────────────────────────────────────
+URL = 'https://api.open-meteo.com/v1/forecast'
+    + '?latitude=28.6139'          // New Delhi
+    + '&longitude=77.2090'
+    + '&current_weather=true'
+    + '&temperature_unit=celsius';
+
+// ── Call the API ──────────────────────────────────────────────────────
+rc = http_get(URL : RespFile);
+IF rc &lt; 0;
+  errMsg = http_error();
+  DSPLY errMsg;
+  *INLR = *ON;
+  RETURN;
+ENDIF;
+
+// ── Parse the JSON response with YAJL ────────────────────────────────
+// Response structure:
+// { "current_weather": { "temperature": 34.1, "windspeed": 12.5, ... } }
+
+yHandle = yajl_open_file(RespFile);
+IF yHandle = *NULL;
+  DSPLY 'Cannot open JSON response file';
+  *INLR = *ON;
+  RETURN;
+ENDIF;
+
+DOW yajl_lexer(yHandle : EventType : StringVal) &gt; 0;
+  SELECT;
+    WHEN EventType = YAJL_STRING_KEY AND StringVal = 'temperature';
+      InTemp = *ON;
+    WHEN EventType = YAJL_NUMBER AND InTemp = *ON;
+      Temperature = %DEC(StringVal : 7 : 2);
+      InTemp = *OFF;
+  ENDSL;
+ENDDO;
+
+yajl_close(yHandle);
+
+// ── Store result in DB2 ───────────────────────────────────────────────
+EXEC SQL
+  INSERT INTO MYLIB.WTHRLOG
+      (WLOGDT, WLOGTM, WLOGLAT, WLOGLON, WLOGTEMP)
+  VALUES
+      (CURRENT_DATE, CURRENT_TIME, 28.6139, 77.2090, :Temperature);
+
+*INLR = *ON;
+RETURN;
+</pre>
+
+<h2>Making an HTTP POST Request with a JSON Body</h2>
+
+<p>POST requests require setting the <code>Content-Type</code> request header to <code>application/json</code> and supplying the request body. HTTPAPI provides <code>http_setOption()</code> for options and a family of POST procedures. The most flexible is <code>http_url_post_stmf()</code> which posts a stream file as the request body, and <code>http_url_post()</code> which posts a memory buffer.</p>
+
+<p>To build a JSON request body, use the YAJL generator procedures:</p>
+
+<pre>
+DCL-S yGen     POINTER;
+DCL-S jsonBuf  VARCHAR(4096) CCSID(1208); // UTF-8
+
+yGen = yajl_genOpen(*ON);           // *ON = beautify output
+yajl_beginObject(yGen);
+  yajl_addChar(yGen : 'weight'      : '12.5');
+  yajl_addChar(yGen : 'length'      : '40');
+  yajl_addChar(yGen : 'width'       : '30');
+  yajl_addChar(yGen : 'height'      : '20');
+  yajl_addChar(yGen : 'destination' : 'Sydney');
+  yajl_addChar(yGen : 'service'     : 'express');
+yajl_endObject(yGen);
+
+jsonBuf = yajl_copyBuf(yGen);
+yajl_genClose(yGen);
+</pre>
+
+<p>Then set the Content-Type header and call <code>http_url_post()</code>:</p>
+
+<pre>
+http_setOption('Content-Type' : 'application/json');
+
+rc = http_url_post( 'https://api.courier.example.com/rates'
+                  : %ADDR(jsonBuf) + 2   // skip the VARCHAR 2-byte length prefix
+                  : %LEN(jsonBuf)
+                  : '/tmp/rates_resp.json' );
+</pre>
+
+<h2>Complete POST Example — Courier Shipping Rate API</h2>
+
+<p>This example sends order weight, dimensions, and destination to a courier rates API, then parses the JSON response to find the cheapest rate and updates the order record in DB2 for i.</p>
+
+<pre>
+**FREE
+// ─────────────────────────────────────────────────────────────────────
+//  GETRATES   –  Fetch courier shipping rates for an order
+//  Parameters: order number (input), cheapest rate (output)
+// ─────────────────────────────────────────────────────────────────────
+CTL-OPT DFTACTGRP(*NO) ACTGRP('GETRATES') BNDDIR('HTTPAPI_H':'YAJL_H');
+
+/COPY HTTPAPI/QRPGLESRC,HTTPAPI_H
+/COPY HTTPAPI/QRPGLESRC,YAJL_H
+
+DCL-PI *N;
+  pOrdNo     CHAR(10) CONST;
+  pRate      PACKED(9:2);
+  pService   CHAR(30);
+END-PI;
+
+DCL-S URL       VARCHAR(256) INZ('https://api.courier.example.com/v2/rates');
+DCL-S RespFile  VARCHAR(128) INZ('/tmp/rates_resp.json');
+DCL-S rc        INT(10);
+DCL-S yGen      POINTER;
+DCL-S yHandle   POINTER;
+DCL-S jsonBuf   VARCHAR(4096) CCSID(1208);
+DCL-S EventType INT(10);
+DCL-S StringVal VARCHAR(512);
+DCL-S BestRate  PACKED(9:2) INZ(999999);
+DCL-S BestSvc   CHAR(30)    INZ('');
+DCL-S CurrRate  PACKED(9:2) INZ(0);
+DCL-S CurrSvc   CHAR(30)    INZ('');
+DCL-S InRate    IND         INZ(*OFF);
+DCL-S InService IND         INZ(*OFF);
+DCL-S InObject  INT(10)     INZ(0);
+
+// ── Read order dimensions from DB2 ───────────────────────────────────
+DCL-S w_Wt   PACKED(7:2);
+DCL-S w_Len  PACKED(5:0);
+DCL-S w_Wid  PACKED(5:0);
+DCL-S w_Hgt  PACKED(5:0);
+DCL-S w_Dst  CHAR(30);
+
+EXEC SQL
+  SELECT ORDWT, ORDLEN, ORDWID, ORDHGT, ORDSHIPTO
+  INTO   :w_Wt, :w_Len, :w_Wid, :w_Hgt, :w_Dst
+  FROM   ORDLIB.ORDHDR
+  WHERE  ORDNO = :pOrdNo;
+
+// ── Build JSON request body ───────────────────────────────────────────
+yGen = yajl_genOpen(*OFF);
+yajl_beginObject(yGen);
+  yajl_addChar(yGen : 'weight'      : %CHAR(w_Wt));
+  yajl_addChar(yGen : 'length'      : %CHAR(w_Len));
+  yajl_addChar(yGen : 'width'       : %CHAR(w_Wid));
+  yajl_addChar(yGen : 'height'      : %CHAR(w_Hgt));
+  yajl_addChar(yGen : 'destination' : %TRIMR(w_Dst));
+yajl_endObject(yGen);
+jsonBuf = yajl_copyBuf(yGen);
+yajl_genClose(yGen);
+
+// ── Set headers and POST ──────────────────────────────────────────────
+http_setOption('Content-Type' : 'application/json');
+http_setOption('Accept'       : 'application/json');
+
+rc = http_url_post( URL
+                  : %ADDR(jsonBuf) + 2
+                  : %LEN(jsonBuf)
+                  : RespFile );
+
+IF rc &lt; 0;
+  pRate    = -1;
+  pService = http_error();
+  *INLR = *ON;
+  RETURN;
+ENDIF;
+
+// ── Parse rates array: [{"service":"express","rate":18.50}, ...] ──────
+yHandle = yajl_open_file(RespFile);
+
+DOW yajl_lexer(yHandle : EventType : StringVal) &gt; 0;
+  SELECT;
+    WHEN EventType = YAJL_BEGIN_OBJECT;
+      InObject += 1;
+      IF InObject = 2;   // inside a rate object (depth 2)
+        CurrRate = 0;
+        CurrSvc  = '';
+      ENDIF;
+    WHEN EventType = YAJL_END_OBJECT AND InObject = 2;
+      IF CurrRate &lt; BestRate AND CurrRate &gt; 0;
+        BestRate = CurrRate;
+        BestSvc  = CurrSvc;
+      ENDIF;
+      InObject -= 1;
+    WHEN EventType = YAJL_STRING_KEY AND StringVal = 'service';
+      InService = *ON;
+    WHEN EventType = YAJL_STRING_KEY AND StringVal = 'rate';
+      InRate = *ON;
+    WHEN EventType = YAJL_STRING AND InService = *ON;
+      CurrSvc   = StringVal;
+      InService = *OFF;
+    WHEN EventType = YAJL_NUMBER AND InRate = *ON;
+      CurrRate = %DEC(StringVal : 9 : 2);
+      InRate   = *OFF;
+  ENDSL;
+ENDDO;
+
+yajl_close(yHandle);
+
+// ── Update order record with cheapest rate ────────────────────────────
+EXEC SQL
+  UPDATE ORDLIB.ORDHDR
+  SET    ORDSHIPCST = :BestRate,
+         ORDSHIPSVC = :BestSvc
+  WHERE  ORDNO = :pOrdNo;
+
+pRate    = BestRate;
+pService = BestSvc;
+
+*INLR = *ON;
+RETURN;
+</pre>
+
+<h2>OAuth 2.0 Token Flow from RPG</h2>
+
+<p>Most production APIs require OAuth 2.0 bearer tokens rather than simple API keys. The <strong>client credentials grant</strong> is the appropriate flow for machine-to-machine calls from IBM i — there is no user interaction, only a server-to-server token exchange.</p>
+
+<p>The flow has three steps: POST to the token endpoint with client ID and secret, receive an access token with an expiry time, then include the token as a Bearer header in subsequent API calls. The token should be cached in a DB2 table or data area to avoid requesting a new token on every transaction.</p>
+
+<p>Step 1 — request a token:</p>
+
+<pre>
+**FREE
+// ─────────────────────────────────────────────────────────────────────
+//  GETTOKEN   –  OAuth 2.0 client credentials token fetch
+//  Caches the token in MYLIB.OAUTHTOK
+// ─────────────────────────────────────────────────────────────────────
+CTL-OPT DFTACTGRP(*NO) ACTGRP('GETTOKEN') BNDDIR('HTTPAPI_H':'YAJL_H');
+
+/COPY HTTPAPI/QRPGLESRC,HTTPAPI_H
+/COPY HTTPAPI/QRPGLESRC,YAJL_H
+
+DCL-C CLIENT_ID    'my_client_id_here';
+DCL-C CLIENT_SEC   'my_client_secret_here';
+DCL-C TOKEN_URL    'https://auth.example.com/oauth2/token';
+
+DCL-S RespFile   VARCHAR(128) INZ('/tmp/token_resp.json');
+DCL-S PostBody   VARCHAR(256) CCSID(1208);
+DCL-S AuthHdr    VARCHAR(512) CCSID(1208);
+DCL-S rc         INT(10);
+DCL-S yHandle    POINTER;
+DCL-S EventType  INT(10);
+DCL-S StringVal  VARCHAR(1024);
+DCL-S Token      VARCHAR(2048) INZ('');
+DCL-S ExpiresIn  INT(10)       INZ(0);
+DCL-S InToken    IND           INZ(*OFF);
+DCL-S InExpiry   IND           INZ(*OFF);
+
+// ── Build the x-www-form-urlencoded POST body ─────────────────────────
+PostBody = 'grant_type=client_credentials'
+         + '&client_id='     + CLIENT_ID
+         + '&client_secret=' + CLIENT_SEC;
+
+// ── Set Content-Type for form-encoded body ────────────────────────────
+http_setOption('Content-Type' : 'application/x-www-form-urlencoded');
+
+// ── POST to token endpoint ────────────────────────────────────────────
+rc = http_url_post( TOKEN_URL
+                  : %ADDR(PostBody) + 2
+                  : %LEN(PostBody)
+                  : RespFile );
+
+IF rc &lt; 0;
+  DSPLY ('Token request failed: ' + http_error());
+  *INLR = *ON;
+  RETURN;
+ENDIF;
+
+// ── Parse the token response ──────────────────────────────────────────
+// Response: {"access_token":"eyJ...","expires_in":3600,"token_type":"Bearer"}
+
+yHandle = yajl_open_file(RespFile);
+
+DOW yajl_lexer(yHandle : EventType : StringVal) &gt; 0;
+  SELECT;
+    WHEN EventType = YAJL_STRING_KEY AND StringVal = 'access_token';
+      InToken = *ON;
+    WHEN EventType = YAJL_STRING_KEY AND StringVal = 'expires_in';
+      InExpiry = *ON;
+    WHEN EventType = YAJL_STRING AND InToken = *ON;
+      Token   = StringVal;
+      InToken = *OFF;
+    WHEN EventType = YAJL_NUMBER AND InExpiry = *ON;
+      ExpiresIn = %INT(StringVal);
+      InExpiry  = *OFF;
+  ENDSL;
+ENDDO;
+
+yajl_close(yHandle);
+
+// ── Store token and expiry in DB2 cache table ─────────────────────────
+// OAUTHTOK(TOKID CHAR(50), TOKVAL VARCHAR(2048), TOKEXPIRY TIMESTAMP)
+EXEC SQL
+  MERGE INTO MYLIB.OAUTHTOK AS t
+  USING (VALUES('COURIER_API', :Token,
+                CURRENT_TIMESTAMP + :ExpiresIn SECONDS)) AS s(TOKID, TOKVAL, TOKEXPIRY)
+  ON t.TOKID = s.TOKID
+  WHEN MATCHED    THEN UPDATE SET t.TOKVAL = s.TOKVAL, t.TOKEXPIRY = s.TOKEXPIRY
+  WHEN NOT MATCHED THEN INSERT (TOKID, TOKVAL, TOKEXPIRY)
+                        VALUES (s.TOKID, s.TOKVAL, s.TOKEXPIRY);
+
+*INLR = *ON;
+RETURN;
+</pre>
+
+<p>Step 2 — use the cached token in an API call. A helper procedure reads the token from DB2, checks expiry, refreshes if needed, and returns the Bearer header value:</p>
+
+<pre>
+// ── Retrieve a valid bearer token ─────────────────────────────────────
+DCL-S CachedToken  VARCHAR(2048);
+DCL-S TokenExpiry  TIMESTAMP;
+DCL-S Now          TIMESTAMP;
+
+Now = CURRENT_TIMESTAMP;
+
+EXEC SQL
+  SELECT TOKVAL, TOKEXPIRY
+  INTO   :CachedToken, :TokenExpiry
+  FROM   MYLIB.OAUTHTOK
+  WHERE  TOKID = 'COURIER_API';
+
+IF SQLCODE &lt;&gt; 0 OR TokenExpiry &lt;= Now + 5 MINUTES;
+  // Token missing or expires within 5 minutes — refresh it
+  CALLP GetToken();   // call the GETTOKEN program or procedure
+  EXEC SQL
+    SELECT TOKVAL INTO :CachedToken
+    FROM   MYLIB.OAUTHTOK
+    WHERE  TOKID = 'COURIER_API';
+ENDIF;
+
+// ── Set the Bearer header for the next HTTP call ──────────────────────
+http_setOption('Authorization' : 'Bearer ' + %TRIMR(CachedToken));
+</pre>
+
+<h2>SSL/TLS and Certificate Management</h2>
+
+<p>HTTPAPI uses IBM i's own SSL/TLS stack via GSKit. For HTTPS calls to succeed, the server's certificate chain must be trusted by the IBM i Digital Certificate Manager (DCM). This is the most common cause of HTTPAPI failures on first deployment.</p>
+
+<p><strong>IBM i Digital Certificate Manager (DCM)</strong> is the system certificate store. Access it through the IBM i Navigator web interface or via the 5250 command <code>STRDCM</code>. Procedure to add a trusted root CA:</p>
+
+<ul>
+  <li>In DCM, navigate to <strong>Manage Certificate Store &gt; *SYSTEM</strong></li>
+  <li>Select <strong>Populate with default IBM CA certificates</strong> if starting fresh</li>
+  <li>To add a custom or private CA, select <strong>Import Certificate</strong> and upload the PEM or DER file</li>
+  <li>Assign the certificate store to the <strong>*SYSTEM</strong> application definition</li>
+</ul>
+
+<p>To tell HTTPAPI which certificate store to use, call <code>http_setCertificate()</code> before making the HTTP call:</p>
+
+<pre>
+// Use the *SYSTEM certificate store (default for most environments)
+http_setCertificate( '*SYSTEM' : '' );
+
+// Or specify an explicit certificate store path and password:
+http_setCertificate( '/QIBM/UserData/ICSS/Cert/Server/DEFAULT.KDB'
+                   : 'my_keystore_password' );
+</pre>
+
+<p>The environment variable <code>QIBM_USE_SIGNCERT</code> can also influence certificate validation. To disable it entirely for testing (never in production):</p>
+
+<pre>
+ADDENVVAR ENVVAR(QIBM_USE_SIGNCERT) VALUE('0') REPLACE(*YES)
+</pre>
+
+<p>Common SSL errors and their resolutions:</p>
+
+<ul>
+  <li><strong>SSL0008E: Certificate not trusted</strong> — the server's root CA is not in the IBM i certificate store. Import the CA certificate into DCM.</li>
+  <li><strong>SSL0119E: Certificate expired</strong> — the server's certificate has expired. Contact the API provider or check that the IBM i system date is correct.</li>
+  <li><strong>SSL0601E: GSKit not initialised</strong> — the QSSLPCL (protocol) and QSSLCSL (cipher) system values may be too restrictive. Review with <code>DSPSYSVAL QSSLPCL</code> and enable TLSv1.2 or TLSv1.3.</li>
+  <li><strong>TCP/IP connection refused</strong> — firewall or exit point blocking outbound port 443. Confirm with <code>PING</code> and check IBM i exit programs registered against <code>QIBM_QTC_CONNECT</code>.</li>
+</ul>
+
+<p>To verify connectivity from the IBM i command line before writing any RPG code:</p>
+
+<pre>
+CALL QP2TERM
+-- then at the PASE shell:
+curl -v https://api.open-meteo.com/v1/forecast?latitude=28.6&longitude=77.2&current_weather=true
+</pre>
+
+<p>A successful <code>curl</code> response confirms that networking and SSL are working. If <code>curl</code> succeeds but HTTPAPI fails, the issue is in the certificate store configuration passed to HTTPAPI, not in the network itself.</p>
+
+<em>Next post: IBM i System Startup and Shutdown Procedures — the QSTRUP startup programme, INZTCP, STRTCP, starting subsystems in the correct order, controlled shutdown with ENDSBS and PWRDWNSYS, IPL modes, and building reliable startup and shutdown CL programmes.</em>

@@ -1,0 +1,506 @@
+<p>The previous post covered DB2 for i SQL stored procedures and user-defined functions — CREATE PROCEDURE, cursor loops, IN/OUT parameters, scalar and table UDFs, and calling procedures from RPG, CL, and Node.js. This post covers IBM i security hardening: a topic that is frequently deferred until an audit or incident forces it onto the agenda. In 2026, IBM i systems remain a target for both external attackers and insider threats, and the default configuration of a freshly installed system is nowhere near production-hardened. This post works through every major layer: QSECURITY levels, user profile auditing, object authority, the QAUDJRN audit journal, network service hardening, and Row and Column Access Control in DB2 for i.</p>
+
+<h2>IBM i Security Model Overview</h2>
+
+<p>IBM i uses an <strong>object-based security model</strong>. Every entity on the system — files, programmes, libraries, commands, job descriptions, user profiles — is an object, and access is controlled at the object level through an authority hierarchy. There is no filesystem permission string; instead, each object carries an authority list and each user profile carries a set of special authorities.</p>
+
+<p>The <strong>QSECURITY system value</strong> controls how strictly the operating system enforces security. There are five levels:</p>
+
+<ul>
+  <li><strong>Level 10</strong> — Security by obscurity. No passwords required, all users have full authority. Never used in production.</li>
+  <li><strong>Level 20</strong> — Password security. Passwords required for sign-on, but once signed on users have full authority to all objects. Legacy level; still found on old converted systems.</li>
+  <li><strong>Level 30</strong> — Resource security. Passwords required and object-level authority is enforced. The minimum acceptable level, but adopted authority is not fully controlled.</li>
+  <li><strong>Level 40</strong> — OS integrity. All level 30 checks apply, plus the system prevents programmes from directly accessing internal control blocks and machine interfaces that bypass object authority. This is the <strong>minimum recommended level</strong> for production in 2026.</li>
+  <li><strong>Level 50</strong> — Enhanced integrity. All level 40 checks apply, plus user-written programmes cannot use some privileged machine instructions even if they have *ALLOBJ. Recommended for PCI-DSS and SOX environments.</li>
+</ul>
+
+<p>Check and change your current level:</p>
+
+<pre>
+/* Display current QSECURITY level */
+DSPSYSVAL SYSVAL(QSECURITY)
+
+/* Change to level 40 (requires IPL to take effect) */
+CHGSYSVAL SYSVAL(QSECURITY) VALUE('40')
+</pre>
+
+<p>Changing QSECURITY from 30 to 40 requires careful testing. Any programme that uses unsupported MI (machine interface) calls or violates object authority will fail after the IPL. Run a full regression test cycle in a non-production partition first.</p>
+
+<h2>Auditing the Current Security Posture with QSYS2</h2>
+
+<p>Before making any changes, understand what you have. The <strong>QSYS2.USER_INFO</strong> view (available since IBM i 7.3) exposes the content of all user profiles in a single SQL query. It is far more practical than DSPUSRPRF or WRKUSRPRF for bulk analysis.</p>
+
+<p>Find all users with dangerous special authorities:</p>
+
+<pre>
+-- Users with *ALLOBJ special authority
+SELECT USER_NAME, STATUS, SPECIAL_AUTHORITIES,
+       PASSWORD_EXPIRATION_INTERVAL, DAYS_UNTIL_PASSWORD_EXPIRES,
+       NO_PASSWORD_INDICATOR
+FROM   QSYS2.USER_INFO
+WHERE  SPECIAL_AUTHORITIES LIKE '%*ALLOBJ%'
+ORDER  BY USER_NAME;
+</pre>
+
+<pre>
+-- Users with *SECADM (security administrator) special authority
+SELECT USER_NAME, STATUS, SPECIAL_AUTHORITIES,
+       TEXT_DESCRIPTION
+FROM   QSYS2.USER_INFO
+WHERE  SPECIAL_AUTHORITIES LIKE '%*SECADM%'
+ORDER  BY USER_NAME;
+</pre>
+
+<pre>
+-- Users with *JOBCTL (job control) special authority
+-- Allows operators to end any job, including security-relevant ones
+SELECT USER_NAME, STATUS, SPECIAL_AUTHORITIES
+FROM   QSYS2.USER_INFO
+WHERE  SPECIAL_AUTHORITIES LIKE '%*JOBCTL%'
+ORDER  BY USER_NAME;
+</pre>
+
+<p>Find users who still have their default password (password equals user name — a critical vulnerability):</p>
+
+<pre>
+-- Users with password equal to user name (IBM i 7.4 and later)
+SELECT USER_NAME, STATUS, SPECIAL_AUTHORITIES,
+       LAST_SIGNON_DATE_TIME
+FROM   QSYS2.USER_INFO
+WHERE  PASSWORD_EXPIRATION_INTERVAL = *N
+   OR  NO_PASSWORD_INDICATOR = 'NO'
+   AND DEFAULT_PASSWORD = 'YES'
+ORDER  BY USER_NAME;
+
+-- Simpler check available on all releases: QSYS2.USER_INFO DEFAULT_PASSWORD column
+SELECT USER_NAME, DEFAULT_PASSWORD, STATUS
+FROM   QSYS2.USER_INFO
+WHERE  DEFAULT_PASSWORD = 'YES'
+  AND  STATUS = '*ENABLED';
+</pre>
+
+<p>Find disabled and expired profiles that should be deleted or reviewed:</p>
+
+<pre>
+-- Profiles not signed on in the last 90 days
+SELECT USER_NAME, STATUS, LAST_SIGNON_DATE_TIME,
+       SPECIAL_AUTHORITIES
+FROM   QSYS2.USER_INFO
+WHERE  LAST_SIGNON_DATE_TIME < CURRENT_TIMESTAMP - 90 DAYS
+   OR  LAST_SIGNON_DATE_TIME IS NULL
+ORDER  BY LAST_SIGNON_DATE_TIME;
+
+-- Disabled profiles that still have special authorities
+SELECT USER_NAME, STATUS, SPECIAL_AUTHORITIES
+FROM   QSYS2.USER_INFO
+WHERE  STATUS = '*DISABLED'
+  AND  SPECIAL_AUTHORITIES <> ' ';
+</pre>
+
+<h2>User Profile Hardening</h2>
+
+<p>Once you know your exposure, apply hardening to individual profiles using <strong>CHGUSRPRF</strong>. The most important parameters are:</p>
+
+<pre>
+/* Set inactivity message interval (minutes before inactive job gets message) */
+CHGUSRPRF USRPRF(JSMITH)
+          INACTVMSGQ(*ENDJOB)
+          INACTVMSGI(30)
+
+/* Set password expiry to 60 days */
+CHGUSRPRF USRPRF(JSMITH)
+          PWDEXPITV(60)
+
+/* Limit capabilities — prevents user running commands from command line */
+CHGUSRPRF USRPRF(JSMITH)
+          LMTCPB(*YES)
+
+/* Remove *ALLOBJ from a service account that no longer needs it */
+CHGUSRPRF USRPRF(SVCACCT)
+          SPCAUT(*JOBCTL *IOSYSCFG)
+</pre>
+
+<p>Password policy is controlled via system values. Set these on all production systems:</p>
+
+<pre>
+/* Minimum password length (8 characters minimum in 2026) */
+CHGSYSVAL SYSVAL(QPWDMINLEN) VALUE('8')
+
+/* Password level — 0/1 = DES (legacy), 2 = SHA-1, 3 = SHA-256 (recommended) */
+CHGSYSVAL SYSVAL(QPWDLVL) VALUE('3')
+
+/* Maximum password length */
+CHGSYSVAL SYSVAL(QPWDMAXLEN) VALUE('128')
+
+/* Require at least one digit */
+CHGSYSVAL SYSVAL(QPWDRQDDGT) VALUE('1')
+
+/* Require at least one special character */
+CHGSYSVAL SYSVAL(QPWDRQDSPCHR) VALUE('1')
+
+/* Maximum sign-on attempts before profile is disabled */
+CHGSYSVAL SYSVAL(QMAXSIGN) VALUE('5')
+</pre>
+
+<p>Review a profile's current settings before and after changes:</p>
+
+<pre>
+DSPUSRPRF USRPRF(JSMITH) TYPE(*BASIC)
+DSPUSRPRF USRPRF(JSMITH) TYPE(*PWDEXP)
+</pre>
+
+<h2>Object Authority and Ownership</h2>
+
+<p>Object authority in IBM i follows a hierarchy: <strong>*PUBLIC</strong> authority is the default granted to any user not explicitly listed. On a hardened system, sensitive libraries should have *PUBLIC set to <strong>*EXCLUDE</strong>.</p>
+
+<p>Check the current public authority on your application libraries:</p>
+
+<pre>
+WRKOBJ OBJ(APPLIB) OBJTYPE(*LIB)
+/* Then option 9 (Display authority) to see *PUBLIC authority */
+
+/* Or use SQL */
+SELECT OBJECT_NAME, OBJECT_TYPE, OBJECT_LIBRARY,
+       PUBLIC_AUTHORITY
+FROM   QSYS2.OBJECT_PRIVILEGES
+WHERE  OBJECT_TYPE = '*LIB'
+  AND  OBJECT_LIBRARY = 'QSYS'
+  AND  PUBLIC_AUTHORITY NOT IN ('*EXCLUDE', '*USE');
+</pre>
+
+<p>Grant and revoke object authority explicitly:</p>
+
+<pre>
+/* Revoke *PUBLIC authority on a sensitive library */
+RVKOBJAUT OBJ(APPLIB) OBJTYPE(*LIB)
+          USER(*PUBLIC) AUT(*ALL)
+
+/* Grant specific authority to an application group profile */
+GRTOBJAUT OBJ(APPLIB) OBJTYPE(*LIB)
+          USER(APPGRP) AUT(*USE)
+
+/* Grant change authority on a specific file to a group */
+GRTOBJAUT OBJ(APPLIB/ORDERS) OBJTYPE(*FILE)
+          USER(APPGRP) AUT(*CHANGE)
+
+/* Revoke execute authority on a programme from *PUBLIC */
+RVKOBJAUT OBJ(APPLIB/SENSITIVEPGM) OBJTYPE(*PGM)
+          USER(*PUBLIC) AUT(*ALL)
+</pre>
+
+<p><strong>Adopted authority</strong> is a mechanism where a programme runs with the authority of its owner rather than the calling user. This is powerful and risky. A programme with *USEADPAUT(*YES) and an owner with *ALLOBJ effectively grants *ALLOBJ to any user who can call it.</p>
+
+<p>Find all programmes with adopted authority using QSYS2.PROGRAM_INFO:</p>
+
+<pre>
+-- Programmes that adopt owner authority
+SELECT PROGRAM_LIBRARY, PROGRAM_NAME, PROGRAM_TYPE,
+       OWNER, PROGRAM_ATTRIBUTE,
+       USES_ADOPTED_AUTHORITY
+FROM   QSYS2.PROGRAM_INFO
+WHERE  USES_ADOPTED_AUTHORITY = 'YES'
+ORDER  BY OWNER, PROGRAM_LIBRARY, PROGRAM_NAME;
+
+-- Cross-reference: programmes adopting authority of high-privilege owners
+SELECT PI.PROGRAM_LIBRARY, PI.PROGRAM_NAME,
+       PI.OWNER,
+       UI.SPECIAL_AUTHORITIES
+FROM   QSYS2.PROGRAM_INFO PI
+JOIN   QSYS2.USER_INFO    UI
+  ON   PI.OWNER = UI.USER_NAME
+WHERE  PI.USES_ADOPTED_AUTHORITY = 'YES'
+  AND  UI.SPECIAL_AUTHORITIES LIKE '%*ALLOBJ%'
+ORDER  BY PI.OWNER;
+</pre>
+
+<p>To remove adopted authority from a programme you control:</p>
+
+<pre>
+CHGPGM PGM(APPLIB/ORDPROCESS) USEADPAUT(*NO)
+</pre>
+
+<h2>Auditing with QAUDJRN</h2>
+
+<p>The <strong>QAUDJRN</strong> security audit journal is the central audit facility of IBM i. When enabled, it records every significant security event — authentication failures, object access, programme adoption, and more. It is a pre-requisite for PCI-DSS and SOX compliance.</p>
+
+<p>Enable and configure the audit journal:</p>
+
+<pre>
+/* Enable the security audit journal and set audit levels */
+CHGSECAUD QAUDLVL(*AUTFAIL    /* Authentication failures         */
+                  *CREATE     /* Object creation                 */
+                  *DELETE     /* Object deletion                 */
+                  *SAVRST     /* Save/restore operations         */
+                  *SECCFG     /* Security configuration changes  */
+                  *SECOFR     /* Security officer actions        */
+                  *PGMADP     /* Programme adoption              */
+                  *OBJMGT     /* Object management               */
+                  *JOBBAS)    /* Job start/end                   */
+
+/* Confirm the audit journal receiver is attached */
+WRKJRN JRN(QSYS/QAUDJRN)
+</pre>
+
+<p>Key <strong>journal entry types</strong> and what they record:</p>
+
+<ul>
+  <li><strong>AF</strong> — Authority failure. A user attempted to access an object without sufficient authority.</li>
+  <li><strong>CA</strong> — Authority change. Object authority was granted or revoked.</li>
+  <li><strong>CO</strong> — Object ownership/primary group changed.</li>
+  <li><strong>CP</strong> — User profile change. A user profile was created, changed, or deleted.</li>
+  <li><strong>DO</strong> — Object deleted.</li>
+  <li><strong>GR</strong> — Object restored (save/restore event).</li>
+  <li><strong>PW</strong> — Incorrect password attempt.</li>
+  <li><strong>RJ</strong> — Job rejected — sign-on attempt failed.</li>
+  <li><strong>SO</strong> — Sign-on to the system (successful).</li>
+</ul>
+
+<p>Query recent authentication failures using QSYS2.DISPLAY_JOURNAL:</p>
+
+<pre>
+-- Authentication failures in the last 24 hours
+SELECT ENTRY_TIMESTAMP,
+       CAST(JOURNAL_ENTRY_TYPE AS CHAR(2))  AS JRNE_TYPE,
+       CAST(ENTRY_DATA AS VARCHAR(512))      AS ENTRY_DATA
+FROM   TABLE(
+           QSYS2.DISPLAY_JOURNAL(
+               JOURNAL_LIBRARY  => 'QSYS',
+               JOURNAL_NAME     => 'QAUDJRN',
+               JOURNAL_ENTRY_TYPES => 'AF PW RJ',
+               STARTING_TIMESTAMP  => CURRENT_TIMESTAMP - 24 HOURS
+           )
+       ) AS JRN_DATA
+ORDER  BY ENTRY_TIMESTAMP DESC
+FETCH  FIRST 200 ROWS ONLY;
+</pre>
+
+<pre>
+-- User profile changes in the last 7 days (CP entries)
+SELECT ENTRY_TIMESTAMP,
+       CAST(ENTRY_DATA AS VARCHAR(512)) AS ENTRY_DATA
+FROM   TABLE(
+           QSYS2.DISPLAY_JOURNAL(
+               JOURNAL_LIBRARY     => 'QSYS',
+               JOURNAL_NAME        => 'QAUDJRN',
+               JOURNAL_ENTRY_TYPES => 'CP',
+               STARTING_TIMESTAMP  => CURRENT_TIMESTAMP - 7 DAYS
+           )
+       ) AS JRN_DATA
+ORDER  BY ENTRY_TIMESTAMP DESC;
+</pre>
+
+<h2>Network Security</h2>
+
+<p>IBM i runs a rich set of TCP/IP services, many of which are enabled by default. Each service is a potential attack surface. The key system values and service configurations to review are:</p>
+
+<p><strong>QRMTSIGN</strong> controls how remote sign-on requests are handled:</p>
+
+<pre>
+/* Recommended: force sign-on screen for all remote sessions */
+CHGSYSVAL SYSVAL(QRMTSIGN) VALUE('*FRCSIGNON')
+
+/* *VERIFY   — allows passthrough if user already signed on (weaker) */
+/* *REJECT   — rejects all remote sign-on (too restrictive for most sites) */
+/* *SAMEPRF  — requires remote user to match local profile */
+</pre>
+
+<p><strong>QRETSVRSEC</strong> controls whether the Signon server retains server security data (passwords) for downstream connections. Set to 0 (do not retain) unless specifically required by an application:</p>
+
+<pre>
+CHGSYSVAL SYSVAL(QRETSVRSEC) VALUE('0')
+</pre>
+
+<p>Disable DDM/DRDA remote command execution, which historically allowed remote execution of CL commands without authentication:</p>
+
+<pre>
+/* Disable auto-start of DDM TCP/IP server */
+CHGDDMTCPA AUTOSTART(*NO)
+
+/* If DDM is required for data replication, restrict to data-only */
+CHGDDMTCPA AUTOSTART(*YES) PWDRQD(*USRENCPWD) ALWCMD(*NONE)
+</pre>
+
+<p>Secure or disable FTP (plain-text protocol — consider SFTP via OpenSSH instead):</p>
+
+<pre>
+/* Stop FTP server */
+ENDTCPSVR SERVER(*FTP)
+
+/* Or restrict FTP with exit point programmes (QTMFTPD) */
+WRKREGINF EXITPNT(QTMFTPD) FORMAT(FTPD0100)
+</pre>
+
+<p>Review which servers are running and their subsystem routing:</p>
+
+<pre>
+-- Active TCP/IP servers and their ports
+SELECT SERVER_NAME, SERVER_LIBRARY, SUBSYSTEM,
+       TCP_PORT
+FROM   QSYS2.SERVER_SBS_ROUTING
+ORDER  BY TCP_PORT;
+
+-- Check which TCP services are active
+SELECT CONNECTION_TYPE, LOCAL_ADDRESS, LOCAL_PORT,
+       REMOTE_ADDRESS, REMOTE_PORT
+FROM   QSYS2.NETSTAT_INFO
+WHERE  CONNECTION_TYPE = 'IPV4-TCP'
+  AND  TCP_STATE = 'LISTEN'
+ORDER  BY LOCAL_PORT;
+</pre>
+
+<h2>Row and Column Access Control (RCAC)</h2>
+
+<p>IBM i 7.2 introduced <strong>Row and Column Access Control (RCAC)</strong> in DB2 for i. RCAC allows you to define fine-grained access policies directly in the database — restricting which rows a user can see (row permissions) and masking sensitive column values (column masks) — without changing application code.</p>
+
+<p>A practical example: mask social security numbers for users who do not have the PAYROLL_ADMIN role.</p>
+
+<p>First, create the column mask:</p>
+
+<pre>
+-- Create a column mask on CUSTSSN
+-- Users with PAYROLL_ADMIN group profile see the real value
+-- All others see X's
+CREATE MASK APPLIB.MASK_CUSTSSN
+ON APPLIB.CUSTOMERS (CUSTSSN)
+AS CASE
+     WHEN (VERIFY_GROUP_FOR_USER(SESSION_USER, 'PAYROLL_ADMIN') = 1)
+     THEN CUSTSSN
+     ELSE CAST('XXX-XX-XXXX' AS CHAR(11))
+   END
+ENABLE;
+</pre>
+
+<p>Create a row permission to restrict which orders a sales representative can see:</p>
+
+<pre>
+-- Row permission: sales reps can only see their own customer orders
+-- Users in the SALES_MGR group see all rows
+CREATE PERMISSION APPLIB.PERM_ORDERS
+ON APPLIB.ORDERS
+FOR ROWS WHERE
+    VERIFY_GROUP_FOR_USER(SESSION_USER, 'SALES_MGR') = 1
+    OR SALES_REP_ID = SESSION_USER
+ENFORCED FOR ALL ACCESS
+ENABLE;
+</pre>
+
+<p>Activate both controls on the table:</p>
+
+<pre>
+-- Activate row access control on ORDERS
+ALTER TABLE APPLIB.ORDERS
+ACTIVATE ROW ACCESS CONTROL;
+
+-- Activate column access control on CUSTOMERS
+ALTER TABLE APPLIB.CUSTOMERS
+ACTIVATE COLUMN ACCESS CONTROL;
+
+-- Activate both simultaneously (IBM i 7.4+)
+ALTER TABLE APPLIB.CUSTOMERS
+ACTIVATE ROW ACCESS CONTROL
+ACTIVATE COLUMN ACCESS CONTROL;
+</pre>
+
+<p>Verify active RCAC policies:</p>
+
+<pre>
+-- View all active row permissions
+SELECT TABLE_SCHEMA, TABLE_NAME, PERMISSION_NAME,
+       PERMISSION_TEXT, ENABLE
+FROM   QSYS2.SYSROWPERMISSIONS
+WHERE  ENABLE = 'Y';
+
+-- View all active column masks
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME,
+       MASK_NAME, ENABLE
+FROM   QSYS2.SYSCOLUMNMASKS
+WHERE  ENABLE = 'Y';
+</pre>
+
+<h2>Practical Security Audit SQL</h2>
+
+<p>The following queries form a ready-to-run security audit script. Save them as a source member in QGPL/QSQLSRC or run directly from ACS Run SQL Scripts.</p>
+
+<pre>
+-- ============================================================
+-- IBM i Security Audit Script 2026
+-- Run from ACS Run SQL Scripts with *SECADM or *ALLOBJ
+-- ============================================================
+
+-- 1. Users with *ALLOBJ special authority
+SELECT USER_NAME, STATUS, SPECIAL_AUTHORITIES,
+       LAST_SIGNON_DATE_TIME, TEXT_DESCRIPTION
+FROM   QSYS2.USER_INFO
+WHERE  SPECIAL_AUTHORITIES LIKE '%*ALLOBJ%'
+ORDER  BY USER_NAME;
+
+-- 2. Enabled users with default passwords
+SELECT USER_NAME, STATUS, LAST_SIGNON_DATE_TIME
+FROM   QSYS2.USER_INFO
+WHERE  DEFAULT_PASSWORD = 'YES'
+  AND  STATUS = '*ENABLED';
+
+-- 3. Profiles not signed on in 90 days (candidates for deletion/review)
+SELECT USER_NAME, STATUS, LAST_SIGNON_DATE_TIME,
+       SPECIAL_AUTHORITIES
+FROM   QSYS2.USER_INFO
+WHERE  (LAST_SIGNON_DATE_TIME < CURRENT_TIMESTAMP - 90 DAYS
+        OR LAST_SIGNON_DATE_TIME IS NULL)
+  AND  STATUS = '*ENABLED'
+ORDER  BY LAST_SIGNON_DATE_TIME;
+
+-- 4. Programmes adopting high-privilege owner authority
+SELECT PI.PROGRAM_LIBRARY, PI.PROGRAM_NAME, PI.OWNER,
+       UI.SPECIAL_AUTHORITIES
+FROM   QSYS2.PROGRAM_INFO PI
+JOIN   QSYS2.USER_INFO    UI ON PI.OWNER = UI.USER_NAME
+WHERE  PI.USES_ADOPTED_AUTHORITY = 'YES'
+  AND  (UI.SPECIAL_AUTHORITIES LIKE '%*ALLOBJ%'
+        OR UI.SPECIAL_AUTHORITIES LIKE '%*SECADM%')
+ORDER  BY PI.OWNER, PI.PROGRAM_LIBRARY;
+
+-- 5. Libraries where *PUBLIC has *CHANGE or *ALL authority
+SELECT OBJECT_NAME   AS LIBRARY_NAME,
+       PUBLIC_AUTHORITY
+FROM   QSYS2.OBJECT_PRIVILEGES
+WHERE  OBJECT_TYPE     = '*LIB'
+  AND  AUTHORIZATION_NAME = '*PUBLIC'
+  AND  PUBLIC_AUTHORITY IN ('*CHANGE', '*ALL', '*RWX')
+ORDER  BY OBJECT_NAME;
+
+-- 6. Recent authentication failures from QAUDJRN (last 48 hours)
+SELECT ENTRY_TIMESTAMP,
+       CAST(JOURNAL_ENTRY_TYPE AS CHAR(2)) AS JRNE_TYPE,
+       CAST(ENTRY_DATA AS VARCHAR(256))    AS ENTRY_DATA
+FROM   TABLE(
+           QSYS2.DISPLAY_JOURNAL(
+               JOURNAL_LIBRARY     => 'QSYS',
+               JOURNAL_NAME        => 'QAUDJRN',
+               JOURNAL_ENTRY_TYPES => 'AF PW RJ',
+               STARTING_TIMESTAMP  => CURRENT_TIMESTAMP - 48 HOURS
+           )
+       ) AS JRN
+ORDER  BY ENTRY_TIMESTAMP DESC
+FETCH  FIRST 500 ROWS ONLY;
+
+-- 7. Service programmes and modules with adopted authority in APPLIB
+SELECT PROGRAM_LIBRARY, PROGRAM_NAME, PROGRAM_TYPE,
+       OWNER, USES_ADOPTED_AUTHORITY
+FROM   QSYS2.PROGRAM_INFO
+WHERE  PROGRAM_LIBRARY     = 'APPLIB'
+  AND  USES_ADOPTED_AUTHORITY = 'YES';
+
+-- 8. Current QSECURITY level and key security system values
+SELECT SYSTEM_VALUE_NAME, CURRENT_NUMERIC_VALUE, CURRENT_CHARACTER_VALUE
+FROM   QSYS2.SYSTEM_VALUE_INFO
+WHERE  SYSTEM_VALUE_NAME IN (
+       'QSECURITY', 'QPWDMINLEN', 'QPWDLVL', 'QMAXSIGN',
+       'QRMTSIGN',  'QRETSVRSEC', 'QPWDEXPITV', 'QPWDRQDDGT',
+       'QPWDRQDSPCHR', 'QPWDMAXLEN', 'QAUDLVL', 'QAUDCTL'
+       )
+ORDER  BY SYSTEM_VALUE_NAME;
+</pre>
+
+<p>Running this audit script after every change window gives you a documented security baseline and an easy way to detect configuration drift. Combine it with a scheduled CL programme that emails the output via SNDDST or writes it to a DB2 audit table for long-term trend tracking.</p>
+
+<em>Next post: IBM i Message Files and Exception Handling in CL — creating and using message files, SNDPGMMSG message types (*ESCAPE, *STATUS, *NOTIFY, *INFO), MONMSG for structured exception handling, RCVMSG to retrieve messages, and building robust error handling into CL programmes.</em>

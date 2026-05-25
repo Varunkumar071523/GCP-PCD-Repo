@@ -1,0 +1,465 @@
+<p>The previous post covered AI-assisted legacy code documentation on IBM i — using LLMs to generate plain-English descriptions of RPG programs, extract business rules, build a batch documentation pipeline, and create a searchable vector-based knowledge base over your IBM i source code. This post returns to DB2 for i and covers SQL stored procedures and user-defined functions — one of the most powerful and underused features available to IBM i developers. Stored procedures let you encapsulate business logic at the database layer where it is callable from any language and any access method.</p>
+
+<h2>Why SQL Stored Procedures on IBM i</h2>
+
+<p>Stored procedures on DB2 for i exist as database objects in a schema (library). Once created, they are callable from RPG, CL, Java, Node.js, Python via ODBC, JDBC, XMLSERVICE, or any other interface that can issue a SQL CALL statement. This means business logic written once in a stored procedure runs identically regardless of which application tier calls it.</p>
+
+<p>The practical advantages for IBM i shops are:</p>
+<ul>
+  <li><strong>Reduced round trips</strong> — A procedure that processes 500 order records can do so in a single CALL rather than 500 individual SQL statements across a network connection, dramatically reducing ODBC/JDBC latency for off-system callers.</li>
+  <li><strong>Centralised business rule enforcement</strong> — Rules like "an order cannot be approved if the customer credit limit is exceeded" live in one place at the DB2 layer rather than duplicated across RPG, Java, and Node.js applications.</li>
+  <li><strong>Easier testing</strong> — You can test a stored procedure directly from ACS Run SQL Scripts with a simple CALL statement, without deploying an entire application.</li>
+  <li><strong>Incremental modernisation</strong> — Wrapping legacy business logic in stored procedures allows new applications to call proven IBM i business rules without re-implementing them in a modern language from scratch.</li>
+</ul>
+
+<h2>CREATE PROCEDURE Basics</h2>
+
+<p>The basic syntax for a SQL stored procedure on DB2 for i uses <code>CREATE OR REPLACE PROCEDURE</code>, which is idempotent — safe to run multiple times as you iterate on the procedure body during development.</p>
+
+<pre>-- Minimal stored procedure: no parameters, simple body
+CREATE OR REPLACE PROCEDURE ORDLIB.LOG_SYSTEM_EVENT (
+    IN  P_EVTTYPE  VARCHAR(20),
+    IN  P_EVTMSG   VARCHAR(200)
+)
+LANGUAGE SQL
+SPECIFIC ORDLIB.LOG_SYSTEM_EVENT
+MODIFIES SQL DATA
+BEGIN
+    INSERT INTO ORDLIB.SYSEVTLOG (EVTTYPE, EVTMSG, EVTTIME)
+    VALUES (P_EVTTYPE, P_EVTMSG, CURRENT_TIMESTAMP);
+END;</pre>
+
+<p>Key clauses to understand:</p>
+<ul>
+  <li><strong>LANGUAGE SQL</strong> — This is a pure SQL procedure. The alternative is LANGUAGE RPGLE, LANGUAGE CL, or LANGUAGE C for external procedures (covered later).</li>
+  <li><strong>SPECIFIC name</strong> — A unique identifier for this procedure version within the schema. Useful when you have overloaded procedure names with different parameter signatures.</li>
+  <li><strong>MODIFIES SQL DATA</strong> — Declares that the procedure can INSERT, UPDATE, DELETE, and SELECT. Other options are READS SQL DATA (SELECT only) and NO SQL (no SQL statements at all).</li>
+  <li><strong>IN / OUT / INOUT parameters</strong> — IN parameters are passed by value (read-only inside the procedure). OUT parameters return a value to the caller. INOUT parameters do both.</li>
+</ul>
+
+<p>Call the procedure from ACS Run SQL Scripts:</p>
+
+<pre>CALL ORDLIB.LOG_SYSTEM_EVENT('STARTUP', 'Application initialised by batch job ORDBATCH');</pre>
+
+<h2>Variables, Assignment, and Conditionals</h2>
+
+<p>SQL stored procedures support a full set of procedural constructs within the BEGIN...END compound statement. Variables are declared with DECLARE and assigned with SET.</p>
+
+<pre>CREATE OR REPLACE PROCEDURE ORDLIB.APPLY_DISCOUNT (
+    IN  P_CUSTNO   CHAR(7),
+    IN  P_ORDAMT   DECIMAL(11,2),
+    OUT P_DISCAMT  DECIMAL(11,2),
+    OUT P_DISCPCT  DECIMAL(5,2)
+)
+LANGUAGE SQL
+SPECIFIC ORDLIB.APPLY_DISCOUNT
+READS SQL DATA
+BEGIN
+    -- Local variable declarations
+    DECLARE V_CRTTIER  CHAR(2)       DEFAULT 'ST';
+    DECLARE V_YTDPURCH DECIMAL(13,2) DEFAULT 0;
+
+    -- Look up customer tier and year-to-date purchases
+    SELECT CRTTIER, YTDPURCH
+    INTO   V_CRTTIER, V_YTDPURCH
+    FROM   CUSTLIB.CUSTMST
+    WHERE  CUSTNO = P_CUSTNO
+    FETCH FIRST 1 ROW ONLY;
+
+    -- Apply discount based on tier and order value
+    IF V_CRTTIER = 'PL' THEN
+        -- Platinum tier: 15% on orders over 5000, else 10%
+        IF P_ORDAMT > 5000.00 THEN
+            SET P_DISCPCT = 15.00;
+        ELSE
+            SET P_DISCPCT = 10.00;
+        END IF;
+    ELSEIF V_CRTTIER = 'GO' THEN
+        -- Gold tier: 8% on orders over 2500, else 5%
+        IF P_ORDAMT > 2500.00 THEN
+            SET P_DISCPCT = 8.00;
+        ELSE
+            SET P_DISCPCT = 5.00;
+        END IF;
+    ELSE
+        -- Standard tier: 2% on orders over 1000, else none
+        IF P_ORDAMT > 1000.00 THEN
+            SET P_DISCPCT = 2.00;
+        ELSE
+            SET P_DISCPCT = 0.00;
+        END IF;
+    END IF;
+
+    SET P_DISCAMT = P_ORDAMT * (P_DISCPCT / 100);
+END;</pre>
+
+<p>CASE/WHEN is also available and often cleaner than nested IF/ELSEIF when branching on a single value:</p>
+
+<pre>-- CASE expression within a SET statement
+SET P_DISCPCT = CASE V_CRTTIER
+    WHEN 'PL' THEN 15.00
+    WHEN 'GO' THEN 8.00
+    WHEN 'SI' THEN 5.00
+    ELSE 2.00
+END;</pre>
+
+<h2>Cursor Loops in SQL Procedures</h2>
+
+<p>Cursor loops are the SQL procedure equivalent of RPG's READ loop — they iterate over a result set row by row, applying logic to each row. The pattern always follows: DECLARE cursor, DECLARE NOT FOUND handler, OPEN, loop with FETCH and exit on not-found, CLOSE.</p>
+
+<pre>CREATE OR REPLACE PROCEDURE ORDLIB.APPLY_LATE_FEE (
+    IN P_CUTOFFDT DATE,
+    IN P_FEERATE  DECIMAL(5,4)
+)
+LANGUAGE SQL
+SPECIFIC ORDLIB.APPLY_LATE_FEE
+MODIFIES SQL DATA
+BEGIN
+    -- Variables
+    DECLARE V_ORDNO    CHAR(8);
+    DECLARE V_CUSTNO   CHAR(7);
+    DECLARE V_ORDAMT   DECIMAL(11,2);
+    DECLARE V_FEEPAID  CHAR(1);
+    DECLARE V_DONE     INT DEFAULT 0;
+
+    -- NOT FOUND handler: sets V_DONE = 1 when cursor is exhausted
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET V_DONE = 1;
+
+    -- Cursor: overdue unpaid orders before cutoff date
+    DECLARE C_OVERDUE CURSOR FOR
+        SELECT ORDNO, CUSTNO, ORDAMT
+        FROM   ORDLIB.ORDMST
+        WHERE  ORDSTS  = 'OP'         -- Open order
+        AND    ORDDUE  < P_CUTOFFDT   -- Past due date
+        AND    FEECHGD = 'N'          -- Fee not yet charged
+        FOR UPDATE OF ORDSTS, FEECHGD;
+
+    OPEN C_OVERDUE;
+
+    -- Fetch loop
+    FETCH_LOOP: LOOP
+        FETCH C_OVERDUE INTO V_ORDNO, V_CUSTNO, V_ORDAMT;
+        IF V_DONE = 1 THEN
+            LEAVE FETCH_LOOP;
+        END IF;
+
+        -- Update order: mark as overdue, apply fee
+        UPDATE ORDLIB.ORDMST
+        SET    ORDSTS  = 'OD',
+               FEECHGD = 'Y',
+               FEEAMT  = V_ORDAMT * P_FEERATE
+        WHERE CURRENT OF C_OVERDUE;
+
+        -- Audit log entry for each updated order
+        INSERT INTO ORDLIB.ORDAUDIT
+            (ORDNO, CUSTNO, AUDTYPE, AUDAMT, AUDTIME, AUDUSER)
+        VALUES
+            (V_ORDNO, V_CUSTNO, 'LATEFEE',
+             V_ORDAMT * P_FEERATE, CURRENT_TIMESTAMP, SESSION_USER);
+
+    END LOOP FETCH_LOOP;
+
+    CLOSE C_OVERDUE;
+END;</pre>
+
+<p>The <code>WHERE CURRENT OF cursor_name</code> clause in the UPDATE applies the change to the exact row that was just fetched, making positioned updates safe even on tables without a unique key readily available.</p>
+
+<h2>Complete Stored Procedure: PROCESS_OVERDUE_ORDERS</h2>
+
+<p>The following is a complete, production-ready stored procedure that combines cursor looping, conditional logic, audit logging, and an OUT parameter returning the count of processed records.</p>
+
+<pre>CREATE OR REPLACE PROCEDURE ORDLIB.PROCESS_OVERDUE_ORDERS (
+    IN  P_CUTOFFDT   DATE,
+    OUT P_PROCCOUNT  INT
+)
+LANGUAGE SQL
+SPECIFIC ORDLIB.PROCESS_OVERDUE_ORDERS
+MODIFIES SQL DATA
+COMMENT ON SPECIFIC ROUTINE ORDLIB.PROCESS_OVERDUE_ORDERS IS
+    'Mark open orders past cutoff as overdue, log audit trail, return count.'
+BEGIN
+    DECLARE V_ORDNO    CHAR(8);
+    DECLARE V_CUSTNO   CHAR(7);
+    DECLARE V_ORDAMT   DECIMAL(11,2);
+    DECLARE V_COUNTER  INT DEFAULT 0;
+    DECLARE V_DONE     INT DEFAULT 0;
+
+    -- Error handler: log and continue on unexpected SQL error
+    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
+    BEGIN
+        -- Insert error marker into audit so failures are visible
+        INSERT INTO ORDLIB.ORDAUDIT (ORDNO, CUSTNO, AUDTYPE, AUDAMT, AUDTIME, AUDUSER)
+        VALUES ('ERR', 'ERR', 'SQLERR', 0, CURRENT_TIMESTAMP, SESSION_USER);
+    END;
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET V_DONE = 1;
+
+    DECLARE C_ORDERS CURSOR FOR
+        SELECT ORDNO, CUSTNO, ORDAMT
+        FROM   ORDLIB.ORDMST
+        WHERE  ORDSTS = 'OP'
+        AND    ORDDUE < P_CUTOFFDT
+        FOR UPDATE OF ORDSTS;
+
+    SET P_PROCCOUNT = 0;
+
+    OPEN C_ORDERS;
+
+    ORDER_LOOP: LOOP
+        FETCH C_ORDERS INTO V_ORDNO, V_CUSTNO, V_ORDAMT;
+        IF V_DONE = 1 THEN
+            LEAVE ORDER_LOOP;
+        END IF;
+
+        -- Transition order status to Overdue
+        UPDATE ORDLIB.ORDMST
+        SET    ORDSTS = 'OD'
+        WHERE  CURRENT OF C_ORDERS;
+
+        -- Write audit trail record
+        INSERT INTO ORDLIB.ORDAUDIT
+            (ORDNO, CUSTNO, AUDTYPE, AUDAMT, AUDTIME, AUDUSER)
+        VALUES
+            (V_ORDNO, V_CUSTNO, 'OVERDUEPROC',
+             V_ORDAMT, CURRENT_TIMESTAMP, SESSION_USER);
+
+        SET V_COUNTER = V_COUNTER + 1;
+    END LOOP ORDER_LOOP;
+
+    CLOSE C_ORDERS;
+
+    SET P_PROCCOUNT = V_COUNTER;
+END;</pre>
+
+<p>Test it directly from ACS Run SQL Scripts:</p>
+
+<pre>-- Run the procedure and display the result
+CALL ORDLIB.PROCESS_OVERDUE_ORDERS(CURRENT_DATE - 30 DAYS, ?);
+
+-- Or with a named output host variable in a script
+BEGIN
+    DECLARE V_COUNT INT;
+    CALL ORDLIB.PROCESS_OVERDUE_ORDERS('2026-05-01', V_COUNT);
+    VALUES V_COUNT;
+END;</pre>
+
+<h2>Calling Stored Procedures from RPG</h2>
+
+<p>Calling a DB2 stored procedure from an ILE RPG program is straightforward using embedded SQL. The RPG source file must have a source type of SQLRPGLE and be compiled with CRTSQLRPGI.</p>
+
+<pre>**FREE
+// ============================================================
+// Programme: RUNORDPRC
+// Purpose:   Call ORDLIB.PROCESS_OVERDUE_ORDERS and report result
+// ============================================================
+Ctl-Opt DftActGrp(*No) ActGrp('ORDGRP') Option(*SrcStmt);
+
+Dcl-S CutoffDate  Date(*ISO);
+Dcl-S ProcessedCt Int(10);
+Dcl-S MsgText     Varchar(100);
+
+// Set cutoff: orders more than 30 days old
+CutoffDate = %Date() - %Days(30);
+
+// Call stored procedure — host variables prefixed with colon
+Exec SQL
+    CALL ORDLIB.PROCESS_OVERDUE_ORDERS(:CutoffDate, :ProcessedCt);
+
+// Check SQLSTATE for errors
+If SQLSTATE <> '00000' And SQLSTATE <> '01000';
+    MsgText = 'PROCESS_OVERDUE_ORDERS failed. SQLSTATE: ' + SQLSTATE;
+    // In production: send to QSYSOPR or write to error log
+    Dsply MsgText;
+    *InLR = *On;
+    Return;
+EndIf;
+
+MsgText = 'Orders processed: ' + %Char(ProcessedCt);
+Dsply MsgText;
+
+*InLR = *On;</pre>
+
+<p>Compile the RPG programme:</p>
+
+<pre>CRTSQLRPGI OBJ(ORDLIB/RUNORDPRC) SRCFILE(ORDLIB/QRPGLESRC) +
+    SRCMBR(RUNORDPRC) COMMIT(*NONE) OBJTYPE(*PGM)</pre>
+
+<h2>Calling Stored Procedures from CL and Node.js</h2>
+
+<p>From CL, use RUNSQL to call a stored procedure directly. This is useful in CL automation scripts and QSTRUP programmes that need to run database procedures as part of system startup:</p>
+
+<pre>/* Call stored procedure from CL */
+RUNSQL SQL('CALL ORDLIB.PROCESS_OVERDUE_ORDERS(CURRENT_DATE - 30 DAYS, ?)') +
+    COMMIT(*NONE)</pre>
+
+<p>For a CL programme that captures the output parameter, use QSQEXEC or call an RPG programme wrapper that returns the count. The simplest approach in CL is a wrapper RPG programme.</p>
+
+<p>From Node.js using the <strong>idb-connector</strong> package (the standard Node.js DB2 for i connector available via npm):</p>
+
+<pre>// document_rpg_node.js — Call IBM i stored procedure from Node.js
+// npm install idb-connector
+const { dbconn, dbstmt } = require('idb-connector');
+
+async function processOverdueOrders(cutoffDate) {
+    const conn = new dbconn();
+    conn.conn('*LOCAL');  // Connect to local IBM i DB2
+
+    const stmt = new dbstmt(conn);
+
+    // Prepare the CALL statement with parameter markers
+    stmt.prepare('CALL ORDLIB.PROCESS_OVERDUE_ORDERS(?, ?)', (err) => {
+        if (err) { console.error('Prepare error:', err); return; }
+
+        // Execute with IN parameter; OUT parameter returned in callback
+        stmt.execute([
+            { Type: 'INPUT',  Data: cutoffDate },
+            { Type: 'OUTPUT', Data: 0, Precision: 10, Scale: 0, SqlType: 'INTEGER' }
+        ], (out, err) => {
+            if (err) {
+                console.error('Execute error:', err);
+            } else {
+                const processedCount = out[0];
+                console.log(`Orders processed: ${processedCount}`);
+            }
+            stmt.close();
+            conn.disconn();
+        });
+    });
+}
+
+processOverdueOrders('2026-05-01');
+</pre>
+
+<p>For off-system Node.js access (running on a separate server connecting to IBM i over TCP/IP), replace <code>*LOCAL</code> with the IBM i host name and supply credentials:</p>
+
+<pre>conn.conn('IBMIHOST', 'DBUSER', 'DBPASSWORD');</pre>
+
+<h2>Scalar User-Defined Functions</h2>
+
+<p>A scalar UDF returns a single value and can be used anywhere a scalar expression is valid in a SQL statement — in a SELECT list, WHERE clause, or HAVING clause. This makes it possible to encapsulate formatting and calculation logic that is reused across many queries.</p>
+
+<pre>-- Scalar UDF: format a 10-digit phone number as (0NN) NNN-NNNN
+CREATE OR REPLACE FUNCTION CUSTLIB.FORMATTED_PHONE (
+    P_RAWPHONE CHAR(10)
+)
+RETURNS VARCHAR(14)
+LANGUAGE SQL
+SPECIFIC CUSTLIB.FORMATTED_PHONE
+DETERMINISTIC
+NO EXTERNAL ACTION
+CONTAINS SQL
+RETURN
+    CASE
+        WHEN P_RAWPHONE IS NULL OR LENGTH(TRIM(P_RAWPHONE)) <> 10 THEN
+            COALESCE(TRIM(P_RAWPHONE), 'UNKNOWN')
+        ELSE
+            '(' || SUBSTR(P_RAWPHONE,1,3) || ') ' ||
+            SUBSTR(P_RAWPHONE,4,3) || '-' ||
+            SUBSTR(P_RAWPHONE,7,4)
+    END;</pre>
+
+<p>Use the scalar UDF directly in a SELECT:</p>
+
+<pre>SELECT CUSTNO,
+       CUSTNAM,
+       CUSTLIB.FORMATTED_PHONE(CUSTPH1) AS FORMATTED_PHONE,
+       CUSTLIB.FORMATTED_PHONE(CUSTPH2) AS MOBILE_PHONE
+FROM   CUSTLIB.CUSTMST
+WHERE  CUSTAT = 'AC'
+ORDER BY CUSTNAM;</pre>
+
+<p>The DETERMINISTIC keyword tells the DB2 optimiser that the same input always produces the same output, allowing it to cache results and avoid re-evaluating the function for repeated input values within a query. CONTAINS SQL indicates the function body uses SQL expressions but does not read or modify table data.</p>
+
+<h2>Table User-Defined Functions</h2>
+
+<p>A table UDF returns a result set rather than a scalar value. It is used with the TABLE() function in the FROM clause of a SELECT statement, making it look and behave like a table or view. Table UDFs are powerful for encapsulating parameterised queries that would otherwise require a complex join or derived table.</p>
+
+<pre>-- Table UDF: return all open orders for a given customer
+CREATE OR REPLACE FUNCTION ORDLIB.GET_CUST_ORDERS (
+    P_CUSTNO CHAR(7)
+)
+RETURNS TABLE (
+    ORDNO   CHAR(8),
+    ORDDAT  DATE,
+    ORDDUE  DATE,
+    ORDAMT  DECIMAL(11,2),
+    ORDSTS  CHAR(2),
+    ORDREF  VARCHAR(30)
+)
+LANGUAGE SQL
+SPECIFIC ORDLIB.GET_CUST_ORDERS
+READS SQL DATA
+NO EXTERNAL ACTION
+RETURN
+    SELECT ORDNO, ORDDAT, ORDDUE, ORDAMT, ORDSTS, ORDREF
+    FROM   ORDLIB.ORDMST
+    WHERE  CUSTNO = P_CUSTNO
+    AND    ORDSTS IN ('OP', 'PD', 'OD')
+    ORDER BY ORDDUE;</pre>
+
+<p>Use the table function with the TABLE() constructor:</p>
+
+<pre>-- All open orders for a specific customer
+SELECT *
+FROM   TABLE(ORDLIB.GET_CUST_ORDERS('CUST001')) AS T;
+
+-- Join the table function result to another table
+SELECT C.CUSTNAM,
+       T.ORDNO,
+       T.ORDDUE,
+       T.ORDAMT,
+       T.ORDSTS
+FROM   CUSTLIB.CUSTMST C
+JOIN   TABLE(ORDLIB.GET_CUST_ORDERS(C.CUSTNO)) AS T
+    ON 1=1
+WHERE  C.CUSTAT = 'AC'
+AND    T.ORDDUE < CURRENT_DATE
+ORDER BY C.CUSTNAM, T.ORDDUE;</pre>
+
+<p>The correlated join pattern in the second query (joining on 1=1 after specifying a correlated parameter from the outer table) is a powerful technique for applying a table function to every row of a driving query. It is roughly equivalent to a lateral join in other SQL dialects.</p>
+
+<h2>External Stored Procedures</h2>
+
+<p>Not all business logic belongs in pure SQL. When a stored procedure needs to execute CL commands, perform IFS file I/O, call service programmes, or use ILE capabilities unavailable in SQL, an external stored procedure — backed by an ILE RPG or CL programme — is the right approach.</p>
+
+<pre>-- Register an ILE RPG programme as a SQL stored procedure
+CREATE OR REPLACE PROCEDURE ORDLIB.SEND_ORDER_CONFIRM (
+    IN P_ORDNO   CHAR(8),
+    IN P_EMAIL   VARCHAR(100)
+)
+LANGUAGE RPGLE
+SPECIFIC ORDLIB.SEND_ORDER_CONFIRM
+EXTERNAL NAME 'ORDLIB/SNDORDCFM'
+PARAMETER STYLE GENERAL
+MODIFIES SQL DATA;
+</pre>
+
+<p>The RPG programme <code>ORDLIB/SNDORDCFM</code> receives the parameters as RPG parameters in the order they are declared. The programme can call QCMDEXC, use service programmes, write to the IFS, or do anything an ILE RPG programme can do. From the SQL caller's perspective it is indistinguishable from a SQL procedure — the same CALL syntax applies.</p>
+
+<p>The decision rule between SQL and external procedures:</p>
+<ul>
+  <li>Use <strong>SQL procedures</strong> when the logic is purely relational — it reads and modifies DB2 tables, applies business rules to query results, and has no need for CL commands or IFS operations. SQL procedures are portable, do not require compilation of RPG source, and are managed entirely within the database.</li>
+  <li>Use <strong>external procedures</strong> when you need QCMDEXC to run CL commands, need to call an existing ILE service programme, perform IFS file operations, interact with data queues, or require ILE memory management that SQL cannot provide.</li>
+</ul>
+
+<p>To check all stored procedures defined in a schema:</p>
+
+<pre>SELECT ROUTINE_NAME, ROUTINE_TYPE, EXTERNAL_NAME, LANGUAGE,
+       SQL_DATA_ACCESS, SPECIFIC_NAME
+FROM   QSYS2.SYSROUTINES
+WHERE  ROUTINE_SCHEMA = 'ORDLIB'
+AND    ROUTINE_TYPE   = 'PROCEDURE'
+ORDER BY ROUTINE_NAME;</pre>
+
+<p>To check all UDFs in a schema:</p>
+
+<pre>SELECT ROUTINE_NAME, ROUTINE_TYPE, FUNCTION_TYPE, LANGUAGE,
+       RETURNS_TYPE, SPECIFIC_NAME
+FROM   QSYS2.SYSROUTINES
+WHERE  ROUTINE_SCHEMA = 'ORDLIB'
+AND    ROUTINE_TYPE   = 'FUNCTION'
+ORDER BY ROUTINE_NAME;</pre>
+
+<p>Both queries use QSYS2.SYSROUTINES, the DB2 for i catalogue view for all SQL routines. This is your inventory of stored logic at the database layer — use it to document, audit, and manage your stored procedure library as it grows.</p>
+
+<em>Next post: IBM i Security Hardening in 2026 — QSECURITY system value levels, user profile hardening with minimum authority, object-level security and ownership, special authority audit, network security with QRMTSIGN and QRETSVRSEC, and using QSYS2 security-related table functions to audit your IBM i estate.</em>

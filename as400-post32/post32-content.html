@@ -1,0 +1,316 @@
+The previous post covered advanced ILE RPG — system pointers, IBM i OS APIs, dynamic calls, and user spaces. This post covers Python on IBM i: running Python natively in PASE, accessing DB2 for i, calling IBM i programs and commands from Python, and integrating Python with AI APIs for IBM i data workflows.
+
+Python's presence on IBM i is a consequence of the PASE environment. PASE is a full AIX-compatible runtime, and Python runs in it as a native POSIX process with access to the file system, network, and IBM i OS through both standard POSIX interfaces and IBM i-specific Python packages. This is not a remote Python script talking to IBM i over ODBC — it is Python running inside the same LPAR, with in-process access to DB2 for i and the ability to call CL commands and RPG programs directly.
+
+<h2>Installing Python on IBM i</h2>
+
+Python is installed via yum in PASE. IBM maintains current Python versions in the open-source package repository for IBM i.
+
+<pre>/* From a PASE shell or QSH */
+yum install python39          /* Python 3.9 */
+yum install python39-pip      /* pip package manager */
+yum install python39-ibm_db   /* native DB2 for i connector */
+
+/* Verify */
+python3 --version
+pip3 --version</pre>
+
+<strong>Virtual environments (isolate project dependencies):</strong>
+
+<pre>python3 -m venv /home/build/myproject/venv
+source /home/build/myproject/venv/bin/activate
+pip install requests pandas openpyxl</pre>
+
+Always use virtual environments for project-specific dependencies rather than installing packages globally with sudo.
+
+<h2>Accessing DB2 for i from Python: ibm_db</h2>
+
+ibm_db is the official IBM Python driver for Db2. On IBM i, it connects to the local database using IPC (inter-process communication), the same path as idb-connector for Node.js — no network overhead.
+
+<strong>Installing ibm_db (already installed via yum above):</strong>
+
+<pre>pip install ibm_db    # Alternatively, use the yum-installed version</pre>
+
+<strong>Connecting and querying:</strong>
+
+<pre>import ibm_db
+import ibm_db_dbi    # DB-API 2.0 wrapper (more Pythonic)
+
+# Connect to local IBM i database
+conn = ibm_db_dbi.connect('*LOCAL', '', '')
+
+cursor = conn.cursor()
+
+# Parameterised query
+cust_num = 'CUST00001'
+cursor.execute(
+    "SELECT ORDNUM, ORDAMT, ORDDAT, ORDSTS "
+    "FROM ORDLIB.ORDHDR "
+    "WHERE CUSTNUM = ? AND ORDSTS = 'OP' "
+    "ORDER BY ORDDAT DESC",
+    (cust_num,)
+)
+
+rows = cursor.fetchall()
+for row in rows:
+    print(f"Order {row[0]}: ${row[1]:.2f} on {row[2]}")
+
+cursor.close()
+conn.close()</pre>
+
+<strong>Using pandas for data analysis of IBM i data:</strong>
+
+<pre>import ibm_db_dbi
+import pandas as pd
+
+conn = ibm_db_dbi.connect('*LOCAL', '', '')
+
+# Load DB2 for i query result directly into a DataFrame
+df = pd.read_sql(
+    """
+    SELECT H.CUSTNUM, C.CUSTNAME,
+           SUM(H.ORDAMT)  AS TOTAL_SALES,
+           COUNT(*)       AS ORDER_COUNT,
+           MAX(H.ORDDAT)  AS LAST_ORDER
+    FROM   ORDLIB.ORDHDR   H
+    JOIN   ORDLIB.CUSTOMER  C ON C.CUSTNUM = H.CUSTNUM
+    WHERE  YEAR(H.ORDDAT) = 2026
+    GROUP  BY H.CUSTNUM, C.CUSTNAME
+    ORDER  BY TOTAL_SALES DESC
+    FETCH FIRST 50 ROWS ONLY
+    """,
+    conn
+)
+
+conn.close()
+
+# Analyse with pandas
+top_customers = df[df['TOTAL_SALES'] > 50000]
+print(top_customers.to_string(index=False))
+
+# Export to Excel
+df.to_excel('/home/reports/customer-sales-2026.xlsx', index=False)</pre>
+
+<h2>Accessing DB2 for i via pyodbc</h2>
+
+pyodbc provides an alternative connection path through the IBM i ODBC driver. It is useful when you need ODBC-specific features or when working across multiple database platforms in the same script.
+
+<pre>pip install pyodbc
+
+import pyodbc
+
+conn = pyodbc.connect(
+    'DRIVER={IBM i Access ODBC Driver};'
+    'SYSTEM=*LOCAL;'           # *LOCAL for in-PASE connection
+    'NAM=1;'                   # 1 = system naming (library list)
+    'DBQ=ORDLIB;'              # default library
+    'UNICODESQL=1;'
+)
+
+cursor = conn.cursor()
+cursor.execute("SELECT ORDNUM, ORDAMT FROM ORDHDR WHERE ORDSTS = 'OP'")
+print(cursor.fetchall())
+conn.close()</pre>
+
+<h2>Calling CL commands and RPG programs: itoolkit-for-i</h2>
+
+itoolkit-for-i (the Python version of itoolkit) calls IBM i programs and CL commands through the XMLSERVICE interface, the same mechanism as the Node.js version. It allows Python scripts running in PASE to call RPG service programs, run CL commands, and interact with IBM i data queues.
+
+<pre>pip install itoolkit
+
+from itoolkit import *
+from itoolkit.transport import DatabaseTransport
+import ibm_db
+
+# Connect via ibm_db for the transport layer
+conn = ibm_db.connect('*LOCAL', '', '')
+transport = DatabaseTransport(conn)
+itool = iToolKit()
+
+# Run a CL command
+itool.add(iCmd('addlible', 'ADDLIBLE LIB(ORDLIB)'))
+itool.call(transport)
+result = itool['addlible']
+print(result)
+
+# Call an RPG program
+call = iCall('GETORDSTS', 'ORDLIB')
+call.addParm(iData('ordNum',  '7a0',  'ORD0143'))   # input: 7-char order number
+call.addParm(iData('ordSts',  '2a0',  ''))           # output: 2-char status
+call.addParm(iData('ordDesc', '50a0', ''))           # output: 50-char description
+
+itool.clear()
+itool.add(call)
+itool.call(transport)
+
+result = itool['GETORDSTS']
+print('Status:', result['ordSts'])
+print('Description:', result['ordDesc'])
+
+ibm_db.close(conn)</pre>
+
+<strong>Running a CL command and capturing output:</strong>
+
+<pre>itool.clear()
+itool.add(iSh('ls /home/build/project-repo/src/rpgle'))   # PASE shell command
+itool.call(transport)
+print(itool['ls']['stdout'])</pre>
+
+<code>iSh</code> runs a PASE shell command and captures stdout — useful for integrating shell scripts and Git operations into Python workflows.
+
+<h2>Building data pipelines from IBM i to cloud</h2>
+
+Python on IBM i is well-suited for building data pipelines that extract IBM i data and deliver it to cloud platforms — S3, Azure Blob Storage, BigQuery, or any REST endpoint.
+
+<strong>Extract IBM i data and upload to AWS S3:</strong>
+
+<pre>import ibm_db_dbi
+import pandas as pd
+import boto3
+from io import StringIO
+from datetime import date
+
+# Step 1: Extract from DB2 for i
+conn = ibm_db_dbi.connect('*LOCAL', '', '')
+df = pd.read_sql(
+    f"SELECT * FROM ORDLIB.ORDHDR WHERE ORDDAT = '{date.today()}'",
+    conn
+)
+conn.close()
+
+# Step 2: Convert to CSV in memory
+csv_buffer = StringIO()
+df.to_csv(csv_buffer, index=False)
+
+# Step 3: Upload to S3
+s3 = boto3.client(
+    's3',
+    aws_access_key_id     = open('/home/app/.aws/access_key').read().strip(),
+    aws_secret_access_key = open('/home/app/.aws/secret_key').read().strip(),
+    region_name           = 'ap-south-1'
+)
+s3.put_object(
+    Bucket = 'my-ibmi-data',
+    Key    = f"orders/ordhdr-{date.today()}.csv",
+    Body   = csv_buffer.getvalue()
+)
+
+print(f"Uploaded {len(df)} rows to S3")</pre>
+
+<strong>Installing boto3 for AWS integration:</strong>
+
+<pre>pip install boto3</pre>
+
+<h2>Calling AI APIs from Python on IBM i</h2>
+
+Python's rich ecosystem of AI libraries runs on IBM i in PASE. The OpenAI Python library, the IBM watsonx SDK, and HTTP clients like requests all install and run without modification.
+
+<strong>Batch text classification using OpenAI from IBM i:</strong>
+
+<pre>pip install openai
+
+import ibm_db_dbi
+import openai
+import time
+
+openai.api_key = open('/home/app/.secrets/openai_key').read().strip()
+
+conn = ibm_db_dbi.connect('*LOCAL', '', '')
+cursor = conn.cursor()
+
+# Fetch unclassified complaints
+cursor.execute(
+    "SELECT COMPID, COMPTEXT FROM ORDLIB.COMPLAINTS "
+    "WHERE COMPCAT = ' ' AND COMPSTAT = 'NEW' "
+    "FETCH FIRST 50 ROWS ONLY"
+)
+complaints = cursor.fetchall()
+
+update_cursor = conn.cursor()
+
+for comp_id, comp_text in complaints:
+    try:
+        response = openai.chat.completions.create(
+            model    = 'gpt-4o-mini',
+            messages = [{'role': 'user',
+                         'content': f'Reply with one word: BILLING, DELIVERY, PRODUCT, or OTHER. '
+                                    f'Complaint: {comp_text}'}],
+            max_tokens = 5
+        )
+        category = response.choices[0].message.content.strip().upper()
+        if category not in ('BILLING', 'DELIVERY', 'PRODUCT', 'OTHER'):
+            category = 'OTHER'
+
+        update_cursor.execute(
+            "UPDATE ORDLIB.COMPLAINTS SET COMPCAT = ?, COMPSTAT = 'CLASSIFIED' "
+            "WHERE COMPID = ?",
+            (category, comp_id)
+        )
+        conn.commit()
+        time.sleep(0.1)   # rate limit pause
+
+    except Exception as e:
+        print(f"Error processing complaint {comp_id}: {e}")
+
+cursor.close()
+update_cursor.close()
+conn.close()
+print(f"Processed {len(complaints)} complaints")</pre>
+
+<strong>Using watsonx.ai from Python:</strong>
+
+<pre>pip install ibm-watsonx-ai
+
+from ibm_watsonx_ai import APIClient, Credentials
+from ibm_watsonx_ai.foundation_models import Model
+
+credentials = Credentials(
+    url    = 'https://eu-de.ml.cloud.ibm.com',
+    api_key = open('/home/app/.secrets/ibmcloud_apikey').read().strip()
+)
+
+client = APIClient(credentials)
+
+model = Model(
+    model_id   = 'ibm/granite-13b-instruct-v2',
+    project_id = 'your-watsonx-project-id',
+    credentials = credentials
+)
+
+response = model.generate_text(
+    prompt     = 'Summarise this IBM i batch job result in one sentence: '
+                 'Processed 14,293 orders, 42 failures, total value $4.2M',
+    params     = {'max_new_tokens': 60}
+)
+print(response)</pre>
+
+<h2>Running Python scripts from CL and scheduling</h2>
+
+Python scripts on IBM i can be called from CL programs or scheduled like any other batch job:
+
+<pre>/* Run a Python script from CL */
+QSH CMD('source /home/build/venv/bin/activate && python3 /home/build/scripts/daily-extract.py')
+
+/* Or use STRQSH for a full shell session */
+STRQSH CMD('cd /home/build && python3 scripts/daily-extract.py >> logs/extract.log 2>&1')
+
+/* Schedule daily execution via job scheduler */
+ADDJOBSCDE JOB(PYEXTRACT) +
+            CMD(QSH CMD('python3 /home/build/scripts/daily-extract.py')) +
+            FRQ(*WEEKLY) SCDDAY(*ALL) SCDTIME(020000) +
+            USER(BUILDUSER)</pre>
+
+<h2>Python versus Node.js versus RPG on IBM i</h2>
+
+All three runtimes have legitimate uses on IBM i in 2026. The choice depends on the task:
+
+<ul>
+<li><strong>Python</strong> — data analysis, ML/AI pipelines, data extraction to cloud platforms, automation scripts where the team knows Python better than CL. pandas, boto3, and openai are mature, well-documented libraries.</li>
+<li><strong>Node.js</strong> — REST API layers, real-time event-driven services, web sockets. Express.js is the right tool for building the API layer over IBM i data.</li>
+<li><strong>RPG</strong> — business logic, transaction processing, programs that call other IBM i programs, anything that benefits from compiled ILE performance and tight integration with DB2 for i through embedded SQL.</li>
+<li><strong>CL</strong> — environment control, job orchestration, library list management, operational automation. Nothing else does this as cleanly on IBM i.</li>
+</ul>
+
+Python on IBM i is not a modernisation destination — it is an addition to the toolkit. The RPG programs that process orders, the DB2 tables that store them, and the CL programs that orchestrate the batch streams are still doing what they do best. Python is what you reach for when you need data analysis, cloud integration, or AI API calls that do not belong in the compiled application layer.
+
+<em>Next post: IBM i High Availability and Disaster Recovery — understanding HA options on IBM i, geographic mirroring, IBM i native replication, third-party HA tools, and how to design for recovery time objectives in production IBM i environments.</em>

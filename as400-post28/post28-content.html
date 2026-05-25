@@ -1,0 +1,241 @@
+The previous post covered IBM i performance tuning — memory pools, WRKACTJOB, Collection Services, and diagnosing slow batch jobs. This post goes deeper into the query layer: how DB2 for i decides how to run a query, what the Index Advisor and Plan Cache tell you, when to use Materialized Query Tables, and the SQL patterns that consistently cause performance problems on IBM i.
+
+<h2>SQE and CQE: two query engines in one database</h2>
+
+DB2 for i contains two query engines: the SQL Query Engine (SQE) and the Classic Query Engine (CQE). Understanding which one processes your query determines which tools you use to tune it.
+
+<strong>SQE (SQL Query Engine)</strong> — the modern engine, introduced with DB2 UDB for iSeries (V5R2). Handles all SQL statements submitted through the SQL interfaces: embedded SQL in RPG, JDBC, ODBC, DRDA, interactive SQL (STRSQL/ACS). Uses a cost-based optimiser with column statistics, bitmap indexes, hash joins, and dynamic index creation. The plan cache (SYSQRYSLT) captures SQE plans.
+
+<strong>CQE (Classic Query Engine)</strong> — the legacy engine, which predates SQL on IBM i. Handles OPNQRYF (Open Query File), Query/400 reports, and some specific SQL constructs that SQE does not yet support. CQE uses simpler access plans and does not populate the plan cache.
+
+<strong>Identifying which engine processed a query:</strong>
+
+<pre>SELECT QUERY_TEXT,
+       QUERY_ENGINE,           -- 'SQE' or 'CQE'
+       IMPLEMENTED_IN,         -- access plan implementation detail
+       RUN_COUNT,
+       AVG_TIME_PER_RUN
+FROM   QSYS2.SYSQRYSLT
+WHERE  TABLE_NAME LIKE '%ORDHDR%'
+ORDER  BY AVG_TIME_PER_RUN DESC
+FETCH FIRST 20 ROWS ONLY;</pre>
+
+If a query is running in CQE when you expect SQE, the most common reasons are: the query contains OPNQRYF-style parameter syntax, it uses a feature not yet supported by SQE (some specific join types or legacy DDS file formats), or the query was submitted through a non-SQL interface.
+
+<h2>Column statistics and the optimiser</h2>
+
+The SQE cost-based optimiser builds access plans based on statistics. Without statistics, it estimates based on file size and key structure alone. With column-level statistics, it makes much better decisions about join order, index selection, and whether a table scan is cheaper than a keyed read.
+
+<strong>Checking when statistics were last collected:</strong>
+
+<pre>SELECT TABLE_NAME, COLUMN_NAME, LAST_COLLECTED,
+       DISTINCT_VALUES, NULL_VALUES
+FROM   QSYS2.SYSSTATISTICS
+WHERE  TABLE_SCHEMA = 'ORDLIB'
+ORDER  BY TABLE_NAME, COLUMN_NAME;</pre>
+
+<strong>Collecting statistics manually:</strong>
+
+<pre>CALL QSYS2.COLLECT_COLUMN_STATISTICS(
+    TABLE_SCHEMA => 'ORDLIB',
+    TABLE_NAME   => 'ORDHDR'
+);
+
+-- Or for a specific set of columns
+CALL QSYS2.COLLECT_COLUMN_STATISTICS(
+    TABLE_SCHEMA  => 'ORDLIB',
+    TABLE_NAME    => 'ORDHDR',
+    COLUMN_NAMES  => 'CUSTNUM, ORDSTS, ORDDAT'
+);</pre>
+
+<strong>Automatic statistics maintenance:</strong> DB2 for i can maintain statistics automatically via the Auto Statistics feature. Enable it with:
+
+<pre>CALL QSYS2.CHANGE_QUERY_ATTRIBUTES(
+    AUTOMATIC_STATISTICS_MAINTENANCE => 'YES'
+);</pre>
+
+For production systems with tables that change significantly day-to-day (order processing, inventory), enabling automatic statistics maintenance prevents the optimiser from using stale plans.
+
+<h2>The Index Advisor</h2>
+
+The Index Advisor (SYSIXADV) records indexes that the optimiser would have liked to use but that did not exist. It is populated by both SQE and CQE. Checking it regularly and creating the advised indexes is the highest-ROI query tuning activity for most IBM i shops.
+
+<pre>-- Most frequently advised missing indexes
+SELECT SYSTEM_TABLE_SCHEMA,
+       SYSTEM_TABLE_NAME,
+       TIMES_ADVISED,
+       LAST_ADVISED,
+       ADVISED_INDEX_KEYS,
+       MTI_USED,            -- Y = a temporary index was built instead
+       MTI_CREATED
+FROM   QSYS2.SYSIXADV
+WHERE  SYSTEM_TABLE_SCHEMA = 'ORDLIB'
+ORDER  BY TIMES_ADVISED DESC
+FETCH FIRST 20 ROWS ONLY;</pre>
+
+<strong>MTI_USED = Y</strong> means the optimiser built a temporary index (Managed Temporary Index) at query time because a permanent index did not exist. This is expensive — building a temporary index takes time and storage. A query that builds an MTI every time it runs is a strong candidate for a permanent index.
+
+<strong>Creating the advised index:</strong>
+
+<pre>-- Example: Index Advisor shows ORDSTS, ORDDAT frequently needed together
+CREATE INDEX ORDLIB.ORDHDR_STS_DAT_IDX
+    ON ORDLIB.ORDHDR (ORDSTS ASC, ORDDAT DESC);</pre>
+
+After creating the index, the optimiser picks it up automatically — no recompilation needed.
+
+<h2>Visual Explain</h2>
+
+Visual Explain in ACS (IBM i Access Client Solutions) renders the SQE access plan as a diagram. Each node shows the operation (table scan, index scan, hash join, sort) and estimated cost. Use it to answer: why is this query slow?
+
+<strong>How to use Visual Explain:</strong>
+<ol>
+<li>Open ACS → Run SQL Scripts</li>
+<li>Type or paste the SQL statement</li>
+<li>Right-click → Visual Explain (or press F13)</li>
+<li>Read the plan from bottom to top — leaves are the base table accesses, the root is the final result</li>
+</ol>
+
+<strong>Red flags in a Visual Explain plan:</strong>
+<ul>
+<li><strong>Table scan on a large table</strong> — the optimizer chose not to use any index. Check why: missing index, statistics stale, predicate not sargable (not index-usable)</li>
+<li><strong>Temporary result</strong> — a sort or grouping operation required materialising an intermediate result set to disk</li>
+<li><strong>CQE</strong> label instead of SQE — the query fell back to the classic engine; investigate why</li>
+<li><strong>High estimated rows</strong> at an early join stage — the join order may be wrong; statistics may be stale</li>
+</ul>
+
+<h2>Materialized Query Tables (MQTs)</h2>
+
+A Materialized Query Table is a table whose content is defined by a query and physically stored. It is the IBM i equivalent of a materialized view. The query optimiser can transparently substitute an MQT for a more expensive query — even in queries that do not explicitly reference the MQT.
+
+<strong>When to use MQTs:</strong>
+<ul>
+<li>Aggregations that are computed repeatedly (daily sales totals, regional summaries)</li>
+<li>Expensive joins between large tables that are queried frequently with the same join pattern</li>
+<li>Analytics queries against OLTP tables where real-time freshness is not required</li>
+</ul>
+
+<strong>Creating an MQT for open order summaries by customer:</strong>
+
+<pre>CREATE TABLE ORDLIB.MQT_CUST_OPEN_ORDERS AS (
+    SELECT H.CUSTNUM,
+           C.CUSTNAME,
+           COUNT(*)         AS OPEN_ORDER_CNT,
+           SUM(H.ORDAMT)    AS TOTAL_OPEN_AMT,
+           MAX(H.ORDDAT)    AS LATEST_ORDER_DATE
+    FROM   ORDLIB.ORDHDR   H
+    JOIN   ORDLIB.CUSTOMER  C ON C.CUSTNUM = H.CUSTNUM
+    WHERE  H.ORDSTS = 'OP'
+    GROUP  BY H.CUSTNUM, C.CUSTNAME
+)
+DATA INITIALLY DEFERRED
+REFRESH DEFERRED
+MAINTAINED BY USER
+ENABLE QUERY OPTIMIZATION;</pre>
+
+<strong>Populating the MQT:</strong>
+
+<pre>REFRESH TABLE ORDLIB.MQT_CUST_OPEN_ORDERS;</pre>
+
+<strong>How the optimiser uses MQTs:</strong> Once the MQT is populated and enabled for query optimisation, a query like:
+
+<pre>SELECT CUSTNUM, SUM(ORDAMT) AS TOTAL
+FROM   ORDLIB.ORDHDR
+WHERE  ORDSTS = 'OP'
+GROUP  BY CUSTNUM;</pre>
+
+...may be transparently answered from the MQT rather than scanning ORDHDR. Visual Explain will show "MQT rewrite" in the plan when this happens.
+
+<strong>Scheduling MQT refreshes in CL:</strong>
+
+<pre>/* Refresh MQT as part of nightly batch */
+RUNSQL SQL('REFRESH TABLE ORDLIB.MQT_CUST_OPEN_ORDERS') COMMIT(*NONE)</pre>
+
+<h2>Bitmap indexes for analytics queries</h2>
+
+DB2 for i supports bitmap indexes for low-cardinality columns. A bitmap index is efficient for columns with few distinct values (status codes, region codes, boolean flags) when combined with other predicates in analytics queries.
+
+<pre>-- Bitmap index on order status (few distinct values: OP, CL, HL, CN)
+CREATE BITMAP INDEX ORDLIB.ORDHDR_STS_BMP
+    ON ORDLIB.ORDHDR (ORDSTS);</pre>
+
+The optimiser can combine multiple bitmap indexes with AND/OR operations — a query filtering on both ORDSTS and REGION can use both bitmap indexes together, then fetch only the qualifying rows. This is far more efficient than a composite B-tree index for analytics patterns.
+
+<h2>SQL anti-patterns specific to DB2 for i</h2>
+
+<strong>Non-sargable predicates — functions on indexed columns:</strong>
+
+<pre>-- BAD: function applied to the indexed column; index on ORDDAT cannot be used
+WHERE YEAR(ORDDAT) = 2026 AND MONTH(ORDDAT) = 5
+
+-- GOOD: range predicate; index on ORDDAT IS used
+WHERE ORDDAT BETWEEN DATE('2026-05-01') AND DATE('2026-05-31')</pre>
+
+<strong>LIKE with a leading wildcard:</strong>
+
+<pre>-- BAD: leading % forces a table scan regardless of index
+WHERE CUSTNAME LIKE '%SMITH'
+
+-- ACCEPTABLE: trailing wildcard can use an index
+WHERE CUSTNAME LIKE 'SMITH%'</pre>
+
+<strong>OR across multiple columns (use UNION ALL instead):</strong>
+
+<pre>-- BAD for large tables: OR prevents efficient index use
+WHERE ORDSTS = 'OP' OR ORDSTS = 'HL'
+
+-- GOOD: IN clause is sargable
+WHERE ORDSTS IN ('OP', 'HL')
+
+-- Or UNION ALL for very different access patterns
+SELECT * FROM ORDLIB.ORDHDR WHERE ORDSTS = 'OP'
+UNION ALL
+SELECT * FROM ORDLIB.ORDHDR WHERE ORDSTS = 'HL'</pre>
+
+<strong>SELECT * in production queries:</strong>
+
+<pre>-- BAD: retrieves all columns even if only 3 are needed; prevents index-only scans
+SELECT * FROM ORDLIB.ORDHDR WHERE CUSTNUM = :custNum
+
+-- GOOD: only retrieve needed columns; allows index-only access if index covers them
+SELECT ORDNUM, ORDAMT, ORDDAT FROM ORDLIB.ORDHDR WHERE CUSTNUM = :custNum</pre>
+
+<strong>Implicit conversions between character and numeric:</strong>
+
+<pre>-- BAD: CUSTNUM is CHAR(10); comparing to an integer forces conversion, defeating the index
+WHERE CUSTNUM = 12345
+
+-- GOOD: match the data type of the column
+WHERE CUSTNUM = '0000012345'</pre>
+
+<h2>Plan cache analysis workflow</h2>
+
+A structured approach to identifying and fixing query performance problems:
+
+<pre>-- Step 1: Find the slowest queries
+SELECT QUERY_TEXT, AVG_TIME_PER_RUN / 1000 AS AVG_SEC,
+       RUN_COUNT, TOTAL_TIME / 1000 AS TOTAL_SEC
+FROM   QSYS2.SYSQRYSLT
+ORDER  BY TOTAL_TIME DESC
+FETCH FIRST 10 ROWS ONLY;
+
+-- Step 2: For each slow query, check if Index Advisor has a recommendation
+SELECT TIMES_ADVISED, ADVISED_INDEX_KEYS, MTI_USED
+FROM   QSYS2.SYSIXADV
+WHERE  SYSTEM_TABLE_SCHEMA = 'ORDLIB'
+  AND  SYSTEM_TABLE_NAME   = 'ORDHDR'
+ORDER  BY TIMES_ADVISED DESC;
+
+-- Step 3: Check statistics freshness for tables in slow queries
+SELECT LAST_COLLECTED, DISTINCT_VALUES
+FROM   QSYS2.SYSSTATISTICS
+WHERE  TABLE_SCHEMA = 'ORDLIB'
+  AND  TABLE_NAME   = 'ORDHDR';
+
+-- Step 4: Run Visual Explain in ACS for the specific SQL statement
+-- Step 5: Create recommended indexes or collect statistics
+-- Step 6: Clear the plan cache entry and re-run to verify improvement
+CALL QSYS2.CANCEL_SQL('&lt;statement-id&gt;');</pre>
+
+Query performance on DB2 for i is predictable and improvable. The Index Advisor tells you what indexes to create. Visual Explain tells you why an existing plan is suboptimal. MQTs let you pre-compute expensive aggregations. Statistics keep the optimiser accurate. Working through these tools systematically resolves the vast majority of query performance problems without requiring schema changes or application rewrites.
+
+<em>Next post: IBM i system operations with CL — subsystem management, job control commands, data queues for inter-job communication, output queue management, and the operational CL patterns that IBM i administrators use every day.</em>

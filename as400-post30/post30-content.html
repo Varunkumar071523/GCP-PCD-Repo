@@ -1,0 +1,199 @@
+The previous post covered IBM i system operations with CL — subsystem management, job control, data queues, and scheduling. This post goes deeper into the Integrated File System: journalling stream files, sharing IFS directories over the network with NetServer, backing up IFS data, handling large files, and the encoding challenges that trip up teams working with modern text formats in the IFS.
+
+Post 24 covered the IFS foundations — stream files, directory structure, Git, and basic RPG/CL integration. This post covers the operational and advanced aspects that matter once the IFS is in active use across a development team or production application stack.
+
+<h2>IFS journalling for stream files</h2>
+
+The IBM i library system has had journalling for decades — every change to a database file can be captured in a journal receiver for recovery and replication. Stream files in the IFS support journalling too, but it works differently and is less commonly enabled.
+
+<strong>Why journal IFS stream files:</strong>
+<ul>
+<li>Point-in-time recovery for application configuration files and data files stored in the IFS</li>
+<li>Replication of IFS content to a standby system using IBM i native replication or third-party tools</li>
+<li>Audit trail for changes to sensitive IFS files (scripts, configuration, keys)</li>
+</ul>
+
+<strong>Enabling journalling on an IFS directory:</strong>
+
+<pre>/* Create a journal receiver in the library system */
+CRTJRNRCV JRNRCV(ORDLIB/IFSRCV0001) THRESHOLD(50000) TEXT('IFS journal receiver')
+
+/* Create a journal */
+CRTJRN JRN(ORDLIB/IFSJRN) JRNRCV(ORDLIB/IFSRCV0001) +
+        MNGRCV(*SYSTEM) DLTRCV(*YES) TEXT('IFS stream file journal')
+
+/* Start journalling on an IFS directory (covers all files in the directory) */
+STRJRNLK OBJ('/home/app/data') JRN(ORDLIB/IFSJRN) +
+           SUBTREE(*ALL) OBJTYPE(*STMF) IMAGES(*BOTH)</pre>
+
+<code>SUBTREE(*ALL)</code> includes all files in subdirectories. <code>IMAGES(*BOTH)</code> captures before and after images — required for both recovery and replication.
+
+<strong>Checking which IFS objects are journalled:</strong>
+
+<pre>SELECT PATH_NAME, JOURNAL_NAME, JOURNAL_LIBRARY, JOURNAL_IMAGES
+FROM   QSYS2.IFS_JOURNAL_INFO
+WHERE  PATH_NAME LIKE '/home/app/%'
+ORDER  BY PATH_NAME;</pre>
+
+<h2>NetServer: sharing the IFS as a Windows network drive</h2>
+
+IBM i NetServer implements the SMB (Server Message Block) protocol — the same protocol Windows uses for network file sharing. Any Windows, macOS, or Linux workstation on the same network can mount an IFS directory as a network drive through NetServer, without installing any IBM i client software.
+
+<strong>Starting NetServer:</strong>
+
+<pre>STRTCPSVR SERVER(*NETSVR)    /* Start NetServer */
+ENDTCPSVR SERVER(*NETSVR)    /* Stop NetServer */</pre>
+
+<strong>Configuring NetServer shares:</strong>
+
+<pre>/* Create a share for the application IFS directory */
+ADDNWSSTG TYPE(*SHARE) STGSIZE(0) ONLINE(*YES) DIRNAME('/home/app') +
+            ONLINE(*YES) TEXT('Application files')
+
+/* Or use the CFGTCPSVR command for the full NetServer configuration */
+CFGTCPSVR SVRSPCVAL(*NETSVR)</pre>
+
+NetServer shares are configured through IBM Navigator for i (the browser-based management interface): Network → Servers → TCP/IP → NetServer → File Shares. This is more practical than CL for initial setup.
+
+<strong>Connecting from Windows:</strong>
+
+<pre>\\MYSYSTEM\SHARENAME</pre>
+
+Type this in Windows Explorer's address bar, authenticate with an IBM i user profile and password, and the IFS directory appears as a network folder. Developers can edit files directly, drag and drop, and copy without using ACS or FTP.
+
+<strong>Permissions on NetServer shares:</strong> NetServer respects both the IFS POSIX permission bits and IBM i object authority. A file that a Windows user cannot read through NetServer is also inaccessible through RPG or PASE — it is the same object with the same authority model.
+
+<h2>NFS exports</h2>
+
+IBM i also supports NFS (Network File System) for UNIX/Linux client mounting. Where NetServer serves Windows clients, NFS serves Linux and macOS clients.
+
+<pre>/* Start NFS server */
+STRTCPSVR SERVER(*NFS)
+
+/* Export an IFS directory via NFS */
+/* Configuration is done through /QOpenSys/etc/exports file */</pre>
+
+<pre># /QOpenSys/etc/exports
+/home/build/shared  *(rw,sync,no_subtree_check)</pre>
+
+<pre>/* Apply exports without restarting NFS */
+QSH CMD('exportfs -ra')</pre>
+
+<strong>Mounting on a Linux client:</strong>
+
+<pre>mount -t nfs mysystem:/home/build/shared /mnt/ibmi-build</pre>
+
+NFS is less common than NetServer for IBM i shops but is useful when Linux build servers need to access IBM i source files directly as part of a CI/CD pipeline.
+
+<h2>IFS backup and restore</h2>
+
+The library system has SAVLIB/RSTLIB for libraries. The IFS has SAV/RST (Save/Restore) for directories and stream files.
+
+<strong>Saving an IFS directory:</strong>
+
+<pre>/* Save to a save file */
+SAV DEV('/QSYS.LIB/ORDLIB.LIB/APPSAV.FILE') +
+     OBJ(('/home/app')) +
+     SUBTREE(*ALL) +
+     UPDHST(*YES)
+
+/* Save to tape */
+SAV DEV('/QSYS.LIB/TAP01.DEVD') +
+     OBJ(('/home/build') ('/home/app')) +
+     SUBTREE(*ALL)</pre>
+
+<strong>Restoring an IFS directory:</strong>
+
+<pre>RST DEV('/QSYS.LIB/ORDLIB.LIB/APPSAV.FILE') +
+     OBJ(('/home/app')) +
+     SUBTREE(*ALL)</pre>
+
+<strong>Saving only changed objects (incremental backup):</strong>
+
+<pre>SAV DEV('/QSYS.LIB/ORDLIB.LIB/INCRSAV.FILE') +
+     OBJ(('/home/app')) +
+     SUBTREE(*ALL) +
+     CHGPERIOD(*LASTSAVE)   /* Save only objects changed since last save */</pre>
+
+<strong>Saving from PASE with tar (for Git-managed source):</strong>
+
+For source code managed under Git in the IFS, the most reliable backup is simply pushing to a remote Git repository. The Git history is the backup. For additional safety, archive with tar:
+
+<pre>QSH CMD('cd /home/build && tar -czf /home/backup/source-$(date +%Y%m%d).tar.gz project-repo')</pre>
+
+<h2>Large file support</h2>
+
+By default, IBM i stream files support sizes up to 1 GB in the IFS (limited by a 32-bit offset). For files larger than 1 GB, large file support must be enabled at the directory or file level.
+
+<strong>Creating a directory with large file support enabled:</strong>
+
+<pre>CRTDIR DIR('/home/data/largefiles') DTAAUT(*RWX) OBJAUT(*ALL)
+
+/* Enable large file support for new files in this directory */
+CHGATR OBJ('/home/data/largefiles') ATR(*ALWSAV) VALUE(*YES)
+CHGATR OBJ('/home/data/largefiles') ATR(*CCSID)  VALUE(1208)</pre>
+
+Practically, large file support is relevant for:
+<ul>
+<li>Save files written to the IFS (SAV to STMF)</li>
+<li>Log files that accumulate over long periods without rotation</li>
+<li>Data extract files for analytics pipelines</li>
+<li>Binary data files (images, documents stored in the IFS)</li>
+</ul>
+
+<h2>CCSID and encoding in the IFS</h2>
+
+This is the most frequent source of IFS-related problems for developers from non-IBM backgrounds. IBM i uses EBCDIC for library system objects (source members, database files). The IFS supports multiple encodings through CCSID (Coded Character Set Identifier) attributes.
+
+<strong>Common CCSID values:</strong>
+<ul>
+<li><code>37</code> — EBCDIC US English (the default for library system objects on US IBM i)</li>
+<li><code>1208</code> — UTF-8 (the correct encoding for source files, configuration files, and any text that modern tools will read)</li>
+<li><code>819</code> — ISO 8859-1 (Latin-1)</li>
+<li><code>65535</code> — "no conversion" / binary — use for binary files and files with pre-determined encoding</li>
+</ul>
+
+<strong>Checking the CCSID of an IFS file:</strong>
+
+<pre>SELECT PATH_NAME, CCSID, OBJECT_TYPE
+FROM   TABLE(QSYS2.IFS_OBJECT_STATISTICS(
+             START_PATH_NAME     => '/home/build/project-repo/src',
+             SUBTREE_DIRECTORIES => 'YES'))
+WHERE  OBJECT_TYPE = 'STMF'
+ORDER  BY PATH_NAME;</pre>
+
+<strong>Setting CCSID on a file:</strong>
+
+<pre>/* Set a stream file to UTF-8 */
+CHGATR OBJ('/home/build/project-repo/src/rpgle/CRTORD.rpgle') +
+        ATR(*CCSID) VALUE(1208)</pre>
+
+<strong>Setting default CCSID for new files created in a directory:</strong>
+
+<pre>/* All new files in this directory will default to UTF-8 */
+CHGATR OBJ('/home/build/project-repo') ATR(*CCSID) VALUE(1208)</pre>
+
+<strong>CCSID conversion during CPYTOSTMF:</strong>
+
+When copying a source member (EBCDIC) to an IFS stream file, CPYTOSTMF converts the encoding if you specify STMFCCSID(1208). Always specify this when the destination file will be read by modern tools:
+
+<pre>CPYTOSTMF FROMMBR('/QSYS.LIB/ORDLIB.LIB/QRPGLESRC.FILE/CRTORD.MBR') +
+           TOSTMF('/home/build/project-repo/src/rpgle/CRTORD.rpgle') +
+           STMFOPT(*REPLACE) +
+           STMFCCSID(1208)    /* Convert EBCDIC to UTF-8 */</pre>
+
+<strong>The CCSID 65535 trap:</strong> Files created by some PASE tools default to CCSID 65535 (no conversion). These files appear correct when viewed in the tool that created them but display as garbage in tools that expect UTF-8 or EBCDIC. When a Git clone produces files with CCSID 65535, set the directory default to 1208 and re-clone.
+
+<h2>IFS performance considerations</h2>
+
+<strong>File system cache:</strong> IBM i caches IFS stream file data in main storage. The effective performance of IFS reads depends on how much of the working set fits in the cache. For applications that repeatedly read the same configuration or reference files, the IFS cache means the second and subsequent reads are from memory, not disk.
+
+<strong>Directory depth:</strong> Very deep directory trees (20+ levels) can slow path resolution. Keep IFS directory structures reasonable — four to six levels for source repositories is practical.
+
+<strong>Many small files:</strong> Applications that create thousands of small temporary files in the IFS (log entries, individual record files) can cause directory scan performance problems. Use DB2 for i tables for structured data, not individual IFS files per record.
+
+<strong>IFS objects and system backup:</strong> SAV/RST for IFS objects is slower than SAVLIB/RSTLIB for the same data volume because stream file objects require per-object processing rather than the optimised library save path. If IFS backup time is a concern, use a dedicated backup server that mounts the IFS via NFS or NetServer and runs file-level backup software.
+
+The IFS is not a separate concern from IBM i operations — it is the storage layer for everything modern on the platform. Journals, NetServer shares, CCSID management, and proper backup coverage of IFS directories are operational requirements for any IBM i shop running Git, open-source tools, or Node.js/Python applications on the system.
+
+<em>Next post: Advanced ILE RPG — system pointers, IBM i OS APIs, dynamic program calls, user spaces, and the patterns that allow RPG programs to interrogate and control the IBM i system from within application code.</em>

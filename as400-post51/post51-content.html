@@ -1,0 +1,630 @@
+<p>The previous post covered DB2 for i JSON and XML support — <strong>JSON_VALUE</strong> and <strong>JSON_TABLE</strong> for shredding JSON into rows, <strong>JSON_OBJECT</strong> and <strong>JSON_ARRAYAGG</strong> for constructing JSON responses, <strong>FOR JSON</strong> path expressions, and <strong>XMLTABLE</strong> for parsing XML in SQL. This post covers connecting IBM i to Microsoft Azure: streaming DB2 for i data to Azure Event Hubs, offloading data to Azure Blob Storage, reliable messaging with Azure Service Bus, and connecting to Azure SQL Database — all from PASE using the Azure Python and Node.js SDKs.</p>
+
+<h2>Why Azure for IBM i Integration</h2>
+
+<p>Many organisations running IBM i also maintain Microsoft Azure tenants for web applications, analytics workloads (Azure Synapse Analytics, Power BI), and operational tooling (Azure Logic Apps, Azure Monitor). IBM i is the system of record — it holds order data, stock levels, financial transactions, customer master records. Azure is the platform for modern applications and data analytics. The integration challenge is moving data reliably and efficiently between the two without expensive middleware licences or bespoke ETL tools.</p>
+
+<p>The good news is that IBM i PASE provides a full Linux-compatible runtime. Python 3.x, Node.js, and the Azure SDKs all run natively in PASE without emulation. This means you can write integration code in Python or Node.js, use the official Azure SDKs, and run the integration directly on the IBM i — no intermediate Linux server required. The integration runs close to the data, which matters when you are reading millions of DB2 rows and need to minimise latency.</p>
+
+<p>The four Azure services covered in this post serve distinct purposes:</p>
+<ul>
+  <li><strong>Azure Event Hubs</strong> — a high-throughput event streaming platform; ideal for real-time feeds of order events, inventory changes, or sensor data from IBM i to Azure Synapse or Azure Stream Analytics</li>
+  <li><strong>Azure Blob Storage</strong> — object storage for data lake patterns; ideal for daily or hourly extracts of DB2 data (CSV or Parquet) for consumption by Azure Databricks or Azure Data Factory</li>
+  <li><strong>Azure Service Bus</strong> — a reliable message broker with guaranteed delivery, dead-lettering, and message locking; ideal for order confirmations, replenishment requests, and other transactional messages between IBM i and Azure-hosted microservices</li>
+  <li><strong>Azure SQL Database</strong> — a fully managed SQL Server in Azure; ideal for summary or reporting tables replicated from DB2 for i to feed Power BI dashboards</li>
+</ul>
+
+<h2>Azure SDK in IBM i PASE</h2>
+
+<p>Both the Azure Python SDK and the Azure Node.js SDK run natively in IBM i PASE. Install Python 3 and Node.js from the IBM i open-source package manager (yum) if not already present, then install the Azure packages using pip and npm.</p>
+
+<p>Install the Python Azure packages from a PASE shell (QSH or SSH session):</p>
+
+<pre>
+pip3 install azure-eventhub azure-storage-blob azure-servicebus azure-identity pyodbc
+</pre>
+
+<p>Install the Node.js Azure packages:</p>
+
+<pre>
+npm install @azure/event-hubs @azure/storage-blob @azure/service-bus @azure/identity
+</pre>
+
+<p>Authentication options in PASE:</p>
+<ul>
+  <li><strong>Connection strings</strong> — simplest; store the connection string in an environment variable (<code>AZURE_EVENTHUB_CONN</code>, <code>AZURE_STORAGE_CONN</code>, etc.) set in the PASE session profile (<code>/home/username/.profile</code> or <code>/QOpenSys/etc/profile</code>)</li>
+  <li><strong>Azure Active Directory / Managed Identity</strong> — more secure; use <code>DefaultAzureCredential</code> from <code>azure-identity</code>, which checks environment variables (<code>AZURE_CLIENT_ID</code>, <code>AZURE_CLIENT_SECRET</code>, <code>AZURE_TENANT_ID</code>) for a service principal, or a managed identity if the IBM i is registered</li>
+</ul>
+
+<pre>
+# Test Azure identity from PASE Python
+import os
+from azure.identity import DefaultAzureCredential
+
+# Set these in your PASE profile before running
+# export AZURE_CLIENT_ID=your-service-principal-client-id
+# export AZURE_CLIENT_SECRET=your-service-principal-secret
+# export AZURE_TENANT_ID=your-azure-tenant-id
+
+credential = DefaultAzureCredential()
+token = credential.get_token("https://eventhubs.azure.net/.default")
+print("Token acquired successfully, expires:", token.expires_on)
+</pre>
+
+<h2>Azure Event Hubs — Streaming IBM i Data in Real Time</h2>
+
+<p>Azure Event Hubs accepts millions of events per second and integrates with Azure Stream Analytics, Azure Synapse, and Apache Kafka consumers. The pattern for IBM i is a Python producer that polls DB2 for i for new or changed rows and sends them to Event Hubs in batches.</p>
+
+<p>The checkpoint is stored back in DB2 so it survives PASE process restarts:</p>
+
+<pre>
+# /QOpenSys/usr/local/bin/eventhub_producer.py
+# Polls ORDLIB.ORDHDR for new orders and streams to Azure Event Hub
+
+import os, json, time, pyodbc
+from datetime import datetime
+from azure.eventhub import EventHubProducerClient, EventData
+
+EVENT_HUB_CONN = os.environ['AZURE_EVENTHUB_CONN']
+EVENT_HUB_NAME = os.environ.get('AZURE_EVENTHUB_NAME', 'ibmi-orders')
+POLL_INTERVAL  = int(os.environ.get('POLL_INTERVAL_SECONDS', '30'))
+
+DSN = 'ORDLIB'   # IBM i ODBC DSN configured in /etc/odbc.ini
+
+def get_db_connection():
+    return pyodbc.connect(
+        f'DSN={DSN};UID=APIUSER;PWD={os.environ["DB2_PASSWORD"]}',
+        autocommit=False
+    )
+
+def read_checkpoint(conn):
+    """Read last processed ORDNO from checkpoint table."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT CKPVAL FROM ORDLIB.EVTHUBCKP WHERE CKPKEY = 'ORDHDR_ORDNO'"
+    )
+    row = cur.fetchone()
+    return int(row[0]) if row else 0
+
+def write_checkpoint(conn, last_ordno):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE ORDLIB.EVTHUBCKP SET CKPVAL = ?, CKPTS = CURRENT_TIMESTAMP
+        WHERE CKPKEY = 'ORDHDR_ORDNO'
+        """,
+        str(last_ordno)
+    )
+    if cur.rowcount == 0:
+        cur.execute(
+            "INSERT INTO ORDLIB.EVTHUBCKP (CKPKEY, CKPVAL) VALUES ('ORDHDR_ORDNO', ?)",
+            str(last_ordno)
+        )
+    conn.commit()
+
+def fetch_new_orders(conn, since_ordno, batch_size=500):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT ORDNO, CUSNO, ORDDATE, ORDAMT, ORDSTS, WHSNO
+        FROM ORDLIB.ORDHDR
+        WHERE ORDNO > ?
+        ORDER BY ORDNO ASC
+        FETCH FIRST ? ROWS ONLY
+        """,
+        since_ordno, batch_size
+    )
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+def serialise_order(row):
+    """Convert DB2 row dict to JSON bytes, handling Decimal and date types."""
+    import decimal
+    def default(obj):
+        if isinstance(obj, decimal.Decimal):
+            return float(obj)
+        if hasattr(obj, 'isoformat'):
+            return obj.isoformat()
+        return str(obj)
+    return json.dumps(row, default=default).encode('utf-8')
+
+def produce_loop():
+    conn = get_db_connection()
+    producer = EventHubProducerClient.from_connection_string(
+        conn_str=EVENT_HUB_CONN, eventhub_name=EVENT_HUB_NAME
+    )
+    print(f"Event Hub producer started — polling every {POLL_INTERVAL}s")
+
+    while True:
+        checkpoint = read_checkpoint(conn)
+        orders = fetch_new_orders(conn, checkpoint)
+
+        if orders:
+            batch = producer.create_batch()
+            last_ordno = checkpoint
+
+            for order in orders:
+                payload = serialise_order(order)
+                try:
+                    batch.add(EventData(payload))
+                except ValueError:
+                    # Batch full — send and start a new one
+                    producer.send_batch(batch)
+                    batch = producer.create_batch()
+                    batch.add(EventData(payload))
+                last_ordno = order['ORDNO']
+
+            producer.send_batch(batch)
+            write_checkpoint(conn, last_ordno)
+            print(f"{datetime.now().isoformat()} — sent {len(orders)} orders, last ORDNO={last_ordno}")
+        else:
+            print(f"{datetime.now().isoformat()} — no new orders, checkpoint={checkpoint}")
+
+        time.sleep(POLL_INTERVAL)
+
+if __name__ == '__main__':
+    produce_loop()
+</pre>
+
+<p>Create the checkpoint table in DB2 before running the producer:</p>
+
+<pre>
+CREATE TABLE ORDLIB.EVTHUBCKP (
+    CKPKEY  VARCHAR(50)  NOT NULL,
+    CKPVAL  VARCHAR(50)  NOT NULL,
+    CKPTS   TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (CKPKEY)
+);
+
+INSERT INTO ORDLIB.EVTHUBCKP (CKPKEY, CKPVAL) VALUES ('ORDHDR_ORDNO', '0');
+</pre>
+
+<p>Submit the producer as a persistent PASE batch job using SBMJOB with JOBD(*LIBL/QPASEJOBD) or wrap it in a CL program that calls QSH CMD('/QOpenSys/usr/bin/python3 /QOpenSys/usr/local/bin/eventhub_producer.py').</p>
+
+<h2>Azure Blob Storage — Data Lake Offload from IBM i</h2>
+
+<p>Azure Blob Storage is the foundation of the Azure Data Lake. The pattern for IBM i is a nightly or hourly extract: query DB2 for i using pandas (via pyodbc), write the results to a CSV or Parquet file in IFS, and upload to a Blob Storage container. Azure Data Factory or Azure Synapse can then consume the files.</p>
+
+<pre>
+# /QOpenSys/usr/local/bin/blob_daily_extract.py
+# Extracts SALESHIST for the previous day and uploads to Azure Blob Storage
+
+import os, io, pyodbc, pandas as pd
+from datetime import date, timedelta
+from azure.storage.blob import BlobServiceClient
+from azure.identity import DefaultAzureCredential
+
+STORAGE_ACCOUNT = os.environ.get('AZURE_STORAGE_ACCOUNT', 'myibmistorage')
+CONTAINER       = os.environ.get('AZURE_BLOB_CONTAINER', 'ibmi-extracts')
+DB2_DSN         = 'SALESLIB'
+
+def get_extract_date():
+    return (date.today() - timedelta(days=1)).isoformat()   # YYYY-MM-DD
+
+def extract_sales_data(extract_date):
+    conn = pyodbc.connect(
+        f'DSN={DB2_DSN};UID=APIUSER;PWD={os.environ["DB2_PASSWORD"]}',
+        autocommit=True
+    )
+    query = """
+        SELECT
+            INVNO, CUSNO, INVDATE, INVAMT, TAXAMT, NETAMT,
+            ITMNO, ITMQTY, WHSNO, SLSREP
+        FROM SALESLIB.SALESHIST
+        WHERE DATE(INVDATE) = ?
+        ORDER BY INVNO, ITMNO
+    """
+    df = pd.read_sql(query, conn, params=[extract_date])
+    conn.close()
+    return df
+
+def upload_to_blob(df, extract_date):
+    # Try connection string first, fall back to DefaultAzureCredential
+    conn_str = os.environ.get('AZURE_STORAGE_CONN')
+    if conn_str:
+        client = BlobServiceClient.from_connection_string(conn_str)
+    else:
+        url = f"https://{STORAGE_ACCOUNT}.blob.core.windows.net"
+        client = BlobServiceClient(account_url=url, credential=DefaultAzureCredential())
+
+    container_client = client.get_container_client(CONTAINER)
+
+    # Write to in-memory CSV buffer — avoids IFS temp file for small extracts
+    buf = io.BytesIO()
+    df.to_csv(buf, index=False)
+    buf.seek(0)
+
+    blob_name = f"saleshist/year={extract_date[:4]}/month={extract_date[5:7]}/saleshist_{extract_date}.csv"
+    blob_client = container_client.get_blob_client(blob_name)
+    blob_client.upload_blob(buf, overwrite=True)
+    return blob_name, len(df)
+
+def main():
+    extract_date = get_extract_date()
+    print(f"Extracting SALESHIST for {extract_date}")
+    df = extract_sales_data(extract_date)
+    if df.empty:
+        print("No rows found — nothing to upload.")
+        return
+    blob_name, row_count = upload_to_blob(df, extract_date)
+    print(f"Uploaded {row_count} rows to blob: {blob_name}")
+
+if __name__ == '__main__':
+    main()
+</pre>
+
+<p>Schedule the extract using IBM i job scheduler (ADDJOBSCDE) or submit it from a CL program that runs at end-of-day:</p>
+
+<pre>
+/* CL snippet to submit the Blob extract job */
+SBMJOB JOB(BLOBEXT) JOBD(QPASEJOBD) CMD(QSH CMD('/QOpenSys/usr/bin/python3 +
+    /QOpenSys/usr/local/bin/blob_daily_extract.py')) JOBQ(QBATCH)
+</pre>
+
+<h2>Azure Service Bus — Reliable Messaging Between IBM i and Azure</h2>
+
+<p>Azure Service Bus provides enterprise-grade messaging with queues and topics. Unlike Event Hubs (which is for high-volume streaming), Service Bus is designed for transactional messages where every message must be processed exactly once. IBM i can act as both producer and consumer.</p>
+
+<p>Sending order confirmations from IBM i to Azure Service Bus (producer):</p>
+
+<pre>
+# /QOpenSys/usr/local/bin/servicebus_sender.py
+# Reads pending order confirmations from DB2 and sends to Azure Service Bus queue
+
+import os, json, pyodbc
+from azure.servicebus import ServiceBusClient, ServiceBusMessage
+import decimal
+
+SB_CONN   = os.environ['AZURE_SB_CONN']
+SB_QUEUE  = os.environ.get('AZURE_SB_QUEUE', 'order-confirmations')
+DB2_DSN   = 'ORDLIB'
+
+def json_default(obj):
+    if isinstance(obj, decimal.Decimal):
+        return float(obj)
+    if hasattr(obj, 'isoformat'):
+        return obj.isoformat()
+    return str(obj)
+
+def fetch_pending_confirmations(conn):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT ORDNO, CUSNO, CONFDT, CONFAMT, CONFSTS
+        FROM ORDLIB.ORDCONF
+        WHERE SBSTS = 'P'
+        ORDER BY ORDNO
+        FETCH FIRST 100 ROWS ONLY
+        """
+    )
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+def mark_sent(conn, ordnos):
+    placeholders = ','.join(['?'] * len(ordnos))
+    conn.cursor().execute(
+        f"UPDATE ORDLIB.ORDCONF SET SBSTS = 'S', SBTS = CURRENT_TIMESTAMP WHERE ORDNO IN ({placeholders})",
+        ordnos
+    )
+    conn.commit()
+
+def send_confirmations():
+    conn = pyodbc.connect(f'DSN={DB2_DSN};UID=APIUSER;PWD={os.environ["DB2_PASSWORD"]}', autocommit=False)
+    pending = fetch_pending_confirmations(conn)
+    if not pending:
+        print("No pending confirmations.")
+        return
+
+    with ServiceBusClient.from_connection_string(SB_CONN) as sb_client:
+        with sb_client.get_queue_sender(queue_name=SB_QUEUE) as sender:
+            messages = [
+                ServiceBusMessage(
+                    body=json.dumps(row, default=json_default).encode('utf-8'),
+                    content_type='application/json',
+                    subject='order-confirmation',
+                    message_id=str(row['ORDNO'])
+                )
+                for row in pending
+            ]
+            sender.send_messages(messages)
+
+    sent_ordnos = [row['ORDNO'] for row in pending]
+    mark_sent(conn, sent_ordnos)
+    print(f"Sent {len(sent_ordnos)} confirmations to Service Bus.")
+
+if __name__ == '__main__':
+    send_confirmations()
+</pre>
+
+<p>Receiving replenishment requests from Azure on IBM i (consumer), with proper message locking and settlement:</p>
+
+<pre>
+# /QOpenSys/usr/local/bin/servicebus_receiver.py
+# Receives replenishment requests from Azure Service Bus and writes to DB2
+
+import os, json, pyodbc
+from azure.servicebus import ServiceBusClient, ServiceBusReceiveMode
+
+SB_CONN      = os.environ['AZURE_SB_CONN']
+SB_QUEUE     = os.environ.get('AZURE_SB_REPLEN_QUEUE', 'replenishment-requests')
+MAX_MESSAGES = 50
+DB2_DSN      = 'PURLIB'
+
+def insert_replenishment(conn, msg_data):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO PURLIB.REPLNREQ (ITMNO, REQQTY, WHSNO, REQTS, SRCREF)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
+        """,
+        msg_data['item_number'],
+        int(msg_data['quantity']),
+        msg_data.get('warehouse', '01'),
+        msg_data.get('source_reference', '')
+    )
+    conn.commit()
+
+def receive_replenishment_requests():
+    conn = pyodbc.connect(f'DSN={DB2_DSN};UID=APIUSER;PWD={os.environ["DB2_PASSWORD"]}', autocommit=False)
+
+    with ServiceBusClient.from_connection_string(SB_CONN) as sb_client:
+        with sb_client.get_queue_receiver(
+            queue_name=SB_QUEUE,
+            receive_mode=ServiceBusReceiveMode.PEEK_LOCK,
+            max_wait_time=5
+        ) as receiver:
+            messages = receiver.receive_messages(max_message_count=MAX_MESSAGES)
+            processed = 0
+            for msg in messages:
+                try:
+                    data = json.loads(bytes(msg).decode('utf-8'))
+                    insert_replenishment(conn, data)
+                    receiver.complete_message(msg)   # Remove from queue
+                    processed += 1
+                except Exception as ex:
+                    print(f"Error processing message {msg.message_id}: {ex}")
+                    receiver.abandon_message(msg)    # Return to queue for retry
+
+    print(f"Processed {processed} replenishment requests.")
+
+if __name__ == '__main__':
+    receive_replenishment_requests()
+</pre>
+
+<h2>Azure SQL from IBM i PASE</h2>
+
+<p>Azure SQL Database is fully compatible with SQL Server. From IBM i PASE, you connect using pyodbc with the Microsoft ODBC Driver 18 for SQL Server. Install the driver via yum on IBM i PASE (IBM i 7.3 or later with the yum repositories configured):</p>
+
+<pre>
+yum install msodbcsql18
+</pre>
+
+<p>If the yum package is not available for your IBM i release, download the driver RPM from Microsoft and install manually. Once installed, add the driver to <code>/etc/odbcinst.ini</code>:</p>
+
+<pre>
+[ODBC Driver 18 for SQL Server]
+Description=Microsoft ODBC Driver 18 for SQL Server
+Driver=/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.so
+UsageCount=1
+</pre>
+
+<p>Syncing a DB2 summary table to Azure SQL for Power BI reporting:</p>
+
+<pre>
+# /QOpenSys/usr/local/bin/azuresql_sync.py
+# Syncs daily sales summary from DB2 for i to Azure SQL for Power BI
+
+import os, pyodbc, pandas as pd
+from datetime import date, timedelta
+
+DB2_DSN        = 'SALESLIB'
+AZURE_SQL_CONN = os.environ['AZURE_SQL_CONN']
+# Format: Driver={ODBC Driver 18 for SQL Server};Server=myserver.database.windows.net;
+#         Database=reporting;Uid=apiuser;Pwd=xxx;Encrypt=yes;TrustServerCertificate=no;
+
+def get_db2_summary(for_date):
+    conn = pyodbc.connect(f'DSN={DB2_DSN};UID=APIUSER;PWD={os.environ["DB2_PASSWORD"]}', autocommit=True)
+    query = """
+        SELECT
+            DATE(INVDATE)    AS SALE_DATE,
+            WHSNO,
+            SLSREP,
+            COUNT(DISTINCT INVNO)  AS INVOICE_COUNT,
+            SUM(INVAMT)            AS GROSS_SALES,
+            SUM(TAXAMT)            AS TAX_TOTAL,
+            SUM(NETAMT)            AS NET_SALES
+        FROM SALESLIB.SALESHIST
+        WHERE DATE(INVDATE) = ?
+        GROUP BY DATE(INVDATE), WHSNO, SLSREP
+        ORDER BY WHSNO, SLSREP
+    """
+    df = pd.read_sql(query, conn, params=[for_date])
+    conn.close()
+    return df
+
+def upsert_to_azure_sql(df, for_date):
+    azure_conn = pyodbc.connect(AZURE_SQL_CONN, autocommit=False)
+    cur = azure_conn.cursor()
+
+    # Delete existing rows for the date (simple delete-insert upsert)
+    cur.execute("DELETE FROM dbo.SalesSummary WHERE SaleDate = ?", for_date)
+
+    for _, row in df.iterrows():
+        cur.execute(
+            """
+            INSERT INTO dbo.SalesSummary
+                (SaleDate, WarehouseNo, SalesRep, InvoiceCount, GrossSales, TaxTotal, NetSales)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            row['SALE_DATE'], row['WHSNO'], row['SLSREP'],
+            int(row['INVOICE_COUNT']), float(row['GROSS_SALES']),
+            float(row['TAX_TOTAL']), float(row['NET_SALES'])
+        )
+
+    azure_conn.commit()
+    azure_conn.close()
+    return len(df)
+
+def main():
+    for_date = (date.today() - timedelta(days=1)).isoformat()
+    print(f"Syncing sales summary for {for_date}")
+    df = get_db2_summary(for_date)
+    if df.empty:
+        print("No summary data for date.")
+        return
+    rows = upsert_to_azure_sql(df, for_date)
+    print(f"Synced {rows} summary rows to Azure SQL.")
+
+if __name__ == '__main__':
+    main()
+</pre>
+
+<p>Create the target table in Azure SQL before running the sync:</p>
+
+<pre>
+CREATE TABLE dbo.SalesSummary (
+    SaleDate      DATE          NOT NULL,
+    WarehouseNo   NVARCHAR(10)  NOT NULL,
+    SalesRep      NVARCHAR(10)  NOT NULL,
+    InvoiceCount  INT           NOT NULL,
+    GrossSales    DECIMAL(18,2) NOT NULL,
+    TaxTotal      DECIMAL(18,2) NOT NULL,
+    NetSales      DECIMAL(18,2) NOT NULL,
+    LoadedAt      DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_SalesSummary PRIMARY KEY (SaleDate, WarehouseNo, SalesRep)
+);
+</pre>
+
+<h2>Node.js Azure Integration Pattern</h2>
+
+<p>Node.js running in IBM i PASE suits integration patterns that need an HTTP server — for example, receiving webhooks from Azure Logic Apps and processing them by calling RPG service programs. The itoolkit Node.js package provides the bridge between Node.js in PASE and IBM i ILE programs.</p>
+
+<pre>
+// /QOpenSys/usr/local/lib/node_modules/ibmi-azure-bridge/server.js
+// Express.js webhook receiver: accepts Logic Apps calls, invokes RPG, confirms via Service Bus
+
+const express   = require('express');
+const { ServiceBusClient } = require('@azure/service-bus');
+const { XMLParser } = require('itoolkit');   // itoolkit for calling ILE programs
+
+const app  = express();
+app.use(express.json());
+
+const SB_CONN  = process.env.AZURE_SB_CONN;
+const SB_QUEUE = process.env.AZURE_SB_CONFIRM_QUEUE || 'order-processing-confirms';
+
+// Utility: call an RPG service program procedure via itoolkit
+async function callRpgProcedure(programLib, programName, procedure, params) {
+    return new Promise((resolve, reject) => {
+        const conn = new XMLParser('idb', {
+            database: '*LOCAL', username: process.env.DB2_USER, password: process.env.DB2_PASSWORD
+        });
+        const pgm = conn.pgmCall(programName, programLib, params);
+        conn.run((xmlOut) => {
+            if (xmlOut && xmlOut.includes('<success>')) {
+                resolve({ success: true, output: xmlOut });
+            } else {
+                reject(new Error(`RPG call failed: ${xmlOut}`));
+            }
+        });
+    });
+}
+
+// POST /webhook/order-received — called by Azure Logic App
+app.post('/webhook/order-received', async (req, res) => {
+    const { orderNumber, customerNumber, orderAmount, warehouseCode } = req.body;
+
+    if (!orderNumber || !customerNumber) {
+        return res.status(400).json({ error: 'orderNumber and customerNumber are required' });
+    }
+
+    try {
+        // Call ORDRPG service program to validate and create the order in DB2
+        const params = [
+            { name: 'OrderNumber',    value: String(orderNumber),   type: 'char', length: 10, io: 'in'  },
+            { name: 'CustomerNumber', value: String(customerNumber), type: 'char', length: 10, io: 'in'  },
+            { name: 'OrderAmount',    value: String(orderAmount),    type: 'packed', length: 13, decimals: 2, io: 'in' },
+            { name: 'ReturnCode',     value: '  ',                   type: 'char', length: 2,  io: 'out' },
+            { name: 'ReturnMessage',  value: ' '.repeat(100),        type: 'char', length: 100, io: 'out' },
+        ];
+
+        const result = await callRpgProcedure('ORDLIB', 'ORDRPG', 'CREATEORDER', params);
+
+        // Send confirmation to Azure Service Bus
+        const sbClient = new ServiceBusClient(SB_CONN);
+        const sender   = sbClient.createSender(SB_QUEUE);
+        await sender.sendMessages({
+            body: JSON.stringify({ orderNumber, status: 'accepted', timestamp: new Date().toISOString() }),
+            contentType: 'application/json',
+            messageId: String(orderNumber)
+        });
+        await sender.close();
+        await sbClient.close();
+
+        res.json({ status: 'accepted', orderNumber });
+    } catch (err) {
+        console.error('Order processing error:', err.message);
+        res.status(500).json({ error: 'Internal processing error', detail: err.message });
+    }
+});
+
+// Health check for Azure Load Balancer probes
+app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`IBM i Azure Bridge listening on port ${PORT}`);
+});
+</pre>
+
+<p>Start the Node.js bridge as a PASE job from a CL program:</p>
+
+<pre>
+/* CL to start the Azure Bridge Node.js service */
+PGM
+  DCL VAR(&CMD) TYPE(*CHAR) LEN(256)
+  CHGVAR VAR(&CMD) VALUE('/QOpenSys/usr/bin/node +
+    /QOpenSys/usr/local/lib/node_modules/ibmi-azure-bridge/server.js')
+  SBMJOB JOB(AZBRIDGE) JOBD(QPASEJOBD) +
+         CMD(QSH CMD(&CMD)) JOBQ(QBATCH) +
+         OUTQ(QPRINT)
+ENDPGM
+</pre>
+
+<h2>Authentication and Secrets Management</h2>
+
+<p>Storing Azure connection strings securely on IBM i requires care. The connection strings for Event Hubs, Blob Storage, and Service Bus contain shared access keys — treat them as passwords.</p>
+
+<p>Options in order of preference:</p>
+<ul>
+  <li><strong>Environment variables in PASE profile</strong> — set in <code>/home/APIUSER/.profile</code> with the file authority restricted to owner-only (<code>chmod 600 /home/APIUSER/.profile</code>); variables are available to all PASE processes running as APIUSER</li>
+  <li><strong>IBM i data area</strong> — store the connection string in a data area (CRTDTAARA DTAARA(AZURELIB/SBCONN) TYPE(*CHAR) LEN(500)) with object authority restricted to APIUSER; read it from PASE using <code>system('RTVDTAARA ...')</code> or from Python via itoolkit</li>
+  <li><strong>IFS file with restricted authority</strong> — write the connection string to <code>/home/APIUSER/.azure-secrets</code>, set <code>chmod 600</code>, read at startup with Python <code>open()</code>; straightforward but the file persists on disk</li>
+  <li><strong>Azure Key Vault via HTTP</strong> — call the Key Vault REST API from PASE using Python <code>requests</code> or the <code>azure-keyvault-secrets</code> package; the IBM i authenticates to Key Vault using a service principal and retrieves secrets at runtime without storing them on the IBM i at all</li>
+</ul>
+
+<pre>
+# Retrieve a secret from Azure Key Vault at runtime (no local storage of secret)
+import os
+from azure.keyvault.secrets import SecretClient
+from azure.identity import ClientSecretCredential
+
+KEY_VAULT_URL = os.environ['AZURE_KEY_VAULT_URL']  # https://myibmivault.vault.azure.net/
+
+credential = ClientSecretCredential(
+    tenant_id=os.environ['AZURE_TENANT_ID'],
+    client_id=os.environ['AZURE_CLIENT_ID'],
+    client_secret=os.environ['AZURE_CLIENT_SECRET']
+)
+
+kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
+
+# Retrieve Service Bus connection string at runtime
+sb_conn = kv_client.get_secret('ibmi-servicebus-connection-string').value
+print("Service Bus connection string retrieved from Key Vault.")
+# Use sb_conn to create ServiceBusClient — never persisted to disk
+</pre>
+
+<p>For the Key Vault approach, only <code>AZURE_TENANT_ID</code>, <code>AZURE_CLIENT_ID</code>, and <code>AZURE_CLIENT_SECRET</code> (for the service principal) need to be stored locally — and the service principal can be granted minimal permissions (only <code>secrets/get</code> on the specific secrets it needs). Rotate the service principal secret in Azure AD; the IBM i automatically picks up the new secret on its next key retrieval.</p>
+
+<em>Next post: IBM i Work Management in Depth — designing subsystem descriptions, routing entries, job queue priorities, class objects for CPU and memory limits, multi-threading on IBM i, and using WRKACTJOB and Collection Services to diagnose job performance problems.</em>

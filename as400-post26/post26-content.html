@@ -1,0 +1,323 @@
+The previous post covered AI for IBM i — calling AI APIs directly from RPG and SQL programs. This post covers a complementary integration layer that IBM i shops increasingly use to expose their data and programs to the outside world: Node.js running natively on IBM i in the PASE environment.
+
+Running Node.js on IBM i is not a workaround or an emulation. Node.js runs in PASE as a native POSIX process with direct access to DB2 for i through the idb-connector package, and direct access to IBM i programs and commands through the itoolkit package. It is a first-class runtime on the platform, installed and updated through the same yum package manager that manages Git, Python, and other open-source tools.
+
+The use case is straightforward: IBM i holds decades of business logic in RPG programs and data in DB2 for i tables. External applications — web frontends, mobile apps, partner systems, cloud services — need REST APIs. Building that REST API layer in Node.js, running on the same IBM i LPAR, is the lowest-friction path to modern integration without rewriting the backend.
+
+<h2>Installing Node.js on IBM i</h2>
+
+Node.js is installed via yum in the PASE environment. IBM maintains an open-source package repository for IBM i that provides current versions.
+
+<pre>/* From a PASE shell session or QSH */
+yum install nodejs20       /* Node.js 20 LTS */
+yum install nodejs20-npm   /* npm package manager */
+
+/* Verify installation */
+node --version
+npm --version</pre>
+
+<strong>Starting a PASE shell session:</strong>
+
+<pre>/* From a 5250 command line */
+STRQSH
+
+/* Or call a specific command without an interactive shell */
+QSH CMD('node --version')</pre>
+
+The default PATH in PASE may not include the yum package directories. Add to your shell profile:
+
+<pre># In /home/yourusername/.profile or /QOpenSys/pkgs/lib/profile.d/
+export PATH=/QOpenSys/pkgs/bin:$PATH</pre>
+
+<h2>Accessing DB2 for i from Node.js: idb-connector</h2>
+
+idb-connector is the native IBM i database connector for Node.js. It wraps the IBM i CLI (Call Level Interface) — the same interface used by ODBC — and runs in-process within PASE, avoiding any network overhead.
+
+<strong>Installing idb-connector:</strong>
+
+<pre>npm install idb-connector</pre>
+
+<strong>Synchronous query (simplest form):</strong>
+
+<pre>const db = require('idb-connector');
+
+const conn = new db.dbconn();
+conn.conn('*LOCAL');   // connect to the local IBM i database
+
+const stmt = new db.dbstmt(conn);
+
+const rows = stmt.execSync(
+  "SELECT ORDNUM, CUSTNUM, ORDAMT, ORDDAT " +
+  "FROM ORDLIB.ORDHDR " +
+  "WHERE ORDSTS = 'OP' " +
+  "ORDER BY ORDDAT DESC " +
+  "FETCH FIRST 10 ROWS ONLY"
+);
+
+console.log(rows);
+// [ { ORDNUM: 'ORD0143', CUSTNUM: 'CUST001', ORDAMT: 1250.00, ORDDAT: '2026-05-20' }, ... ]
+
+stmt.close();
+conn.disconn();
+conn.close();</pre>
+
+<strong>Parameterised query (prevents SQL injection):</strong>
+
+<pre>const stmt = new db.dbstmt(conn);
+stmt.prepare("SELECT ORDNUM, ORDAMT FROM ORDLIB.ORDHDR WHERE CUSTNUM = ? AND ORDSTS = ?");
+stmt.bindParam([
+  [custNum, db.SQL_PARAM_INPUT, db.CHAR],
+  ['OP',    db.SQL_PARAM_INPUT, db.CHAR]
+]);
+const rows = stmt.execSync();
+stmt.close();</pre>
+
+<strong>Async/await with idb-pconnector (promise-based wrapper):</strong>
+
+<pre>const { DBPool } = require('idb-pconnector');
+
+const pool = new DBPool({ url: '*LOCAL' });
+
+async function getOpenOrders(custNum) {
+  const conn = await pool.connect();
+  const stmt = conn.getStatement();
+
+  await stmt.prepare(
+    'SELECT ORDNUM, ORDAMT, ORDDAT FROM ORDLIB.ORDHDR ' +
+    'WHERE CUSTNUM = ? AND ORDSTS = ? ORDER BY ORDDAT DESC'
+  );
+  await stmt.bindParam([
+    [custNum, db.SQL_PARAM_INPUT, db.CHAR],
+    ['OP',    db.SQL_PARAM_INPUT, db.CHAR]
+  ]);
+
+  const [result] = await stmt.execute();
+  const rows     = await stmt.fetchAll();
+
+  await stmt.close();
+  pool.detach(conn);
+  return rows;
+}
+
+getOpenOrders('CUST00001').then(console.log).catch(console.error);</pre>
+
+idb-pconnector is the promise-based wrapper around idb-connector. Use it for all async code — callbacks with idb-connector become unmanageable quickly.
+
+<h2>Calling IBM i programs and CL commands: itoolkit</h2>
+
+itoolkit (xmlservice) calls IBM i programs and CL commands by communicating with the XMLSERVICE program that IBM ships with IBM i. It allows Node.js (or Python, PHP) to call RPG service programs, run CL commands, and retrieve output — all from PASE without a 5250 session.
+
+<strong>Installing itoolkit:</strong>
+
+<pre>npm install itoolkit</pre>
+
+<strong>Running a CL command from Node.js:</strong>
+
+<pre>const { Connection, CommandCall } = require('itoolkit');
+
+const conn = new Connection({ transport: 'ipc', transportOptions: { database: '*LOCAL' } });
+
+const cmd = new CommandCall({ command: 'CHGLIBL LIBL(ORDLIB QGPL)' });
+conn.add(cmd);
+
+conn.run((error, xmlOutput) => {
+  if (error) {
+    console.error('Command failed:', error);
+    return;
+  }
+  console.log('Library list changed successfully');
+});</pre>
+
+<strong>Calling an RPG service program procedure from Node.js:</strong>
+
+<pre>const { Connection, ProgramCall, StringParam } = require('itoolkit');
+
+const conn = new Connection({ transport: 'ipc', transportOptions: { database: '*LOCAL' } });
+
+// Call GETORDSTS procedure in ORDLIB/ORDUTILS service program
+const pgm = new ProgramCall('GETORDSTS', { lib: 'ORDLIB', func: 'GETORDSTS' });
+pgm.addParam(new StringParam('ORD00143', { io: 'in',  length: '7'  }));  // order number
+pgm.addParam(new StringParam('',         { io: 'out', length: '2'  }));  // status output
+pgm.addParam(new StringParam('',         { io: 'out', length: '50' }));  // description output
+
+conn.add(pgm);
+
+conn.run((error, xmlOutput) => {
+  if (error) { console.error(error); return; }
+
+  const params = pgm.toJson();
+  console.log('Status:', params[1].value);
+  console.log('Description:', params[2].value);
+});</pre>
+
+<h2>Building a REST API with Express.js</h2>
+
+Express.js is the standard Node.js web framework. Combined with idb-pconnector, it takes about 50 lines to expose IBM i data as a REST API.
+
+<strong>Installing Express:</strong>
+
+<pre>npm install express idb-pconnector</pre>
+
+<strong>A minimal REST API over IBM i order data:</strong>
+
+<pre>const express       = require('express');
+const { DBPool }    = require('idb-pconnector');
+
+const app  = express();
+const pool = new DBPool({ url: '*LOCAL' });
+
+app.use(express.json());
+
+// GET /orders?custNum=CUST00001&status=OP
+app.get('/orders', async (req, res) => {
+  const { custNum, status = 'OP' } = req.query;
+
+  if (!custNum) {
+    return res.status(400).json({ error: 'custNum is required' });
+  }
+
+  try {
+    const conn = await pool.connect();
+    const stmt = conn.getStatement();
+
+    await stmt.prepare(
+      'SELECT ORDNUM, ORDAMT, ORDDAT, ORDSTS ' +
+      'FROM ORDLIB.ORDHDR ' +
+      'WHERE CUSTNUM = ? AND ORDSTS = ? ' +
+      'ORDER BY ORDDAT DESC'
+    );
+    await stmt.bindParam([[custNum, db.SQL_PARAM_INPUT, db.CHAR],
+                          [status,  db.SQL_PARAM_INPUT, db.CHAR]]);
+    await stmt.execute();
+    const rows = await stmt.fetchAll();
+    await stmt.close();
+    pool.detach(conn);
+
+    res.json({ custNum, orders: rows });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// POST /orders/:ordNum/close
+app.post('/orders/:ordNum/close', async (req, res) => {
+  const { ordNum } = req.params;
+
+  try {
+    const conn = await pool.connect();
+    const stmt = conn.getStatement();
+
+    await stmt.prepare(
+      "UPDATE ORDLIB.ORDHDR SET ORDSTS = 'CL', CLSDAT = CURRENT_DATE " +
+      "WHERE ORDNUM = ? AND ORDSTS = 'OP'"
+    );
+    await stmt.bindParam([[ordNum, db.SQL_PARAM_INPUT, db.CHAR]]);
+    await stmt.execute();
+    const rowCount = await stmt.numRowsAffected();
+    await stmt.close();
+    pool.detach(conn);
+
+    if (rowCount === 0) {
+      return res.status(404).json({ error: 'Order not found or already closed' });
+    }
+    res.json({ ordNum, status: 'closed' });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Update failed' });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`API listening on port ${PORT}`));</pre>
+
+<strong>Start the server:</strong>
+
+<pre>node server.js</pre>
+
+The API is now accessible at <code>http://youribmi:3000/orders?custNum=CUST00001</code> — from any system that can reach the IBM i on port 3000.
+
+<h2>Process management with PM2</h2>
+
+In production, the Node.js process must survive restarts and be monitored. PM2 is the standard process manager for Node.js in PASE.
+
+<pre>npm install -g pm2
+
+/* Start the API as a managed process */
+pm2 start server.js --name "ibmi-api"
+
+/* Start automatically on PASE restart */
+pm2 startup
+pm2 save
+
+/* Monitor */
+pm2 status
+pm2 logs ibmi-api
+
+/* Reload without downtime (zero-downtime restart) */
+pm2 reload ibmi-api</pre>
+
+<h2>Authentication and security for the API</h2>
+
+A Node.js API on IBM i runs as a PASE process under a user profile. That user profile's object authority determines what DB2 tables it can access. This is the IBM i security model applied to Node.js — no additional application-level permission system is needed for database access.
+
+For API authentication, JWT (JSON Web Tokens) is the standard approach:
+
+<pre>npm install jsonwebtoken
+
+const jwt = require('jsonwebtoken');
+const SECRET = process.env.JWT_SECRET;   // set as environment variable, not hardcoded
+
+// Middleware to validate JWT on protected routes
+function authenticate(req, res, next) {
+  const header = req.headers['authorization'];
+  if (!header || !header.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+  const token = header.slice(7);
+  try {
+    req.user = jwt.verify(token, SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+app.get('/orders', authenticate, async (req, res) => { /* ... */ });</pre>
+
+<h2>Practical deployment patterns</h2>
+
+<strong>Reverse proxy with nginx (also available via yum):</strong>
+
+Running nginx in PASE in front of Node.js allows HTTPS termination, load balancing across multiple Node.js processes, and serving static files without the Node.js process being exposed directly:
+
+<pre>yum install nginx
+
+# nginx.conf fragment — proxy /api/ to Node.js on port 3000
+location /api/ {
+    proxy_pass         http://127.0.0.1:3000/;
+    proxy_http_version 1.1;
+    proxy_set_header   Upgrade    $http_upgrade;
+    proxy_set_header   Connection 'upgrade';
+    proxy_set_header   Host       $host;
+}</pre>
+
+<strong>Environment-specific configuration:</strong>
+
+<pre>/* Use .env files (install dotenv: npm install dotenv) */
+require('dotenv').config();
+
+const config = {
+  port:      process.env.PORT      || 3000,
+  jwtSecret: process.env.JWT_SECRET,
+  dbLib:     process.env.DB_LIBRARY || 'ORDLIB',
+  logLevel:  process.env.LOG_LEVEL  || 'info',
+};</pre>
+
+Store the <code>.env</code> file in the IFS with restricted permissions (<code>chmod 600</code> and owned by the service account that runs PM2). Never commit <code>.env</code> to Git.
+
+Node.js on IBM i is not a trend — it is a shipping pattern used by IBM i shops worldwide to add REST API capability to systems that run core business logic. The combination of idb-connector for database access, itoolkit for program calls, and Express.js for HTTP routing is stable, well-documented, and requires no changes to existing RPG programs or DB2 tables.
+
+<em>Next post: IBM i performance tuning — understanding memory pools, reading WRKACTJOB correctly, Collection Services, diagnosing slow batch jobs, and the system values that most directly affect performance in production environments.</em>

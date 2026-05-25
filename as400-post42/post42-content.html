@@ -1,0 +1,413 @@
+<p>The previous post covered RPG unit testing with RPGUnit — installing the framework, writing test cases and assertions for ILE RPG service programs, running tests from the command line, and integrating RPGUnit into a CI build pipeline. This post covers DB2 for i triggers: automatic code that fires on INSERT, UPDATE, and DELETE without any application change, enforcing rules at the database layer where no calling program can bypass them.</p>
+
+<h2>What Triggers Are and Why They Matter</h2>
+
+<p>A <strong>trigger</strong> is logic that DB2 for i executes automatically whenever a specified data-modification event occurs on a table. The trigger fires regardless of which application, user, or tool caused the event — whether that is an RPG program, a STRSQL session, a JDBC connection from Java, or a bulk CPYF. This server-side enforcement is the core value proposition.</p>
+
+<p>Common uses on IBM i production systems include:</p>
+<ul>
+  <li><strong>Audit logging</strong> — record who changed what, and what the old and new values were, into a separate audit table with a timestamp and user profile</li>
+  <li><strong>Defaulting fields</strong> — populate a create date, sequence number, or created-by user at INSERT time without relying on the application to supply the value</li>
+  <li><strong>Cross-file synchronisation</strong> — when a detail record changes, update a summary header (e.g. recalculate an order total)</li>
+  <li><strong>Cascading validation</strong> — check a business rule at the database level and raise an SQL error with SIGNAL if the rule is violated</li>
+  <li><strong>Replication preparation</strong> — write changed rows to a staging table for downstream consumption</li>
+</ul>
+
+<p>Without triggers, every application that touches the table must remember to perform these steps. One forgotten code path leaves the audit trail incomplete or the summary stale. Triggers make the rule unconditional.</p>
+
+<h2>Two Trigger Types on IBM i</h2>
+
+<p>IBM i supports two distinct trigger mechanisms, and both remain useful in 2026.</p>
+
+<p><strong>SQL triggers</strong> are defined with <code>CREATE TRIGGER</code> DDL. They are stored in the database catalogue, are portable to other DB2 platforms with minor adjustments, and run inline within the SQL engine without spawning a separate program call. The trigger body is SQL procedural language — you can use assignment, IF/THEN, INSERT, UPDATE, and SIGNAL.</p>
+
+<p><strong>External triggers</strong> are registered with the CL command <code>ADDPFTRG</code> (Add Physical File Trigger). IBM i calls a compiled program — RPG, CL, C, or COBOL — passing a structured trigger buffer that contains the before-image and after-image of the row. External triggers predate SQL triggers on IBM i and are still the right choice when the trigger logic requires capabilities that SQL procedural language cannot provide: calling another program with complex logic, writing to a message queue, invoking a system API, or executing steps that span multiple service programs.</p>
+
+<p>A table can have both types active simultaneously. IBM i fires them in a defined order.</p>
+
+<h2>SQL BEFORE and AFTER Triggers</h2>
+
+<p>SQL triggers specify timing with the keywords <strong>BEFORE</strong> or <strong>AFTER</strong>.</p>
+
+<p>A <strong>BEFORE</strong> trigger fires before the row is written to disk. It can modify the values that will be stored — this is how you auto-populate fields. It cannot, however, modify other tables: a BEFORE trigger must not issue INSERT or UPDATE on a different table because the initiating transaction is not yet committed.</p>
+
+<p>An <strong>AFTER</strong> trigger fires after the row is written. The new values are committed (within the transaction). AFTER triggers are the correct place to write audit records, update summary tables, or call other procedures.</p>
+
+<p>Both types support <strong>transition variables</strong> — references to the old and new row images using the aliases you declare in the <code>REFERENCING</code> clause. By convention these are <code>OLD ROW AS old</code> and <code>NEW ROW AS new</code>, giving you <code>old.FIELDNAME</code> and <code>new.FIELDNAME</code> within the trigger body.</p>
+
+<p>IBM i SQL triggers operate at <strong>row level</strong> by default — the trigger body executes once per affected row. Statement-level triggers (FOR EACH STATEMENT) are also supported but rarely used in OLTP workloads because row-level access to OLD and NEW is usually required.</p>
+
+<h2>Complete SQL BEFORE INSERT Trigger Example</h2>
+
+<p>The following trigger fires on every INSERT into <code>ORDLIB.ORDHDR</code> and auto-populates three fields: the order create date, the creating user profile, and a sequence number drawn from a DB2 sequence object. The application does not need to supply any of these values — the trigger handles them unconditionally.</p>
+
+<p>First, create the sequence object if it does not already exist:</p>
+
+<pre>
+CREATE SEQUENCE ORDLIB.ORDHDR_SEQ
+    AS INTEGER
+    START WITH 1
+    INCREMENT BY 1
+    NO MAXVALUE
+    NO CYCLE
+    NO CACHE;
+</pre>
+
+<p>Now create the BEFORE INSERT trigger:</p>
+
+<pre>
+CREATE OR REPLACE TRIGGER ORDLIB.ORDHDR_BI
+    BEFORE INSERT ON ORDLIB.ORDHDR
+    REFERENCING NEW ROW AS new
+    FOR EACH ROW
+    MODE DB2ROW
+BEGIN
+    -- Auto-populate the order create date (IST date stored as DATE)
+    SET new.ORDCREDT = CURRENT_DATE;
+
+    -- Capture the IBM i user profile that initiated the INSERT
+    SET new.ORDCREBY = USER;
+
+    -- Assign the next value from the sequence as the order sequence number
+    SET new.ORDSEQ = NEXT VALUE FOR ORDLIB.ORDHDR_SEQ;
+END;
+</pre>
+
+<p>The <code>USER</code> special register returns the current IBM i user profile name as a VARCHAR(128). <code>CURRENT_DATE</code> returns the system date. <code>NEXT VALUE FOR</code> atomically increments the sequence and returns the new value — there is no gap risk even under concurrent inserts.</p>
+
+<p>To test the trigger interactively in STRSQL or ACS Run SQL Scripts:</p>
+
+<pre>
+INSERT INTO ORDLIB.ORDHDR
+    (ORDNO, ORDCUST, ORDAMT, ORDSTS)
+VALUES
+    ('ORD00999', 'CUST001', 1250.00, 'N');
+
+SELECT ORDNO, ORDCREDT, ORDCREBY, ORDSEQ
+FROM   ORDLIB.ORDHDR
+WHERE  ORDNO = 'ORD00999';
+</pre>
+
+<p>The result will show ORDCREDT, ORDCREBY, and ORDSEQ populated correctly — none of those columns appeared in the INSERT statement.</p>
+
+<h2>Complete SQL AFTER UPDATE Trigger Example</h2>
+
+<p>This trigger writes an audit record every time the order status field <code>ORDSTS</code> changes. It captures the old status, the new status, the timestamp, the user profile, and the client application name from the <code>CLIENT_APPLNAME</code> special register (available on IBM i 7.3 and later).</p>
+
+<p>The audit table first:</p>
+
+<pre>
+CREATE TABLE ORDLIB.ORDAUDIT (
+    AUDID       BIGINT        GENERATED ALWAYS AS IDENTITY,
+    AUDORDNO    CHAR(10)      NOT NULL,
+    AUDOLDSTS   CHAR(2)       NOT NULL,
+    AUDNEWSTS   CHAR(2)       NOT NULL,
+    AUDTS       TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    AUDUSR      VARCHAR(128)  NOT NULL,
+    AUDAPPL     VARCHAR(255)  NOT NULL,
+    PRIMARY KEY (AUDID)
+);
+</pre>
+
+<p>Now the AFTER UPDATE trigger, conditional on the status field actually having changed:</p>
+
+<pre>
+CREATE OR REPLACE TRIGGER ORDLIB.ORDHDR_AU_STATUS
+    AFTER UPDATE OF ORDSTS ON ORDLIB.ORDHDR
+    REFERENCING OLD ROW AS old
+                NEW ROW AS new
+    FOR EACH ROW
+    MODE DB2ROW
+BEGIN
+    -- Only write an audit row when the status value actually changed
+    IF old.ORDSTS &lt;&gt; new.ORDSTS THEN
+        INSERT INTO ORDLIB.ORDAUDIT
+            (AUDORDNO, AUDOLDSTS, AUDNEWSTS, AUDTS, AUDUSR, AUDAPPL)
+        VALUES
+            (new.ORDNO,
+             old.ORDSTS,
+             new.ORDSTS,
+             CURRENT_TIMESTAMP,
+             USER,
+             CLIENT_APPLNAME);
+    END IF;
+END;
+</pre>
+
+<p>Scoping the trigger to <code>UPDATE OF ORDSTS</code> means it fires only when that column is included in the SET clause of an UPDATE statement, reducing overhead for updates to other columns. The IF guard is still good practice because the column-level scope does not guarantee a value change — it only guarantees the column was referenced.</p>
+
+<p>Verify the audit trail after a status change:</p>
+
+<pre>
+UPDATE ORDLIB.ORDHDR
+SET    ORDSTS = 'A'
+WHERE  ORDNO  = 'ORD00999';
+
+SELECT * FROM ORDLIB.ORDAUDIT
+WHERE  AUDORDNO = 'ORD00999'
+ORDER BY AUDTS DESC;
+</pre>
+
+<h2>External Triggers with ADDPFTRG</h2>
+
+<p>External triggers are registered with the <strong>ADDPFTRG</strong> CL command. IBM i calls the specified program, passing a single parameter: a pointer to a trigger buffer containing the old row image, the new row image, and a header area with metadata about the event.</p>
+
+<p>The command syntax to register an external AFTER UPDATE trigger on ORDHDR:</p>
+
+<pre>
+ADDPFTRG FILE(ORDLIB/ORDHDR)
+         TRGTIME(*AFTER)
+         TRGEVENT(*UPDATE)
+         PGM(ORDLIB/ORDTRGPGM)
+         RPLTRG(*YES)
+</pre>
+
+<p>Parameters explained:</p>
+<ul>
+  <li><strong>TRGTIME</strong> — <code>*BEFORE</code> or <code>*AFTER</code>, matching SQL trigger timing semantics</li>
+  <li><strong>TRGEVENT</strong> — <code>*INSERT</code>, <code>*UPDATE</code>, or <code>*DELETE</code></li>
+  <li><strong>PGM</strong> — the compiled IBM i program to call; must reside in a library on the library list or specified with a qualified name</li>
+  <li><strong>RPLTRG(*YES)</strong> — replaces any existing trigger registered for the same file, time, and event; use <code>*NO</code> to prevent accidental replacement</li>
+</ul>
+
+<p>The trigger buffer structure that IBM i passes to the external program is documented in the IBM i Knowledge Center under "Trigger buffer". Its layout in a data structure notation:</p>
+
+<pre>
+D TrgBuf          DS                  BASED(pTrgBuf)
+D  TrgFilNam              10A          -- Physical file name
+D  TrgFilLib              10A          -- Library name
+D  TrgMbrNam              10A          -- Member name
+D  TrgEvent                1A          -- '1'=Insert '2'=Delete '3'=Update
+D  TrgTime                 1A          -- '1'=Before  '2'=After
+D  TrgCmtLck               1A          -- Commit lock level
+D  TrgReserv               3A          -- Reserved
+D  TrgCcsid               10I 0        -- CCSID of data
+D  TrgReserv2              2A          -- Reserved
+D  TrgOldOff              10U 0        -- Offset to old row data
+D  TrgOldLen              10U 0        -- Length of old row data
+D  TrgNewOff              10U 0        -- Offset to new row data
+D  TrgNewLen              10U 0        -- Length of new row data
+D  TrgOldNullOff          10U 0        -- Offset to old null indicators
+D  TrgOldNullLen          10U 0        -- Length of null indicator array
+D  TrgNewNullOff          10U 0        -- Offset to new null indicators
+D  TrgNewNullLen          10U 0        -- Length of null indicator array
+</pre>
+
+<p>The actual row data starts at <code>TrgOldOff</code> bytes from the start of the buffer for the before-image and at <code>TrgNewOff</code> bytes for the after-image. You use pointer arithmetic or <code>%ADDR</code> and <code>%SUBARR</code> to extract the relevant fields.</p>
+
+<h2>RPG External Trigger Program Skeleton</h2>
+
+<p>The following ILE RPG program (<code>ORDTRGPGM</code>) reads the trigger buffer, extracts the old and new ORDSTS fields, and writes to an audit message queue when the status changes. It uses free-format RPG (fully free since IBM i 7.2 PTF level).</p>
+
+<pre>
+**FREE
+// ─────────────────────────────────────────────────────────────────────
+//  ORDTRGPGM  –  External AFTER UPDATE trigger for ORDLIB/ORDHDR
+//  Receives the IBM i trigger buffer as a pointer parameter.
+//  Writes status-change notification to QSYSOPR message queue.
+// ─────────────────────────────────────────────────────────────────────
+CTL-OPT DFTACTGRP(*NO) ACTGRP('ORDTRG') OPTION(*NODEBUGIO);
+
+// ── Trigger buffer header ─────────────────────────────────────────────
+DCL-DS TrgBuf BASED(pTrgBuf);
+  TrgFilNam   CHAR(10);
+  TrgFilLib   CHAR(10);
+  TrgMbrNam   CHAR(10);
+  TrgEvent    CHAR(1);
+  TrgTime     CHAR(1);
+  TrgCmtLck   CHAR(1);
+  TrgReserv   CHAR(3);
+  TrgCcsid    INT(10);
+  TrgReserv2  CHAR(2);
+  TrgOldOff   UNS(10);
+  TrgOldLen   UNS(10);
+  TrgNewOff   UNS(10);
+  TrgNewLen   UNS(10);
+  TrgOldNOff  UNS(10);
+  TrgOldNLen  UNS(10);
+  TrgNewNOff  UNS(10);
+  TrgNewNLen  UNS(10);
+END-DS;
+
+// ── ORDHDR row layout (must match physical file field order/length) ────
+DCL-DS OrdhdrRow BASED(pRowData);
+  OrdNo    CHAR(10);
+  OrdCust  CHAR(10);
+  OrdAmt   PACKED(11:2);
+  OrdSts   CHAR(2);
+  OrdCreDt DATE;
+  OrdCreBy CHAR(10);
+  OrdSeq   INT(10);
+END-DS;
+
+// ── QSND_MSG prototype ────────────────────────────────────────────────
+DCL-PR QMHSNDM EXTPGM('QMHSNDM');
+  MsgId        CHAR(7)   CONST;
+  MsgFile      CHAR(20)  CONST;
+  MsgData      CHAR(256) CONST;
+  MsgDataLen   INT(10)   CONST;
+  MsgType      CHAR(10)  CONST;
+  MsgQ         CHAR(20)  CONST;
+  MsgQCnt      INT(10)   CONST;
+  MsgKey       CHAR(4);
+  ErrCode      CHAR(256);
+END-PR;
+
+// ── Main entry: receives the trigger buffer pointer ───────────────────
+DCL-PI *N;
+  pTrgBuf  POINTER;
+END-PI;
+
+DCL-S pOldRow  POINTER;
+DCL-S pNewRow  POINTER;
+DCL-S OldSts   CHAR(2);
+DCL-S NewSts   CHAR(2);
+DCL-S MsgText  CHAR(256);
+DCL-S MsgKey   CHAR(4);
+DCL-S ErrCode  CHAR(256)  INZ(*ALLX'00');
+
+// Only process UPDATE events (*AFTER is already guaranteed by ADDPFTRG)
+IF TrgEvent = '3';   // '3' = UPDATE
+  // Locate the old row image in the buffer
+  pOldRow = pTrgBuf + TrgOldOff;
+  pRowData = pOldRow;
+  OldSts = OrdSts;
+
+  // Locate the new row image in the buffer
+  pNewRow = pTrgBuf + TrgNewOff;
+  pRowData = pNewRow;
+  NewSts = OrdSts;
+
+  // Act only when the status actually changed
+  IF OldSts &lt;&gt; NewSts;
+    MsgText = 'ORDHDR status changed: Order=' + OrdNo
+            + ' Old=' + OldSts + ' New=' + NewSts;
+    QMHSNDM( '*NONE'
+           : 'QSYS      QCPFMSG   '
+           : MsgText
+           : %LEN(%TRIMR(MsgText))
+           : '*INFO     '
+           : 'QSYSOPR   *LIBL     '
+           : 1
+           : MsgKey
+           : ErrCode );
+  ENDIF;
+ENDIF;
+
+*INLR = *ON;
+RETURN;
+</pre>
+
+<p>Compile the program with:</p>
+
+<pre>
+CRTRPGMOD MODULE(ORDLIB/ORDTRGPGM) SRCFILE(ORDLIB/QRPGLESRC) SRCMBR(ORDTRGPGM)
+CRTPGM    PGM(ORDLIB/ORDTRGPGM)   MODULE(ORDLIB/ORDTRGPGM)
+</pre>
+
+<p>Note that trigger programs must be <strong>OPM or ILE programs</strong> — they cannot be ILE service programs (*SRVPGM). Compile to a *PGM object, not a *SRVPGM.</p>
+
+<h2>RMVPFTRG and Trigger Management</h2>
+
+<p>To remove an external trigger:</p>
+
+<pre>
+RMVPFTRG FILE(ORDLIB/ORDHDR)
+          TRGTIME(*AFTER)
+          TRGEVENT(*UPDATE)
+</pre>
+
+<p>To inspect which triggers are registered on a file, use <strong>DSPFD</strong> (Display File Description) with the trigger section:</p>
+
+<pre>
+DSPFD FILE(ORDLIB/ORDHDR) TYPE(*TRG)
+</pre>
+
+<p>From SQL you can query the system catalogue view:</p>
+
+<pre>
+SELECT TRIGGER_NAME, EVENT_MANIPULATION, ACTION_TIMING,
+       ACTION_ORIENTATION, CREATED
+FROM   QSYS2.SYSTRIGGERS
+WHERE  EVENT_OBJECT_TABLE = 'ORDHDR'
+  AND  EVENT_OBJECT_SCHEMA = 'ORDLIB'
+ORDER BY ACTION_TIMING, EVENT_MANIPULATION;
+</pre>
+
+<p>When multiple triggers are registered for the same file, time, and event, IBM i fires them in the order they were registered. Sequence can be controlled by removing and re-adding triggers in the desired order. Document this dependency explicitly in your operations runbook.</p>
+
+<p><strong>Trigger overhead</strong> is real. A trigger that writes to an audit table doubles the I/O for every affected row. On high-volume tables (millions of inserts per day), measure the overhead before deploying. Alternatives include journal-based change data capture (CDC) via the IBM i journal (*JRN), which has lower per-row overhead and does not require a trigger at all.</p>
+
+<h2>Practical Patterns</h2>
+
+<p><strong>Audit trail trigger pattern</strong> — the AFTER UPDATE example above is the canonical pattern. Extend it to INSERT and DELETE for a complete picture:</p>
+
+<pre>
+CREATE OR REPLACE TRIGGER ORDLIB.ORDHDR_AI_AUDIT
+    AFTER INSERT ON ORDLIB.ORDHDR
+    REFERENCING NEW ROW AS new
+    FOR EACH ROW
+    MODE DB2ROW
+BEGIN
+    INSERT INTO ORDLIB.ORDAUDIT
+        (AUDORDNO, AUDOLDSTS, AUDNEWSTS, AUDTS, AUDUSR, AUDAPPL)
+    VALUES
+        (new.ORDNO, '  ', new.ORDSTS, CURRENT_TIMESTAMP, USER, CLIENT_APPLNAME);
+END;
+
+CREATE OR REPLACE TRIGGER ORDLIB.ORDHDR_AD_AUDIT
+    AFTER DELETE ON ORDLIB.ORDHDR
+    REFERENCING OLD ROW AS old
+    FOR EACH ROW
+    MODE DB2ROW
+BEGIN
+    INSERT INTO ORDLIB.ORDAUDIT
+        (AUDORDNO, AUDOLDSTS, AUDNEWSTS, AUDTS, AUDUSR, AUDAPPL)
+    VALUES
+        (old.ORDNO, old.ORDSTS, 'XX', CURRENT_TIMESTAMP, USER, CLIENT_APPLNAME);
+END;
+</pre>
+
+<p><strong>Cross-file synchronisation trigger pattern</strong> — update a summary record when a detail line changes. Here, when an order line amount changes, recalculate the order header total:</p>
+
+<pre>
+CREATE OR REPLACE TRIGGER ORDLIB.ORDLIN_AU_TOTAL
+    AFTER UPDATE OF LINAMT ON ORDLIB.ORDLIN
+    REFERENCING NEW ROW AS new
+    FOR EACH ROW
+    MODE DB2ROW
+BEGIN
+    UPDATE ORDLIB.ORDHDR
+    SET    ORDAMT = (SELECT COALESCE(SUM(LINAMT), 0)
+                    FROM   ORDLIB.ORDLIN
+                    WHERE  LINORDNO = new.LINORDNO)
+    WHERE  ORDNO  = new.LINORDNO;
+END;
+</pre>
+
+<p><strong>Validation trigger with SIGNAL</strong> — a BEFORE INSERT trigger that enforces a business rule and raises a proper SQL error if violated. SIGNAL stops the INSERT and returns the SQLSTATE and message to the caller:</p>
+
+<pre>
+CREATE OR REPLACE TRIGGER ORDLIB.ORDHDR_BI_VALIDATE
+    BEFORE INSERT ON ORDLIB.ORDHDR
+    REFERENCING NEW ROW AS new
+    FOR EACH ROW
+    MODE DB2ROW
+BEGIN
+    -- Business rule: orders cannot be created for suspended customers
+    DECLARE v_suspended CHAR(1) DEFAULT 'N';
+
+    SELECT CUSTSUSP INTO v_suspended
+    FROM   ORDLIB.CUSTMST
+    WHERE  CUSTNO = new.ORDCUST;
+
+    IF v_suspended = 'Y' THEN
+        SIGNAL SQLSTATE '75001'
+        SET MESSAGE_TEXT = 'Order rejected: customer account is suspended';
+    END IF;
+END;
+</pre>
+
+<p>The SQLSTATE value <code>75001</code> is in the user-defined range (75000–79999). The calling program will receive SQL0438 with the MESSAGE_TEXT you specified, giving operators and developers a clear diagnostic rather than a generic constraint violation.</p>
+
+<em>Next post: Calling External REST APIs from IBM i RPG with HTTPAPI — Scott Klement's open source HTTPAPI library for making HTTP GET and POST requests from RPG programs, parsing JSON responses with YAJL, and handling OAuth 2.0 token flows from ILE RPG.</em>

@@ -1,0 +1,353 @@
+<p>The previous post covered Python on IBM i — running Python in PASE, accessing DB2 for i with <strong>ibm_db</strong> and <strong>pyodbc</strong>, calling RPG programs with <strong>itoolkit</strong>, and building cloud and AI integration pipelines. This post covers High Availability and Disaster Recovery on IBM i: what the platform offers natively, how third-party tools extend those capabilities, and how to design an architecture that meets your Recovery Time Objective and Recovery Point Objective in 2026.</p>
+
+<h2>HA vs DR — Understanding the Distinction</h2>
+
+<p>High Availability (HA) and Disaster Recovery (DR) are frequently used interchangeably, but they address different failure scenarios and require different architectural responses.</p>
+
+<p><strong>High Availability</strong> is concerned with eliminating or minimising planned and unplanned outages within a site or between closely coupled sites. The goal is continuous operation — measured by uptime percentage — and the primary metric is <strong>Recovery Time Objective (RTO)</strong>: how quickly can the system be back in service after a failure?</p>
+
+<p><strong>Disaster Recovery</strong> is concerned with surviving a catastrophic event that takes an entire site offline — a data centre fire, flood, power grid failure, or ransomware event. The primary metric here is <strong>Recovery Point Objective (RPO)</strong>: how much data are you willing to lose? An RPO of zero means synchronous replication; an RPO of 15 minutes means asynchronous replication with a tolerable lag.</p>
+
+<ul>
+  <li><strong>Planned outage:</strong> OS upgrade, hardware maintenance, storage expansion — the system is taken offline intentionally. HA tools allow a <em>role swap</em> to a standby system so users remain productive.</li>
+  <li><strong>Unplanned outage:</strong> Hardware failure, network partition, OS hang — the primary system disappears without warning. HA tools detect the failure and perform a <em>failover</em>, bringing the secondary online automatically or with manual intervention.</li>
+  <li><strong>Disaster:</strong> An entire site becomes unavailable. DR requires a geographically separate system with replicated data and a tested recovery runbook.</li>
+</ul>
+
+<p>On IBM i, both HA and DR rely on one or more of three underlying mechanisms: <strong>Geographic Mirroring</strong> (storage-layer), <strong>Switchable Independent ASPs</strong> (disk-pool mobility), and <strong>journal-based logical replication</strong> (object-level). Understanding which layer each mechanism operates on is essential before selecting a product or designing an architecture.</p>
+
+<h2>IBM i HA Options Overview</h2>
+
+<p>IBM i offers several native HA mechanisms, each with different trade-offs in terms of granularity, performance overhead, and licensing cost.</p>
+
+<ul>
+  <li><strong>Geographic Mirroring:</strong> A Power Systems feature (requires IBM i 7.3 or later with appropriate storage) that mirrors disk writes from a production IASP to a remote copy at the storage layer. Changes are replicated synchronously or asynchronously at the hardware level, below the operating system.</li>
+  <li><strong>Switchable Independent ASPs (IASPs):</strong> An Independent Auxiliary Storage Pool can be detached from one IBM i partition and attached to another — on the same system or a remote system via SAN extension. The IASP carries all objects in its library and directory structure with it. No data copying is required during the switch; the target system simply varies on the ASP.</li>
+  <li><strong>Journal-based logical replication:</strong> IBM i journals capture before and after images of every change to a database file or object. Third-party HA tools — and IBM's own PowerHA SystemMirror for i — read the journal receivers on the source system and replay those transactions on a target system, keeping a logical copy in sync.</li>
+  <li><strong>Third-party HA tools:</strong> MIMIX (Precisely), iTera (Rocket Software), and IBM PowerHA SystemMirror for i each provide a management layer above journalling — automating replication monitoring, switchover orchestration, and object-level tracking beyond what native CL commands provide alone.</li>
+</ul>
+
+<h2>Independent Auxiliary Storage Pools (IASPs)</h2>
+
+<p>An Auxiliary Storage Pool (ASP) is a logical grouping of physical disk units. The <strong>system ASP</strong> (ASP 1) holds the operating system, licensed programs, and by default all user data. <strong>User ASPs</strong> (ASPs 2–32) are overflow pools on the same system. <strong>Independent ASPs</strong> (IASPs, ASPs 33–255) are different: they are self-contained disk pools that can be varied on and off independently of the system ASP, and they can be moved between partitions.</p>
+
+<p>An IASP contains its own set of libraries and directories. When varied on, those libraries appear in the system's library list and are fully accessible. When varied off, they disappear completely — no other system can access them unless they vary them on.</p>
+
+<p>Use <strong>WRKCFGSTS</strong> to check the current state of an IASP:</p>
+
+<pre>
+WRKCFGSTS CFGTYPE(*DEV) CFGD(PRODASP)
+</pre>
+
+<p>The status will show <code>VARIED ON</code>, <code>VARIED OFF</code>, or <code>VRYCFG IN PROGRESS</code>. To vary an IASP off on the primary system before switching it to a secondary:</p>
+
+<pre>
+/* Vary off the IASP on the production system */
+VRYCFG CFGOBJ(PRODASP) CFGTYPE(*DEV) STATUS(*OFF)
+</pre>
+
+<p>On the target (secondary) system, vary it on:</p>
+
+<pre>
+/* Vary on the IASP on the secondary system */
+VRYCFG CFGOBJ(PRODASP) CFGTYPE(*DEV) STATUS(*ON)
+</pre>
+
+<p>Before varying off, ensure all jobs using objects in the IASP have ended. Use <strong>WRKOBJ</strong> or <strong>WRKOBJLCK</strong> to check for locks:</p>
+
+<pre>
+WRKOBJLCK OBJ(PRODASP/MYLIB) OBJTYPE(*LIB)
+</pre>
+
+<p>For a remote switchable IASP (the most common HA architecture), the IASP is connected to both the primary and secondary systems via a SAN fabric. Geographic Mirroring or a third-party replication tool keeps the secondary copy current. During a switchover:</p>
+
+<ol style="margin-left:1.5em;">
+  <li>End all jobs on the primary that have objects open in the IASP.</li>
+  <li>Vary off the IASP on the primary (<code>VRYCFG STATUS(*OFF)</code>).</li>
+  <li>If using geographic mirroring, end mirroring and promote the secondary copy.</li>
+  <li>Vary on the IASP on the secondary system.</li>
+  <li>Redirect TCP/IP or change DNS to point users at the secondary.</li>
+</ol>
+
+<p>The <strong>DSPASPSTS</strong> command provides a summary of all ASPs and their usage:</p>
+
+<pre>
+DSPASPSTS
+</pre>
+
+<p>To list all IASPs configured on the system with their current configuration, use:</p>
+
+<pre>
+WRKDEVD DEVD(*ASP)
+</pre>
+
+<h2>Geographic Mirroring</h2>
+
+<p>Geographic Mirroring is a storage-layer replication technology available on IBM Power Systems. It mirrors writes to an IASP at the disk-controller level, producing an exact copy of the disk pool on a remote system. Because it operates below the OS, it replicates all data — database files, IFS objects, user spaces, data queues, and everything else — without any application-level awareness.</p>
+
+<p><strong>Architecture:</strong> The source system writes to its local disks and simultaneously (synchronous mode) or shortly after (asynchronous mode) sends those writes to the remote disk pool. The remote pool is an exact mirror; the target system cannot use it while mirroring is active.</p>
+
+<p>Geographic Mirroring requires:</p>
+<ul>
+  <li>IBM i 7.3 or later on both systems</li>
+  <li>The IASP must be an Independent ASP (not the system ASP)</li>
+  <li>A high-bandwidth, low-latency network connection between sites (fibre or DWDM for synchronous; WAN tolerable for asynchronous)</li>
+  <li>The <strong>IBM i High Availability Licensed Program (5770-HAS)</strong> or equivalent entitlement</li>
+</ul>
+
+<p>To start geographic mirroring on a configured IASP:</p>
+
+<pre>
+STRGEOMRR ASPDEV(PRODASP)
+</pre>
+
+<p>To display the current mirroring status:</p>
+
+<pre>
+DSPGEOMRR ASPDEV(PRODASP)
+</pre>
+
+<p>The output shows the mirror state (<code>MIRRORED</code>, <code>SUSPENDED</code>, <code>DETACHED</code>), the synchronisation percentage if catching up, and the network path being used. To end mirroring before a planned switchover:</p>
+
+<pre>
+ENDGEOMRR ASPDEV(PRODASP) OPTION(*PROMOTE)
+</pre>
+
+<p>The <code>*PROMOTE</code> option makes the remote copy a standalone, writable IASP. Without this option, <code>ENDGEOMRR</code> simply stops mirroring without promoting; the remote copy remains in a mirrored state and cannot be varied on elsewhere.</p>
+
+<p>To check and manage the geographic mirroring copy description:</p>
+
+<pre>
+WRKGEOMRRCPY ASPDEV(PRODASP)
+</pre>
+
+<p>In synchronous mode, every write on the source must be acknowledged by the target before completing — this guarantees zero data loss (RPO=0) but adds latency. For sites more than roughly 50–100 km apart, the round-trip latency of synchronous mirroring becomes a performance concern; asynchronous mode is used instead, accepting a small RPO window (typically seconds to low minutes under normal load).</p>
+
+<h2>Journal-Based Logical Replication</h2>
+
+<p>Journals are IBM i's native mechanism for capturing change data. Every database physical file that participates in replication must be journalled. When a record is inserted, updated, or deleted, the before-image and after-image of that record are written to a <strong>journal receiver</strong>. Third-party HA tools read those journal receivers and replay the changes on the target system.</p>
+
+<p>To start journalling a physical file:</p>
+
+<pre>
+/* Create a journal receiver */
+CRTJRNRCV JRNRCV(MYLIB/MYJRNRCV) THRESHOLD(100000)
+
+/* Create the journal */
+CRTJRN JRN(MYLIB/MYJRN) JRNRCV(MYLIB/MYJRNRCV) MNGRCV(*SYSTEM)
+
+/* Start journalling a physical file */
+STRJRNPF FILE(MYLIB/MYFILE) JRN(MYLIB/MYJRN) IMAGES(*BOTH) OMTJRNE(*OPNCLO)
+</pre>
+
+<p>The <code>IMAGES(*BOTH)</code> parameter instructs IBM i to capture both before-images and after-images — required for logical replication tools that need to detect and replicate updates and deletes accurately. The <code>OMTJRNE(*OPNCLO)</code> parameter omits open and close journal entries, which reduces journal volume without losing data change events.</p>
+
+<p>To change the journalling attributes of an existing file — for example, to add before-images to a file that was previously journalled with after-images only:</p>
+
+<pre>
+CHGJRN JRN(MYLIB/MYJRN) JRNRCV(*GEN)
+
+/* Change the file to capture both images */
+CHGJRNPF FILE(MYLIB/MYFILE) IMAGES(*BOTH)
+</pre>
+
+<p>Journal receivers accumulate over time. The <code>MNGRCV(*SYSTEM)</code> parameter on <code>CRTJRN</code> tells IBM i to manage receiver chaining and detachment automatically. Detached receivers that have been delivered to the target system can be deleted:</p>
+
+<pre>
+DLTJRNRCV JRNRCV(MYLIB/MYJRNRCV0001) DLTOPT(*IGNINQMSG)
+</pre>
+
+<p>To display the current journal receiver chain and identify the active receiver:</p>
+
+<pre>
+WRKJRNA JRN(MYLIB/MYJRN)
+</pre>
+
+<p>For IFS objects and data queues, the commands differ slightly:</p>
+
+<pre>
+/* Journal an IFS stream file */
+STRJRN OBJ('/PRODASP/MYDIR/MYFILE.DAT') JRN('/QSYS.LIB/MYLIB.LIB/MYJRN.JRN')
+
+/* Journal a data queue */
+STRJRNOBJ OBJ(MYLIB/MYDTAQ) OBJTYPE(*DTAQ) JRN(MYLIB/MYJRN)
+</pre>
+
+<p>Logical replication tools consume the journal stream via APIs or direct receiver access, apply transactions on the target, and maintain their own position pointer within the receiver chain. This gives them fine-grained control — they can replicate selected files, apply filters, handle conflicts, and provide detailed replication lag reporting.</p>
+
+<h2>Third-Party HA Tools — MIMIX, iTera, and PowerHA SystemMirror</h2>
+
+<p>Three products dominate the IBM i HA market in 2026. Each uses journalling as its replication engine but wraps it with management, monitoring, and automation capabilities.</p>
+
+<p><strong>MIMIX (Precisely)</strong> is the most widely deployed IBM i HA product. It provides object-level replication using journals, a graphical management console, automated switchover with pre/post-processing scripts, and detailed activity and lag reporting. MIMIX supports both database-only replication and full system replication (including IFS, data areas, user profiles, and non-journalled objects). It can replicate between IBM i versions, making it useful for upgrade projects where the standby is one release ahead.</p>
+
+<p><strong>iTera (Rocket Software)</strong> takes a similar journal-based approach but is known for its tight integration with the IBM i command line and its replication auditing features. iTera's <strong>Replication Audit</strong> functionality performs periodic object comparisons between source and target to detect any drift caused by non-journalled object changes or replication gaps. It also supports selective replication at the library, file, or member level.</p>
+
+<p><strong>IBM PowerHA SystemMirror for i (5770-HAS)</strong> is IBM's own offering. It provides cluster resource group (CRG) management, geographic mirroring integration, and switchable IASP orchestration. PowerHA is the choice when you want IBM-supported HA tightly integrated with the platform — particularly for environments that use geographic mirroring as the underlying replication mechanism. It does not require third-party journal readers; instead, it orchestrates the IASP switch at the CRG level.</p>
+
+<table style="border-collapse:collapse;width:100%;margin:1em 0;">
+  <thead>
+    <tr style="background:#f0f0f0;">
+      <th style="border:1px solid #ccc;padding:6px 10px;text-align:left;">Feature</th>
+      <th style="border:1px solid #ccc;padding:6px 10px;text-align:left;">MIMIX (Precisely)</th>
+      <th style="border:1px solid #ccc;padding:6px 10px;text-align:left;">iTera (Rocket)</th>
+      <th style="border:1px solid #ccc;padding:6px 10px;text-align:left;">PowerHA SystemMirror</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="border:1px solid #ccc;padding:6px 10px;">Replication method</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">Journal-based logical</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">Journal-based logical</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">Geo mirror / IASP / journal</td>
+    </tr>
+    <tr style="background:#f9f9f9;">
+      <td style="border:1px solid #ccc;padding:6px 10px;">GUI management</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">Yes (web console)</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">Yes (5250 and web)</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">5250 + IBM Navigator</td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #ccc;padding:6px 10px;">Cross-version replication</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">Yes</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">Yes</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">Limited</td>
+    </tr>
+    <tr style="background:#f9f9f9;">
+      <td style="border:1px solid #ccc;padding:6px 10px;">Geographic mirroring</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">No (logical only)</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">No (logical only)</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">Yes (native integration)</td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #ccc;padding:6px 10px;">Audit / drift detection</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">Yes</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">Yes (strong feature)</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">Limited</td>
+    </tr>
+    <tr style="background:#f9f9f9;">
+      <td style="border:1px solid #ccc;padding:6px 10px;">IBM support alignment</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">ISV</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">ISV</td>
+      <td style="border:1px solid #ccc;padding:6px 10px;">IBM</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Designing for RTO and RPO</h2>
+
+<p>Choosing the right replication architecture begins with agreeing on RTO and RPO targets with the business, then working backwards to the technology.</p>
+
+<p><strong>Synchronous replication (RPO = 0):</strong> Every write on the source is confirmed on the target before the application receives an acknowledgement. No data loss is possible, but every write carries the round-trip latency to the target site. This is viable for sites within ~50 km connected by dark fibre or DWDM. Beyond that distance, the latency impact on OLTP throughput becomes unacceptable.</p>
+
+<p><strong>Asynchronous replication (RPO &gt; 0):</strong> Writes are acknowledged immediately on the source, then transmitted to the target asynchronously. Replication lag — typically measured in seconds under normal conditions — defines the RPO. This model is appropriate for inter-city or inter-country DR where network latency rules out synchronous operation.</p>
+
+<p>RTO is driven by the switchover automation. A fully automated failover triggered by a heartbeat timeout can achieve RTOs of two to five minutes. A manually executed switchover with multiple steps — ending jobs, varying off the IASP, promoting the mirror, varying it on at the DR site, redirecting DNS — typically takes 15–60 minutes depending on the runbook.</p>
+
+<p><strong>Switchover testing</strong> is non-negotiable. An untested HA architecture is not an HA architecture — it is a hope. Best practice is to test a full role swap quarterly in a non-production window:</p>
+
+<ul>
+  <li>Practice ending applications cleanly on the primary.</li>
+  <li>Vary off the IASP and confirm it reaches <code>VARIED OFF</code> status.</li>
+  <li>On the secondary, vary on the IASP and confirm all libraries are accessible.</li>
+  <li>Run smoke tests — verify that batch jobs start, interactive sessions connect, and key business transactions execute correctly.</li>
+  <li>Switch back and measure elapsed time against your RTO target.</li>
+</ul>
+
+<p>Role swap automation can be scripted in CL. A minimal role swap CL programme skeleton:</p>
+
+<pre>
+PGM
+  DCL VAR(&ASPNAME) TYPE(*CHAR) LEN(10) VALUE('PRODASP')
+  DCL VAR(&MSGID)   TYPE(*CHAR) LEN(7)
+  DCL VAR(&ERRMSG)  TYPE(*CHAR) LEN(100)
+
+  /* Step 1 — end subsystems that use the IASP */
+  ENDSBS SBS(QBATCH)   OPTION(*CNTRLD) DELAY(120)
+  ENDSBS SBS(QINTER)   OPTION(*CNTRLD) DELAY(120)
+  ENDSBS SBS(APPSBSYS) OPTION(*CNTRLD) DELAY(60)
+
+  /* Step 2 — vary off the IASP */
+  VRYCFG CFGOBJ(&ASPNAME) CFGTYPE(*DEV) STATUS(*OFF)
+  MONMSG MSGID(CPF0000) EXEC(DO)
+    RCVMSG MSGTYPE(*LAST) MSG(&ERRMSG)
+    SNDUSRMSG MSG('VRYCFG FAILED: ' *CAT &ERRMSG) TOUSR(*SYSOPR)
+    GOTO ENDPGM
+  ENDDO
+
+  /* Step 3 — signal secondary system to vary on */
+  /* (implementation depends on inter-system comm mechanism) */
+  SNDDTAARA DTAARA(DRLIB/SWITCHCTL (1 1)) VALUE('1')
+
+  SNDUSRMSG MSG('Role swap initiated. IASP varied off. Secondary notified.') TOUSR(*SYSOPR)
+
+  ENDPGM:
+ENDPGM
+</pre>
+
+<h2>Practical CL — Working with PowerHA SystemMirror for i</h2>
+
+<p>When using IBM PowerHA SystemMirror for i, HA resources are managed through <strong>Cluster Resource Groups (CRGs)</strong>. A CRG defines the resources to protect (the IASP, IP addresses, application start/end scripts) and the node roles (primary, backup).</p>
+
+<p>To display all cluster resource groups on the system:</p>
+
+<pre>
+WRKHAGRP
+</pre>
+
+<p>This displays a list of CRGs with their current state, primary node, and backup node. To start a cluster resource group (bring it into managed state):</p>
+
+<pre>
+STRHAGRP HAGRP(PRODCRG)
+</pre>
+
+<p>To initiate a controlled switchover (role swap) of a CRG from the primary to the backup node:</p>
+
+<pre>
+CHGHAGRP HAGRP(PRODCRG) ACTION(*SWITCH) NEWPRIMARY(BACKUPSYS)
+</pre>
+
+<p>To display the full details of a specific cluster resource group, including its IP takeover addresses and exit programme paths:</p>
+
+<pre>
+DSPHAGRP HAGRP(PRODCRG)
+</pre>
+
+<p>To check cluster node status across all nodes in the cluster:</p>
+
+<pre>
+WRKCLUNODE
+</pre>
+
+<p>PowerHA also provides <strong>DSPCLUNOD</strong> for a single-node view and <strong>WRKCLUSTS</strong> for overall cluster status. When a node shows <code>FAILED</code> status, investigate the cluster message log:</p>
+
+<pre>
+DSPLOG LOG(QHST) PERIOD((*AVAIL *BEGIN) (*AVAIL *END)) MSGID(CPIB)
+</pre>
+
+<p>For manual failover outside of PowerHA (for example, when using a third-party HA tool's console), the steps are:</p>
+
+<pre>
+/* On secondary system — check IASP readiness */
+DSPASPSTS
+
+/* Confirm replication lag is within acceptable RPO */
+/* (tool-specific command — e.g., MXDSP for MIMIX) */
+
+/* Vary on the IASP */
+VRYCFG CFGOBJ(PRODASP) CFGTYPE(*DEV) STATUS(*ON)
+
+/* Start application subsystems */
+STRSBS SBSD(APPLIB/APPSBSYS)
+
+/* Redirect client IP if not using IP takeover */
+ADDTCPIFC INTNETADR('10.0.1.100') LIND(ETHLINE) SUBNETMASK('255.255.255.0')
+</pre>
+
+<p>For DR scenarios where the primary site is completely unavailable, most organisations rely on a pre-written runbook that maps each step to the responsible team member, with verified contact information and tested timings from the last DR test. The technology can execute a switchover in minutes; the organisational readiness to invoke it is usually what determines the actual RTO.</p>
+
+<h2>Summary</h2>
+
+<p>IBM i provides a mature, multi-layered HA and DR capability in 2026. Geographic Mirroring delivers storage-layer replication with RPO=0 for synchronous configurations. Switchable IASPs provide the mechanism for moving a disk pool between systems with minimal RTO once replication has kept the secondary current. Journal-based logical replication, used by MIMIX, iTera, and PowerHA SystemMirror for i, provides fine-grained, application-aware replication that can cross OS versions and selectively replicate subsets of data. Designing the right architecture requires matching your RTO and RPO commitments to the appropriate replication mode — synchronous or asynchronous — and then investing in switchover automation and regular testing to ensure the architecture performs as designed when it matters most.</p>
+
+<em>Next post: IBM i PTF Management and OS Upgrades — understanding PTF types, ordering and applying cumulative and group PTFs, managing SF99xxx groups, and planning an IBM i OS upgrade with IMGCLG virtual optical media.</em>

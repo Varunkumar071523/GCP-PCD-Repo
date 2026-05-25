@@ -1,0 +1,483 @@
+<p>The previous post covered IBM i system startup and shutdown procedures — the IPL sequence, custom QSTRUP programmes, STRTCP and subsystem startup order, controlled shutdown with ENDSBS and PWRDWNSYS, and scheduling maintenance IPLs. This post covers something genuinely useful for every IBM i shop with decades of undocumented RPG code: using AI and large language models to accelerate legacy code documentation. The challenge is real, the tools are mature, and the workflow is practical enough to start this week.</p>
+
+<h2>The Documentation Problem on IBM i</h2>
+
+<p>The IBM i platform has a unique documentation problem. It has been in continuous production use since the System/38 era, and many organisations are running RPG programs written in the 1990s or earlier. The developers who wrote those programs have retired or moved on. The programs themselves often contain no comments at all — just dense RPG II or RPG III fixed-format logic with 6-character field names like <strong>ORDAMT</strong>, <strong>CUSTNO</strong>, <strong>DLVDAT</strong>, <strong>INVNO</strong>, and <strong>PRCCD</strong>.</p>
+
+<p>The DDS physical file and logical file source that defines the data structures was written to match the physical storage layout of the time — field names were truncated to fit display columns, and the COLHDG (column heading) attribute was left blank or populated with a cryptic abbreviation. No data dictionary was maintained. No business rules were written down.</p>
+
+<p>The cost of this situation is concrete: every new developer or maintenance programmer spends weeks reverse-engineering the code before they can safely change a single line. Senior developers become gatekeepers because they hold the institutional knowledge that the code itself does not document. When those senior developers leave, the knowledge leaves with them.</p>
+
+<p>AI documentation tooling does not solve this problem completely, but it provides a genuinely useful starting point: a first draft that turns 6-character field names into probable business names, explains what a 400-line RPG procedure does in plain English, and identifies the business rules encoded in the conditional logic — all in minutes rather than days.</p>
+
+<h2>What AI Can and Cannot Do</h2>
+
+<p>Before building a documentation pipeline, it is important to set realistic expectations about what large language models can and cannot do with RPG source code.</p>
+
+<p><strong>AI can reliably:</strong></p>
+<ul>
+  <li>Generate a plain-English description of what a program does based on the code structure, file usage, and variable names.</li>
+  <li>Suggest probable business meanings for abbreviated field names based on context (ORDAMT is almost certainly Order Amount; DLVDAT is almost certainly Delivery Date).</li>
+  <li>Identify conditional logic patterns and describe the business rules they encode (if ORDSTS = 'P' and INVAMT > 10000, escalate to APRVQ).</li>
+  <li>Draft a data dictionary table from DDS source, populating business name, data type, and probable purpose columns.</li>
+  <li>Explain what SQL queries or subfile handling routines do in plain language.</li>
+  <li>Suggest inline comment text for individual subroutines and procedures.</li>
+</ul>
+
+<p><strong>AI cannot reliably:</strong></p>
+<ul>
+  <li>Guarantee correctness — all AI output is a first draft that requires human review against actual business knowledge.</li>
+  <li>Access live data to validate field value ranges or understand runtime behaviour.</li>
+  <li>Understand business rules that are implied by the data rather than visible in the code (for example, a field named PRCCD might be a price code with specific business meanings that only exist in a reference table).</li>
+  <li>Replace a subject matter expert review for critical programmes that affect financial calculations or compliance requirements.</li>
+</ul>
+
+<p>Treat every AI-generated documentation artefact as a first draft — valuable enough to save significant time, but requiring expert validation before it becomes authoritative documentation.</p>
+
+<h2>Extracting Source Code from IBM i</h2>
+
+<p>Before you can pass RPG source to an LLM API, you need to get it off the IBM i in a format a Python script can read. There are three practical approaches.</p>
+
+<p><strong>Approach 1: CPYTOSTMF to IFS stream files</strong></p>
+
+<pre>/* Copy a source member to an IFS stream file */
+CPYTOSTMF FROMMBR('/QSYS.LIB/RPGSRC.LIB/QRPGLESRC.FILE/ORDHDR.MBR') +
+    TOSTMF('/home/docpipeline/ORDHDR.rpgle') +
+    STMFOPT(*REPLACE) +
+    DBFCCSID(*FILE) +
+    STMFCCSID(1208)</pre>
+
+<p>The STMFCCSID(1208) parameter ensures the stream file is written in UTF-8, which is what Python and LLM APIs expect. Once the source is in the IFS, you can access it via PASE, FTP, or the IBM i VS Code extension.</p>
+
+<p><strong>Approach 2: PASE Git to push source to a repository</strong></p>
+<p>From an IBM i PASE shell session (started with <code>CALL QP2TERM</code>), you can use Git to push IFS-resident source to a GitHub or Azure DevOps repository. The IBM i Open Source packages include a full Git installation. This approach is best for teams that want version-controlled documentation alongside their source.</p>
+
+<pre>/* In a PASE shell — push IFS source folder to Git */
+cd /home/docpipeline
+git init
+git remote add origin https://github.com/yourorg/ibmi-source.git
+git add *.rpgle
+git commit -m "Initial source extraction for AI documentation"
+git push -u origin main</pre>
+
+<p><strong>Approach 3: IBM i VS Code extension direct access</strong></p>
+<p>The IBM i VS Code extension (Code for IBM i) by Halcyon allows you to open source members directly from QSYS libraries as if they were local files. For individual programs you want to document interactively, this is the most convenient approach — open the member, select all, copy, paste into a documentation script.</p>
+
+<h2>Calling the OpenAI API from Python to Document RPG</h2>
+
+<p>The following Python script reads an RPG source member from the IFS (or a local copy), sends it to the GPT-4o API with a structured documentation prompt, and writes the output as a Markdown file alongside the source. Install the openai package first: <code>pip install openai</code>.</p>
+
+<pre>#!/usr/bin/env python3
+"""
+document_rpg.py — Generate AI documentation for a single RPG source member.
+Usage: python3 document_rpg.py /path/to/ORDHDR.rpgle
+"""
+
+import sys
+import os
+from pathlib import Path
+from openai import OpenAI
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+DOCUMENTATION_PROMPT = """You are an IBM i RPG specialist with deep knowledge of
+free-format ILE RPG, fixed-format RPG III, RPG IV, and IBM i business applications.
+
+The following is an RPG source member from a production IBM i system.
+
+Your task is to produce documentation in three sections:
+
+1. PROGRAM SUMMARY (3-5 sentences): Describe what this program does in plain
+   English. Focus on the business purpose, not the technical mechanism.
+
+2. BUSINESS RULES: List each business rule encoded in the program as a numbered
+   list. A business rule is a conditional or processing decision that reflects a
+   business requirement (e.g. "If order status is Pending and order value exceeds
+   10000, the order is routed to the approval queue").
+
+3. FILE AND FIELD REFERENCE: For each file used by the program, provide:
+   - File name and probable business purpose
+   - A table of key field names with: Field Name | Probable Business Name |
+     Data Type Guess | Purpose
+
+Format the output as plain Markdown. Do not include any preamble or sign-off.
+
+SOURCE CODE:
+{source_code}
+"""
+
+def document_rpg_source(source_path: str) -> None:
+    source_file = Path(source_path)
+    if not source_file.exists():
+        print(f"Error: source file not found: {source_path}")
+        sys.exit(1)
+
+    source_code = source_file.read_text(encoding="utf-8", errors="replace")
+
+    # Truncate to 120,000 characters to stay within GPT-4o context window
+    if len(source_code) > 120000:
+        source_code = source_code[:120000] + "\n\n[TRUNCATED — source exceeds context limit]"
+
+    prompt = DOCUMENTATION_PROMPT.format(source_code=source_code)
+
+    print(f"Sending {source_file.name} to GPT-4o for documentation...")
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are an expert IBM i and RPG documentation specialist."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+        max_tokens=4096,
+    )
+
+    documentation = response.choices[0].message.content
+
+    output_path = source_file.with_suffix(".md")
+    output_path.write_text(documentation, encoding="utf-8")
+    print(f"Documentation written to: {output_path}")
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python3 document_rpg.py <path-to-rpg-source>")
+        sys.exit(1)
+    document_rpg_source(sys.argv[1])
+</pre>
+
+<p>Run it against a source file copied from the IFS:</p>
+
+<pre>python3 document_rpg.py /home/docpipeline/ORDHDR.rpgle</pre>
+
+<p>The script produces <code>ORDHDR.md</code> alongside the source file, containing the three documentation sections. Review time for a typical 200-line RPG program is 10–15 minutes rather than 2–3 hours of manual reverse-engineering.</p>
+
+<h2>Prompt Engineering for RPG Documentation</h2>
+
+<p>The quality of AI documentation output depends heavily on the prompt. Generic prompts produce generic descriptions. Prompts that tell the model what role it is playing, what output structure is expected, and what IBM i-specific context to apply produce substantially better results.</p>
+
+<p>Key prompt patterns that work well for RPG documentation:</p>
+
+<ul>
+  <li><strong>Role establishment</strong> — Begin with "You are an IBM i RPG specialist" rather than a generic request. LLMs produce more accurate IBM i-specific output when primed with domain context.</li>
+  <li><strong>Structured output requirements</strong> — Specify exactly the sections you want (summary, business rules, field reference) rather than asking for "documentation". This ensures every response has the same structure for storage and search.</li>
+  <li><strong>Business rule extraction framing</strong> — Ask specifically for "business rules encoded in the conditional logic" rather than "explain the code". The former produces actionable documentation; the latter often produces a line-by-line technical walkthrough.</li>
+  <li><strong>Field name disambiguation</strong> — Include this instruction: "When interpreting abbreviated field names, use context from file names, subroutine names, and surrounding code to infer the business meaning." This significantly improves field name explanations.</li>
+</ul>
+
+<p>A refined prompt for fixed-format RPG III programs (which LLMs handle less well than free-format ILE RPG):</p>
+
+<pre>You are an IBM i RPG specialist. The following is a fixed-format RPG III program
+from a legacy AS/400 system. Field names are 6 characters or fewer. File names
+follow the IBM naming conventions of the era.
+
+Ignore the column-based formatting (positions 6-80) and focus on the logic.
+Identify: (1) what the program does in plain English, (2) the business rules in
+the conditional logic (IF/IFEQ/IFNE/IFGT/IFLT blocks and COMP operations),
+(3) a field reference table. Flag any field names where the meaning is ambiguous.
+
+SOURCE:
+{source_code}</pre>
+
+<h2>Using IBM Granite Models via watsonx.ai for On-Premise Documentation</h2>
+
+<p>For organisations with data governance requirements that prohibit sending source code to external APIs, IBM's Granite models on watsonx.ai provide an on-premise alternative. The <code>ibm/granite-34b-code-instruct</code> model was trained specifically on code datasets including RPG, and it handles IBM i source more accurately than general-purpose models for some patterns.</p>
+
+<p>Install the watsonx.ai Python SDK: <code>pip install ibm-watsonx-ai</code></p>
+
+<pre>#!/usr/bin/env python3
+"""
+document_rpg_granite.py — Document RPG source using IBM Granite via watsonx.ai.
+Keeps source code on-premise within your IBM Cloud or private cloud environment.
+"""
+
+import os
+from pathlib import Path
+from ibm_watsonx_ai import APIClient, Credentials
+from ibm_watsonx_ai.foundation_models import ModelInference
+
+WATSONX_URL     = os.environ["WATSONX_URL"]      # e.g. https://us-south.ml.cloud.ibm.com
+WATSONX_API_KEY = os.environ["WATSONX_API_KEY"]
+WATSONX_PROJECT = os.environ["WATSONX_PROJECT_ID"]
+
+credentials = Credentials(url=WATSONX_URL, api_key=WATSONX_API_KEY)
+client = APIClient(credentials)
+
+model = ModelInference(
+    model_id="ibm/granite-34b-code-instruct",
+    api_client=client,
+    project_id=WATSONX_PROJECT,
+    params={
+        "max_new_tokens": 3000,
+        "temperature": 0.1,
+        "repetition_penalty": 1.1,
+    },
+)
+
+def document_with_granite(source_path: str) -> None:
+    source_file = Path(source_path)
+    source_code = source_file.read_text(encoding="utf-8", errors="replace")[:80000]
+
+    prompt = f"""### IBM i RPG Documentation Task
+
+You are an IBM i RPG expert. Document the following RPG program.
+
+Provide:
+1. A 3-5 sentence plain-English summary of the program's business purpose.
+2. A numbered list of the business rules encoded in the conditional logic.
+3. A Markdown table of field names with columns: Field | Business Name | Type | Purpose.
+
+### RPG Source:
+{source_code}
+
+### Documentation:
+"""
+
+    response = model.generate_text(prompt=prompt)
+    output_path = source_file.with_suffix(".md")
+    output_path.write_text(response, encoding="utf-8")
+    print(f"Granite documentation written to: {output_path}")
+
+if __name__ == "__main__":
+    import sys
+    document_with_granite(sys.argv[1])
+</pre>
+
+<p>The Granite models are hosted within IBM Cloud regions and can be deployed to IBM Cloud Private or watsonx.ai on-premises appliances, meaning source code never leaves your controlled environment.</p>
+
+<h2>Batch Documentation Pipeline</h2>
+
+<p>Documenting programs one at a time is useful but not practical for a library with hundreds of source members. The following script iterates all RPG source members in a library using the IFS path structure of QSYS.LIB, generates documentation for each, and stores the results in a DB2 for i table for later search and retrieval.</p>
+
+<p>First, create the DB2 table to store the results (run this once from ACS Run SQL Scripts):</p>
+
+<pre>CREATE TABLE DOCLIB.PROGDOC (
+    PGMNAME    VARCHAR(10)    NOT NULL,
+    PGMLIB     VARCHAR(10)    NOT NULL,
+    SRCFILE    VARCHAR(10)    NOT NULL,
+    DOCSUMMARY VARCHAR(2000),
+    BIZRULES   VARCHAR(4000),
+    FIELDDOC   VARCHAR(4000),
+    RAWDOC     CLOB(1M),
+    LASTDOC    TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    DOCMODEL   VARCHAR(50),
+    PRIMARY KEY (PGMNAME, PGMLIB)
+);
+
+CREATE INDEX DOCLIB.PROGDOC_NAME ON DOCLIB.PROGDOC (PGMNAME);
+LABEL ON TABLE DOCLIB.PROGDOC IS 'AI-generated programme documentation';
+</pre>
+
+<p>Then the Python batch pipeline that populates it via JDBC (using the JTOpen driver via jaydebeapi):</p>
+
+<pre>#!/usr/bin/env python3
+"""
+batch_document.py — Iterate all RPGLE members in a source file and document them.
+Stores results in DB2 table DOCLIB.PROGDOC via JDBC.
+Run from PASE or from an off-system machine with IFS mapped as a network drive.
+"""
+
+import os
+import time
+from pathlib import Path
+from openai import OpenAI
+import jaydebeapi
+
+OPENAI_API_KEY  = os.environ["OPENAI_API_KEY"]
+IBMI_HOST       = os.environ["IBMI_HOST"]       # IP or hostname
+IBMI_USER       = os.environ["IBMI_USER"]
+IBMI_PASSWORD   = os.environ["IBMI_PASSWORD"]
+JDBC_JAR        = "/opt/jtopen/jt400.jar"
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+JDBC_URL = f"jdbc:as400://{IBMI_HOST}/DOCLIB;naming=system;errors=full"
+
+PROMPT_TEMPLATE = """You are an IBM i RPG specialist. Document this RPG program in three sections:
+SUMMARY: (3-5 sentences of plain-English business purpose)
+RULES: (numbered list of business rules from conditional logic)
+FIELDS: (Markdown table: Field | Business Name | Type | Purpose)
+Do not include any other text.
+RPG SOURCE:
+{source}"""
+
+def get_connection():
+    return jaydebeapi.connect(
+        "com.ibm.as400.access.AS400JDBCDriver",
+        JDBC_URL,
+        [IBMI_USER, IBMI_PASSWORD],
+        JDBC_JAR,
+    )
+
+def document_one(source_code: str, member_name: str) -> dict:
+    prompt = PROMPT_TEMPLATE.format(source=source_code[:100000])
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=3000,
+        )
+        raw = response.choices[0].message.content
+        summary = ""
+        rules = ""
+        fields = ""
+        current = None
+        for line in raw.splitlines():
+            if line.startswith("SUMMARY:"):
+                current = "summary"
+                summary += line[8:].strip() + " "
+            elif line.startswith("RULES:"):
+                current = "rules"
+            elif line.startswith("FIELDS:"):
+                current = "fields"
+            elif current == "summary":
+                summary += line.strip() + " "
+            elif current == "rules":
+                rules += line + "\n"
+            elif current == "fields":
+                fields += line + "\n"
+        return {"summary": summary.strip(), "rules": rules.strip(),
+                "fields": fields.strip(), "raw": raw}
+    except Exception as exc:
+        print(f"  API error for {member_name}: {exc}")
+        return {"summary": "", "rules": "", "fields": "", "raw": str(exc)}
+
+def batch_document_library(lib: str, srcfile: str) -> None:
+    ifs_path = Path(f"/QSYS.LIB/{lib}.LIB/{srcfile}.FILE")
+    if not ifs_path.exists():
+        print(f"Source file not found at IFS path: {ifs_path}")
+        return
+
+    members = list(ifs_path.glob("*.MBR"))
+    print(f"Found {len(members)} members in {lib}/{srcfile}")
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    for mbr_path in members:
+        member_name = mbr_path.stem
+        print(f"  Documenting {member_name}...")
+
+        try:
+            source = mbr_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            print(f"  Could not read {member_name}: {exc}")
+            continue
+
+        doc = document_one(source, member_name)
+
+        cur.execute("""
+            MERGE INTO DOCLIB.PROGDOC AS T
+            USING (VALUES(?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?))
+                AS S(PGMNAME, PGMLIB, SRCFILE, DOCSUMMARY, BIZRULES,
+                     FIELDDOC, RAWDOC, LASTDOC, DOCMODEL)
+            ON T.PGMNAME = S.PGMNAME AND T.PGMLIB = S.PGMLIB
+            WHEN MATCHED THEN
+                UPDATE SET DOCSUMMARY=S.DOCSUMMARY, BIZRULES=S.BIZRULES,
+                           FIELDDOC=S.FIELDDOC, RAWDOC=S.RAWDOC,
+                           LASTDOC=S.LASTDOC, DOCMODEL=S.DOCMODEL
+            WHEN NOT MATCHED THEN
+                INSERT (PGMNAME,PGMLIB,SRCFILE,DOCSUMMARY,BIZRULES,
+                        FIELDDOC,RAWDOC,LASTDOC,DOCMODEL)
+                VALUES (S.PGMNAME,S.PGMLIB,S.SRCFILE,S.DOCSUMMARY,
+                        S.BIZRULES,S.FIELDDOC,S.RAWDOC,S.LASTDOC,S.DOCMODEL)
+        """, (member_name, lib, srcfile, doc["summary"], doc["rules"],
+              doc["fields"], doc["raw"], "gpt-4o-mini"))
+        conn.commit()
+
+        # Respect OpenAI rate limits
+        time.sleep(1.5)
+
+    cur.close()
+    conn.close()
+    print(f"Batch documentation complete for {lib}/{srcfile}")
+
+if __name__ == "__main__":
+    import sys
+    batch_document_library(sys.argv[1], sys.argv[2])
+</pre>
+
+<p>Run it with: <code>python3 batch_document.py RPGLIB QRPGLESRC</code></p>
+
+<h2>Building a Searchable Knowledge Base</h2>
+
+<p>Once documentation summaries are stored in DB2, they become searchable with standard SQL. But to enable semantic search — finding programs that handle conceptually related tasks even when they do not share keyword overlap — you need vector embeddings, the same technique covered in Post 39 using QSYS2.HTTP_POST to the OpenAI embeddings API.</p>
+
+<p>Add an embedding column to the PROGDOC table:</p>
+
+<pre>ALTER TABLE DOCLIB.PROGDOC ADD COLUMN EMBEDDING CLOB(64000);
+ALTER TABLE DOCLIB.PROGDOC ADD COLUMN EMBED_MODEL VARCHAR(50);</pre>
+
+<p>Then extend the Python pipeline to generate and store embeddings for each summary:</p>
+
+<pre>def embed_summary(summary: str) -> list:
+    """Generate a vector embedding for a documentation summary."""
+    if not summary.strip():
+        return []
+    response = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=summary,
+    )
+    return response.data[0].embedding
+
+import json
+
+def store_embedding(cur, pgmname: str, pgmlib: str, embedding: list) -> None:
+    embed_json = json.dumps(embedding)
+    cur.execute(
+        "UPDATE DOCLIB.PROGDOC SET EMBEDDING = ?, EMBED_MODEL = ? "
+        "WHERE PGMNAME = ? AND PGMLIB = ?",
+        (embed_json, "text-embedding-3-small", pgmname, pgmlib)
+    )
+</pre>
+
+<p>For semantic search, generate an embedding for the search query and compute cosine similarity against all stored embeddings in Python (or use pgvector if you have a PostgreSQL mirror). This enables queries like "find all programs that process customer refunds" to return relevant results even if those programs never contain the word "refund" — they might use CRDBLADJ (credit balance adjustment) internally.</p>
+
+<h2>DDS Data Dictionary Generation</h2>
+
+<p>The same AI documentation approach works equally well for DDS source members. DDS physical file definitions contain field names, data types, and lengths but rarely business descriptions. Sending DDS source to an LLM and requesting a data dictionary produces immediately useful documentation for every table in your database.</p>
+
+<p>First copy DDS source to IFS:</p>
+
+<pre>CPYTOSTMF FROMMBR('/QSYS.LIB/DBLIB.LIB/QDDSSRC.FILE/ORDHDRF.MBR') +
+    TOSTMF('/home/docpipeline/dds/ORDHDRF.dds') +
+    STMFOPT(*REPLACE) STMFCCSID(1208)</pre>
+
+<p>Then send it to the API with a DDS-specific prompt:</p>
+
+<pre>DDS_PROMPT = """You are an IBM i DDS and DB2 for i specialist.
+The following is a DDS source member defining a physical database file on IBM i.
+
+Produce a data dictionary as a Markdown table with these columns:
+Field Name | Business Name | Data Type | Length/Precision | Probable Purpose | Nullable
+
+For each field:
+- Expand the abbreviated field name into a probable full business name.
+- Infer the data type from the DDS type indicator (A=Character, S=Zoned Decimal,
+  P=Packed Decimal, L=Date, T=Time, Z=Timestamp, B=Binary).
+- Describe the probable business purpose in one sentence.
+
+DDS SOURCE:
+{source}
+
+DATA DICTIONARY:
+"""</pre>
+
+<p>Store the generated data dictionary in a second DB2 table:</p>
+
+<pre>CREATE TABLE DOCLIB.DATADCT (
+    FILENAME   VARCHAR(10)    NOT NULL,
+    FILELIB    VARCHAR(10)    NOT NULL,
+    FLDNAME    VARCHAR(10)    NOT NULL,
+    BIZNAME    VARCHAR(100),
+    DATATYPE   VARCHAR(20),
+    FLDPURPOSE VARCHAR(500),
+    LASTDOC    TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (FILENAME, FILELIB, FLDNAME)
+);
+LABEL ON TABLE DOCLIB.DATADCT IS 'AI-generated data dictionary from DDS source';</pre>
+
+<p>With both PROGDOC and DATADCT populated, new developers can search for a field name and immediately find which programs use it, what it means, and what business rules apply to it — a knowledge base that would have taken months to build manually, assembled in days with an automated AI pipeline running overnight.</p>
+
+<em>Next post: DB2 for i SQL Stored Procedures, Functions, and User-Defined Functions — CREATE PROCEDURE, IN/OUT parameters, cursor loops, CALL from RPG and CL, scalar and table UDFs, and using SQL procedures to encapsulate reusable business logic in DB2 for i.</em>

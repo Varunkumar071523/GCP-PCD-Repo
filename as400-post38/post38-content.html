@@ -1,0 +1,368 @@
+<p>The previous post covered DB2 for i replication — journal-based logical replication, Q-Replication architecture, MIMIX for reporting and HA, and designing a replication strategy. This post covers save and restore strategy on IBM i: the full backup stack from the GO SAVE menu through granular SAVLIB and SAVOBJ commands, SAV for IFS paths, virtual optical media with image catalogues, and BRMS for automated backup management with incremental and cumulative policies.</p>
+
+<h2>IBM i Save Concepts — Four Areas You Must Cover</h2>
+
+<p>IBM i backup is different from file-system backup on Linux or Windows. You are not backing up a directory tree — you are saving a collection of typed objects that live in a hierarchical namespace: libraries containing objects (files, programs, data areas, job queues), the Integrated File System (IFS) directory tree, system configuration (network attributes, system values, device descriptions), and licensed internal code (LIC). Missing any of these four areas produces a backup that cannot fully restore a production system.</p>
+
+<ul>
+  <li><strong>Libraries and objects</strong> — the primary IBM i namespace. Every DB2 table, RPG program, CL program, data area, output queue, and user profile lives in a library. Saved with SAVLIB and SAVOBJ.</li>
+  <li><strong>IFS (Integrated File System)</strong> — the Unix-style directory tree. Holds Java applications, Python scripts, web content, PASE binaries, and XML/JSON data files. Saved with SAV.</li>
+  <li><strong>System configuration</strong> — network attributes, line descriptions, controller descriptions, device descriptions, subsystem descriptions, user profiles, authorisation lists. Saved with SAVSYS or option 22 of GO SAVE.</li>
+  <li><strong>Licensed Internal Code</strong> — the lowest layer of the OS. Only saved as part of a full system save (GO SAVE option 21). Cannot be saved independently in a useful way for restore purposes.</li>
+</ul>
+
+<p>IBM i save commands are object-aware: they understand object types, lock the objects during save (with options to limit disruption), record the save date in the object header, and can save only changed objects since the last save. This is fundamentally more capable than block-level or file-system snapshots.</p>
+
+<h2>GO SAVE — Full, System Data, and User Data</h2>
+
+<p>The GO SAVE menu (type <code>GO SAVE</code> at a command line) is the traditional starting point for IBM i backup. It provides three primary options:</p>
+
+<ul>
+  <li><strong>Option 21 — Save the entire system</strong>: Saves LIC, operating system, all system libraries (*NONSYS), all user libraries, and the IFS. Requires all users to be signed off and all subsystems except the controlling subsystem to be ended. The system must be in a restricted state. An option 21 save is the only save from which you can perform a bare-metal restore of a completely blank system.</li>
+  <li><strong>Option 22 — Save system data only</strong>: Saves LIC, the operating system (QSYS and related system libraries), and system configuration. Does not save user libraries or IFS data. Used when you want to update OS PTFs and want a restore point for system data only.</li>
+  <li><strong>Option 23 — Save all user data</strong>: Saves all user libraries (*ALLUSR), configuration objects, and user portions of the IFS (excludes /QSYS.LIB which is covered by SAVLIB). Does not save LIC or the operating system. This is the option used for routine scheduled backups on systems where the OS is stable.</li>
+</ul>
+
+<p>Initiate an option 21 save to tape device TAP01:</p>
+
+<pre>GO SAVE
+/* Select option 21, specify device TAP01, answer prompts */</pre>
+
+<p>Or automate it unattended with SAVSYS + SAVLIB(*NONSYS) + SAV sequence in a CL program. GO SAVE option 21 effectively runs this sequence for you with IPL-required locked state.</p>
+
+<p>Check when the last full system save occurred:</p>
+
+<pre>SELECT
+    OBJECT_LIBRARY,
+    OBJECT_NAME,
+    OBJECT_TYPE,
+    LAST_SAVE_TIMESTAMP,
+    LAST_SAVE_SIZE_KILOBYTES,
+    LAST_SAVE_VOLUME_ID
+FROM QSYS2.OBJECT_STATISTICS
+WHERE OBJECT_LIBRARY = 'QSYS'
+  AND OBJECT_NAME    = 'QSYS'
+  AND OBJECT_TYPE    = '*LIB';</pre>
+
+<h2>SAVLIB — Saving Libraries</h2>
+
+<p>SAVLIB is the workhorse command for saving individual libraries or groups of libraries. It is used for scheduled backups of user libraries without requiring a full system restricted state.</p>
+
+<p>Save a single library to a save file (useful for automated offsite transfer):</p>
+
+<pre>SAVLIB LIB(ORDLIB)
+       DEV(*SAVF)
+       SAVF(QGPL/ORDLIB230601)
+       TGTRLS(*CURRENT)
+       UPDHST(*YES)
+       OMITOBJ((*ALL *DTAQ) (*ALL *USRSPC))</pre>
+
+<p><code>UPDHST(*YES)</code> records the save date in each saved object's header — essential for incremental saves later. <code>OMITOBJ</code> here excludes data queues and user spaces which are transient and do not need to be backed up.</p>
+
+<p>Save all user libraries to a tape device:</p>
+
+<pre>SAVLIB LIB(*ALLUSR)
+       DEV(TAP01)
+       ENDOPT(*REWIND)
+       UPDHST(*YES)
+       PRECHK(*YES)</pre>
+
+<p><code>PRECHK(*YES)</code> checks that all libraries can be saved before starting, preventing a partial save that fails midway through.</p>
+
+<p>Omit specific libraries from *ALLUSR (e.g., libraries used only for work files):</p>
+
+<pre>SAVLIB LIB(*ALLUSR)
+       DEV(TAP01)
+       OMITLIB(WRKLIB TMPLIB STAGLIB)
+       UPDHST(*YES)</pre>
+
+<p>Save only changed objects (incremental) using SAVCHGOBJ — objects modified since a reference date:</p>
+
+<pre>SAVCHGOBJ OBJ(*ALL)
+           LIB(ORDLIB)
+           DEV(*SAVF)
+           SAVF(QGPL/ORDLIBCHG)
+           REFDATE('2026-06-01')
+           REFTIME('000000')
+           UPDHST(*YES)</pre>
+
+<p>This saves only objects in ORDLIB whose last-change date is after midnight on 1 June 2026. Combined with a periodic full SAVLIB, this forms the basis of an incremental backup strategy.</p>
+
+<p>Parallel save using multiple tape devices (dramatically faster for large libraries):</p>
+
+<pre>SAVLIB LIB(*ALLUSR)
+       DEV(TAP01 TAP02 TAP03)
+       UPDHST(*YES)
+       PRECHK(*YES)</pre>
+
+<p>IBM i distributes the parallel tape streams automatically across the specified devices.</p>
+
+<h2>SAVOBJ and SAVSRVPGM — Object-Level Saves</h2>
+
+<p>SAVOBJ saves individual objects within a library. This is useful when you want to save a specific program before applying a change, or when a library is too large to save fully during a maintenance window.</p>
+
+<p>Save a specific RPG service program before patching it:</p>
+
+<pre>SAVOBJ OBJ(ORDCALCR)
+        LIB(ORDLIB)
+        DEV(*SAVF)
+        SAVF(QGPL/ORDCALCRBK)
+        OBJTYPE(*SRVPGM)
+        UPDHST(*YES)</pre>
+
+<p>Save all programs and service programs in a library:</p>
+
+<pre>SAVOBJ OBJ(*ALL)
+        LIB(ORDLIB)
+        DEV(TAP01)
+        OBJTYPE(*PGM *SRVPGM)
+        UPDHST(*YES)</pre>
+
+<p>Save all object types in a library (equivalent to SAVLIB for that library, but with more filtering options):</p>
+
+<pre>SAVOBJ OBJ(*ALL)
+        LIB(ORDLIB)
+        DEV(*SAVF)
+        SAVF(QGPL/ORDLIBFULL)
+        OBJTYPE(*ALL)
+        UPDHST(*YES)
+        TGTRLS(*CURRENT)</pre>
+
+<p>Save a user profile and its associated private authorities:</p>
+
+<pre>SAVSECDTA USRPRF(JSMITH)
+           DEV(*SAVF)
+           SAVF(QTEMP/JSMITHSEC)</pre>
+
+<h2>SAV for IFS — Saving the Integrated File System</h2>
+
+<p>The IFS directory tree is saved with the SAV command, not SAVLIB. The IFS holds Python scripts, Java applications, PASE binaries, web server content, node.js applications, and any data files written by open-source tools running in PASE.</p>
+
+<p>Save selected IFS paths to a save file:</p>
+
+<pre>SAV DEV('/QSYS.LIB/QGPL.LIB/IFSBK230601.FILE')
+    OBJ(('/home')
+        ('/QOpenSys/QIBM/UserData')
+        ('/www')
+        ('/opt'))
+    SUBTREE(*ALL)
+    UPDHST(*YES)</pre>
+
+<p>Note that <code>/QSYS.LIB</code> is the IFS projection of the IBM i library namespace. You do NOT save it with SAV — it is already covered by SAVLIB. Saving it twice wastes tape and time.</p>
+
+<p>Save the entire IFS except QSYS.LIB and temporary paths:</p>
+
+<pre>SAV DEV('/QSYS.LIB/QGPL.LIB/IFSFULL.FILE')
+    OBJ(('/*' *INCLUDE)
+        ('/QSYS.LIB' *OMIT)
+        ('/QDLS' *OMIT)
+        ('/tmp' *OMIT)
+        ('/QIBM/ProdData' *OMIT))
+    SUBTREE(*ALL)
+    UPDHST(*YES)</pre>
+
+<p><code>/QIBM/ProdData</code> contains IBM product data that is restored by PTF install; you generally omit it from user data saves.</p>
+
+<p>Save changed IFS objects only (incremental):</p>
+
+<pre>SAV DEV('/QSYS.LIB/QGPL.LIB/IFSCHG.FILE')
+    OBJ(('/home' *INCLUDE)
+        ('/www' *INCLUDE))
+    SUBTREE(*ALL)
+    CHGPERIOD('2026-06-01' '000000' *NOW *NOW)
+    UPDHST(*YES)</pre>
+
+<h2>RSTLIB and RSTOBJ — Restoring</h2>
+
+<p>Restore is the purpose of save. Understanding restore sequence and dependencies is as important as understanding save commands.</p>
+
+<p>Restore a full library from a save file:</p>
+
+<pre>RSTLIB SAVLIB(ORDLIB)
+        DEV(*SAVF)
+        SAVF(QGPL/ORDLIB230601)
+        RSTLIB(ORDLIB)
+        MBROPT(*ALL)
+        ALWOBJDIF(*ALL)</pre>
+
+<p><code>MBROPT(*ALL)</code> restores all members of physical files, including members added after the last save. <code>ALWOBJDIF(*ALL)</code> allows object differences between the save media and the current system — necessary when restoring to a different system or after an OS upgrade.</p>
+
+<p>Restore a specific object:</p>
+
+<pre>RSTOBJ OBJ(ORDCALCR)
+        SAVLIB(ORDLIB)
+        DEV(*SAVF)
+        SAVF(QGPL/ORDCALCRBK)
+        OBJTYPE(*SRVPGM)
+        RSTLIB(ORDLIB)</pre>
+
+<p>Restore IFS objects:</p>
+
+<pre>RST DEV('/QSYS.LIB/QGPL.LIB/IFSBK230601.FILE')
+    OBJ(('/home/*') ('/www/*'))
+    SUBTREE(*ALL)</pre>
+
+<p><strong>Restore sequence dependencies</strong> matter. When restoring a complete library that contains RPG programs bound to service programs:</p>
+
+<ol style="margin-left:1.5em;margin-bottom:1em;">
+  <li>Restore the library structure first (RSTLIB with data-only objects).</li>
+  <li>Restore service programs (*SRVPGM) before the programs (*PGM) that bind to them.</li>
+  <li>Restore physical files (*FILE with FILE(*PHY)) before logical files (*FILE with FILE(*LGL)) that are based on them.</li>
+  <li>Restore programs last.</li>
+</ol>
+
+<p>IBM i handles most of this automatically when restoring a complete library save, but partial restores require attention to dependency order.</p>
+
+<h2>Virtual Optical Media with IMGCLG</h2>
+
+<p>Virtual optical media (image catalogues) allow you to save to and restore from virtual disc images on the IFS instead of physical tape. This is the modern approach for environments without tape infrastructure and for cloud-offload scenarios where save files are uploaded to object storage after creation.</p>
+
+<p>Create an image catalogue:</p>
+
+<pre>CRTIMGCLG IMGCLG(ORDLIBCLG)
+           DIR('/imgclg/ordlib')
+           TYPE(*OPT)
+           TEXT('ORDLIB monthly save image catalogue')</pre>
+
+<p>Add virtual media entries to the catalogue:</p>
+
+<pre>ADDIMGCLGE IMGCLG(ORDLIBCLG)
+            FROMFILE(*NEW)
+            TOFILE(ORDLIBVOL001)
+            IMGSIZ(4700)</pre>
+
+<p><code>IMGSIZ(4700)</code> creates a 4.7 GB virtual disc image — equivalent to a DVD. For large libraries, add multiple entries; IBM i spans them automatically.</p>
+
+<p>Load (mount) the image catalogue so save commands can use it:</p>
+
+<pre>LODIMGCLG IMGCLG(ORDLIBCLG)
+           DEV(IMGCLGDEV01)</pre>
+
+<p>Now use the virtual device IMGCLGDEV01 in a SAVLIB command exactly as you would use TAP01:</p>
+
+<pre>SAVLIB LIB(ORDLIB)
+       DEV(IMGCLGDEV01)
+       UPDHST(*YES)
+       ENDOPT(*UNLOAD)</pre>
+
+<p>After saving, the image files reside in <code>/imgclg/ordlib/</code> on the IFS. You can then upload them to IBM Cloud Object Storage, AWS S3, or Azure Blob Storage using any PASE tool:</p>
+
+<pre>/* From PASE — upload completed image to S3 */
+QSH CMD('aws s3 cp /imgclg/ordlib/ORDLIBVOL001 \
+    s3://mybucket/ibmi-backups/2026-06-01/ \
+    --region eu-west-2')</pre>
+
+<p>To restore from a cloud-stored image, download it back to the IFS, re-add it to an image catalogue with ADDIMGCLGE, load it with LODIMGCLG, and restore with RSTLIB pointing to the virtual device.</p>
+
+<h2>BRMS — Backup Recovery and Media Services</h2>
+
+<p>BRMS (5770-BR1) is IBM's integrated backup automation and media management product for IBM i. It transforms the manual CL commands described above into a policy-driven, scheduled, and tracked system. BRMS is the right choice for any production IBM i where backup must be reliable, auditable, and recoverable without manual intervention.</p>
+
+<p>What BRMS adds over manual CL commands:</p>
+
+<ul>
+  <li><strong>Media management</strong> — tracks every tape or virtual media volume: what is on it, when it expires, where it is (on-site, off-site, in-transit). WRKMEDIBRM displays the media inventory.</li>
+  <li><strong>Backup policies (control groups)</strong> — define what to save, in what order, to what device, on what schedule. A control group replaces a hand-crafted CL backup program.</li>
+  <li><strong>Incremental and cumulative tracking</strong> — BRMS tracks save history per object and per library. It knows which objects have changed since the last full or incremental save without you having to manage REFDATE parameters manually.</li>
+  <li><strong>Recovery reports</strong> — BRMS generates step-by-step recovery instructions for any restore scenario based on current media inventory.</li>
+  <li><strong>Integration with system journal</strong> — BRMS logs all backup activity to the system journal for audit purposes.</li>
+</ul>
+
+<p>Start a BRMS backup using a defined backup control group:</p>
+
+<pre>STRBKUBRM CTLGRP(NIGHTLY_USR)
+           STRSEQ(*STRSEQ)</pre>
+
+<p>Start a BRMS recovery (restores from BRMS-managed media):</p>
+
+<pre>STRRCYBRM CTLGRP(*SYSTEM)
+           OPTION(*RESTORE)</pre>
+
+<p>Display media inventory:</p>
+
+<pre>WRKMEDIBRM VOL(*ALL)
+            MEDCLS(*ALL)
+            EXPIRED(*NO)</pre>
+
+<p>Move media to off-site (update location tracking):</p>
+
+<pre>MOVMEDBRM FROMLOC(*HOME)
+           TOLOC(OFFSITE1)
+           MEDCLS(*ALL)</pre>
+
+<p>Display what is saved on a specific volume:</p>
+
+<pre>DSPSAVBRM VOL(TAPVOL001)
+           OUTPUT(*PRINT)</pre>
+
+<p>Create a new backup control group for nightly user library saves:</p>
+
+<pre>CRTCTLGBRM CTLGRP(NIGHTLY_USR)
+            TYPE(*BKU)
+            TEXT('Nightly user library incremental')</pre>
+
+<p>Then add backup items to the control group:</p>
+
+<pre>ADDLBRBRM CTLGRP(NIGHTLY_USR)
+           SEQ(10)
+           LIB(*ALLUSR)
+           OMITLIB(WRKLIB TMPLIB)
+           SAVACT(*SYNCLIB)
+           UPDHST(*YES)
+           INCLIB(*YES)</pre>
+
+<p><code>INCLIB(*YES)</code> tells BRMS to save only objects changed since the last save recorded in BRMS history — making this an incremental backup automatically.</p>
+
+<h2>Backup Schedule Design</h2>
+
+<p>A practical IBM i backup schedule uses three tiers that match recovery point objectives with media costs and backup window constraints.</p>
+
+<p><strong>Daily incremental — SAVCHGOBJ</strong></p>
+
+<p>Run nightly, typically in a maintenance window between 22:00 and 02:00. Save only changed objects using SAVCHGOBJ or a BRMS incremental control group. This produces small, fast saves that can complete within an hour even for large systems.</p>
+
+<pre>/* CL for nightly incremental — run from a scheduled job */
+SAVCHGOBJ OBJ(*ALL)
+           LIB(*ALLUSR)
+           OMITLIB(WRKLIB TMPLIB)
+           DEV(*SAVF)
+           SAVF(QGPL/INCR0620)
+           REFDATE(*SAVLIB)
+           UPDHST(*YES)</pre>
+
+<p><code>REFDATE(*SAVLIB)</code> uses the recorded last-save date from the object's save history as the reference point.</p>
+
+<p><strong>Weekly differential — SAVLIB</strong></p>
+
+<p>Run once a week (typically Sunday night) saving all user libraries in full. This is the baseline from which daily incrementals apply forward. Rotate media so that two weekly saves are available before the oldest is reused.</p>
+
+<pre>SAVLIB LIB(*ALLUSR)
+       DEV(TAP01)
+       OMITLIB(WRKLIB TMPLIB)
+       ENDOPT(*REWIND)
+       UPDHST(*YES)
+       PRECHK(*YES)</pre>
+
+<p><strong>Monthly full — GO SAVE option 21</strong></p>
+
+<p>Run once a month in a planned maintenance window (requiring an IPL to restricted state). This is the only save from which a bare-metal restore is possible. Store monthly full saves off-site. Retain at least three monthly saves before recycling media.</p>
+
+<p>The recovery sequence from a complete system loss:</p>
+
+<ol style="margin-left:1.5em;margin-bottom:1em;">
+  <li>Install LIC from D-mode IPL (distribution tape or virtual media).</li>
+  <li>Restore the operating system from the most recent option 21 full save.</li>
+  <li>Restore system configuration (SAVSYS data).</li>
+  <li>Restore user libraries from the most recent weekly full save (RSTLIB *ALLUSR).</li>
+  <li>Apply daily incrementals in sequence from the weekly save date forward (RSTOBJ or BRMS STRRCYBRM).</li>
+  <li>Restore IFS from the most recent SAV save.</li>
+  <li>Verify by testing key application functions before handing back to users.</li>
+</ol>
+
+<p>Test your restore procedure at least quarterly. An untested backup is not a backup.</p>
+
+<h2>Summary</h2>
+
+<p>IBM i save and restore is a layered discipline: GO SAVE option 21 for full system bare-metal recovery, SAVLIB for library-level saves, SAVOBJ for object-level precision, SAV for IFS, and IMGCLG virtual optical media for tapeless cloud-offload. BRMS transforms these manual commands into a managed policy system with media tracking, incremental history, and recovery reports. A well-designed schedule — daily SAVCHGOBJ, weekly SAVLIB, monthly GO SAVE 21 — combined with off-site storage and quarterly restore tests gives IBM i the reliable backup posture the platform's business-critical workloads demand.</p>
+
+<em>Next post: Vector Search and Embeddings on IBM i — generating text embeddings with OpenAI and watsonx.ai, storing vector representations in DB2 for i, implementing cosine similarity in SQL, and building semantic search applications over IBM i data.</em>

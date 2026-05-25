@@ -1,0 +1,283 @@
+The previous post covered advanced IFS operations — journalling, NetServer, backup, and CCSID. This post goes deeper into ILE RPG itself: system pointers, IBM i OS APIs called directly from RPG, dynamic program calls, and user spaces — the techniques that allow RPG programs to interrogate and control the IBM i system rather than just processing data.
+
+These are not everyday RPG patterns — most application programs never need them. But they appear consistently in the programs that underpin IBM i frameworks, build tools, operational utilities, and middleware. Understanding them explains how tools like Bob, itoolkit, and system monitoring utilities actually work. They also provide solutions to problems that cannot be solved any other way: listing the objects in a library at runtime, checking whether a program exists before calling it, reading a data queue non-destructively, or passing data to a program that was not designed with a known parameter signature.
+
+<h2>IBM i OS APIs</h2>
+
+IBM i exposes a large library of OS-level APIs that are callable from ILE programs. These APIs are IBM i programs stored in QSYS and called using the standard ILE program call mechanism — no special syntax needed.
+
+<strong>How to find and use IBM i APIs:</strong>
+
+IBM's online documentation lists all APIs under "IBM i 7.x API Overview". Each API has:
+<ul>
+<li>A program name (e.g. QUSLJOB — list job information)</li>
+<li>A library (usually QSYS)</li>
+<li>A parameter list with types, lengths, and directions</li>
+</ul>
+
+The pattern for calling an IBM i API from RPG is always the same: define a prototype matching the documented parameter list, define data structures for the input and output parameter formats, call the API, and read the output.
+
+<h2>QCMDEXC — running CL commands from RPG</h2>
+
+QCMDEXC is the simplest and most commonly used IBM i API. It takes a CL command string and executes it. Any command that can be run on a 5250 command line can be called from RPG via QCMDEXC.
+
+<pre>**FREE
+ctl-opt dftactgrp(*no) actgrp(*new);
+
+dcl-pr qcmdexc extpgm('QCMDEXC');
+  cmdStr  char(32702) const options(*varsize);
+  cmdLen  packed(15:5) const;
+end-pr;
+
+dcl-s cmd    char(512);
+dcl-s cmdLen packed(15:5);
+dcl-s lib    char(10);
+
+lib = 'TESTLIB';
+
+// Build and execute a CL command
+cmd    = 'CRTLIB LIB(' + %trim(lib) + ') TYPE(*TEST)';
+cmdLen = %len(%trim(cmd));
+
+monitor;
+  qcmdexc(cmd : cmdLen);
+on-error;
+  dsply ('Failed to create library: ' + %trim(lib));
+endmon;</pre>
+
+<code>options(*varsize)</code> on the cmdStr parameter tells the compiler the caller can pass a shorter character string than the declared length — the actual length is communicated through the cmdLen parameter.
+
+<h2>User spaces and the list APIs</h2>
+
+Many IBM i APIs return variable-length lists of objects (jobs, files, programs, messages) into a user space. A user space (*USRSPC) is an IBM i object that holds an arbitrary block of data — essentially a large array that programs can read and write at byte offsets.
+
+The pattern is:
+<ol>
+<li>Create a user space</li>
+<li>Call the list API, passing the user space name</li>
+<li>Read the list header from the user space to get count and entry offset</li>
+<li>Loop through entries at the documented offsets</li>
+</ol>
+
+<strong>Example: listing all programs in a library using QUSLOBJ:</strong>
+
+<pre>**FREE
+ctl-opt dftactgrp(*no) actgrp(*new) option(*srcstmt);
+
+// API prototypes
+dcl-pr quscrtus extpgm('QUSCRTUS');         // Create user space
+  qualName    char(20) const;
+  attr        char(10) const;
+  initSize    int(10) const;
+  initValue   char(1) const;
+  pubAuth     char(10) const;
+  desc        char(50) const;
+  replace     char(10) const options(*nopass);
+end-pr;
+
+dcl-pr quslobj extpgm('QUSLOBJ');           // List objects
+  qualUsrSpc  char(20) const;
+  format      char(8) const;
+  qualObjName char(20) const;
+  objType     char(10) const;
+  errCode     char(1) options(*omit);
+end-pr;
+
+dcl-pr qusrtvus extpgm('QUSRTVUS');         // Retrieve from user space
+  qualName  char(20) const;
+  startPos  int(10) const;
+  length    int(10) const;
+  receiver  char(32767) options(*varsize);
+end-pr;
+
+// List header data structure (OBJL0200 format, first 140 bytes)
+dcl-ds listHeader;
+  hdrUserData  char(64)  pos(1);
+  hdrSize      int(10)   pos(65);
+  hdrStructure char(4)   pos(69);
+  hdrInfoComplete char(1) pos(73);
+  hdrCreateDate char(13) pos(74);
+  hdrStatus    char(1)   pos(87);
+  hdrFiller    char(3)   pos(88);
+  hdrEntryCount int(10)  pos(125);
+  hdrEntryOffset int(10) pos(129);
+  hdrEntrySize int(10)   pos(133);
+end-ds;
+
+// Single entry in OBJL0200 format
+dcl-ds objEntry;
+  objName    char(10) pos(1);
+  objLib     char(10) pos(11);
+  objType    char(10) pos(21);
+  objStatus  char(1)  pos(31);
+  extAttr    char(10) pos(32);
+  objText    char(50) pos(42);
+end-ds;
+
+dcl-s usrSpcName char(20);
+dcl-s qualLib    char(20);
+dcl-s idx        int(10);
+dcl-s entryData  char(200);
+
+// Create user space LSTSPC in QTEMP
+usrSpcName = 'LSTSPC    QTEMP     ';
+quscrtus(usrSpcName : 'LISTOBJ   ' : 65536 : x'00' : '*ALL' :
+         'Program list space' : '*YES');
+
+// List all *PGM objects in ORDLIB
+qualLib = 'ORDLIB    *ALL      ';   // unpadded: 'ORDLIB' in first 10, '*ALL' in next 10
+quslobj(usrSpcName : 'OBJL0200' : qualLib : '*PGM' : *omit);
+
+// Read the list header (starts at position 1 in user space)
+qusrtvus(usrSpcName : 1 : 140 : listHeader);
+
+// Loop through entries
+for idx = 1 to hdrEntryCount;
+  qusrtvus(usrSpcName :
+           hdrEntryOffset + ((idx - 1) * hdrEntrySize) + 1 :
+           hdrEntrySize :
+           objEntry);
+
+  dsply (%trim(objName) + ' in ' + %trim(objLib));
+endfor;
+
+*inlr = *on;</pre>
+
+<h2>Dynamic program calls</h2>
+
+Most RPG program calls use static binding — the called program name is known at compile time. Dynamic calls use a variable to hold the program name, resolved at runtime.
+
+<strong>CALL with a variable (OPM-style dynamic call):</strong>
+
+<pre>dcl-s pgmName char(10);
+dcl-s pgmLib  char(10);
+
+pgmName = 'CRTORD';
+pgmLib  = 'ORDLIB';
+
+// Call a program by variable name
+// Parms passed as before — this is a simple dynamic call
+call(e) pgmName;
+if %error();
+  dsply ('Failed to call: ' + %trim(pgmName));
+endif;</pre>
+
+<strong>Calling a procedure in a dynamically named service program (using QSYS_RESOLVE_SRVPGM):</strong>
+
+For true dynamic dispatch — calling a procedure in a service program whose name is determined at runtime — RPG uses pointers and system APIs. This is the mechanism underlying plugin-style architectures on IBM i:
+
+<pre>// Pointer-based dynamic call using procedure pointer
+dcl-s procPtr   pointer(*proc);
+dcl-pr dynamicProc extproc(procPtr);
+  parm1 char(10) const;
+end-pr;
+
+// Set the procedure pointer to a specific procedure in a service program
+// (typically done via QSYS2.RESOLVE_SRVPGM or a registration table)
+// Then call via the pointer:
+dynamicProc('PARM VALUE');</pre>
+
+<h2>System pointers</h2>
+
+IBM i is a capability-based system. Every object is accessed through a pointer. System pointers are 16-byte values that reference IBM i objects — programs, files, data areas — at the LIC level. Most RPG programs never deal with them directly, but they appear when calling certain system APIs that return or accept object references.
+
+<strong>Resolving a system pointer to an object:</strong>
+
+<pre>dcl-s objPtr pointer;
+dcl-s objName char(30);   // qualified name: 10 char name + 10 char lib + ...
+
+// RSLVREF resolves a qualified object name to a system pointer
+// Used when passing objects to APIs that accept pointer parameters
+dcl-pr rslvref extproc('_RSLVREF');
+  result  pointer;
+  name    char(*) const;
+end-pr;</pre>
+
+System pointers matter in practice when calling MI (Machine Interface) instructions directly, when working with teraspace storage, or when writing programs that need to operate on objects without knowing their names at compile time.
+
+<h2>QUSRTVUS and QUSCHGUS — reading and writing user spaces</h2>
+
+Beyond the list API pattern, user spaces serve as a general-purpose data exchange mechanism between programs. Two programs can share a user space as a bulletin board:
+
+<pre>// Write status to a shared user space
+dcl-pr quschgus extpgm('QUSCHGUS');
+  qualName  char(20) const;
+  startPos  int(10) const;
+  length    int(10) const;
+  data      char(32767) const options(*varsize);
+  force     char(1) const options(*nopass);
+end-pr;
+
+dcl-s statusData char(50);
+dcl-s sharedSpace char(20);
+
+sharedSpace = 'BATCHSTS  QTEMP     ';
+statusData  = 'STEP2-COMPLETE      ';
+
+quschgus(sharedSpace : 1 : %len(%trim(statusData)) : statusData);</pre>
+
+<h2>Practical API patterns</h2>
+
+<strong>QUSLJOB — list all jobs for a user profile (for monitoring):</strong>
+
+<pre>// Useful for checking whether a batch job is already running
+// before submitting a duplicate
+// Pattern: create user space → call QUSLJOB → check entry count</pre>
+
+<strong>QUSJOBSTS — retrieve job status without WRKACTJOB:</strong>
+
+<pre>// Returns the current status of a specific job: *ACTIVE, *JOBQ, *OUTQ
+// Used in CL and RPG programs that need to poll for job completion</pre>
+
+<strong>QWTCHGJB — change job attributes from another program:</strong>
+
+<pre>// Allows one program to change a running job's attributes
+// (priority, logging level, message queue) — used in operational utilities</pre>
+
+<strong>QMHSNDM — send a message from an API call:</strong>
+
+<pre>// More control than SNDPGMMSG — specify the exact message queue,
+// message type, and key. Used when the standard CL command
+// is not precise enough for the target message handling.</pre>
+
+<h2>IBM i APIs for checking object existence</h2>
+
+A common requirement: check whether an object exists before trying to use it. In CL, CHKOBJ does this. In RPG, the QUSROBJD (Retrieve Object Description) API is the tool:
+
+<pre>dcl-pr qusrobjd extpgm('QUSROBJD');
+  receiver    char(32767) options(*varsize);
+  rcvLen      int(10) const;
+  format      char(8) const;
+  qualObjName char(20) const;
+  objType     char(10) const;
+  errCode     char(32767) options(*varsize);
+end-pr;
+
+dcl-ds objDesc len(108);
+  objName     char(10) pos(1);
+  objLib      char(10) pos(11);
+  objType     char(10) pos(21);
+  objAttr     char(10) pos(31);
+  objText     char(50) pos(41);
+end-ds;
+
+dcl-ds errCodeDs;
+  bytesProvided int(10) inz(0);  // 0 means do not report errors — return instead
+  bytesAvailable int(10) inz(0);
+end-ds;
+
+// Attempt to retrieve the object description
+qusrobjd(objDesc : %size(objDesc) : 'OBJD0100' :
+         'CRTORD    ORDLIB    ' : '*PGM' : errCodeDs);
+
+if errCodeDs.bytesAvailable = 0;
+  dsply 'CRTORD exists in ORDLIB';
+else;
+  dsply 'CRTORD not found';
+endif;</pre>
+
+Setting <code>bytesProvided = 0</code> in the error code parameter tells the API to return the error in the error code data structure rather than sending an escape message — critical for checking existence without triggering an error.
+
+IBM i APIs are well-documented and stable across OS releases. Programs that use them correctly can implement capabilities that are not available through CL commands or SQL alone: runtime object discovery, dynamic program dispatch, direct control of the system job environment, and fine-grained messaging. They are the layer beneath the visible command interface and the foundation of every IBM i framework worth examining.
+
+<em>Next post: Python on IBM i — running Python natively in PASE, accessing DB2 for i with ibm_db and pyodbc, calling CL commands and RPG programs with itoolkit-for-i, and integrating Python with AI APIs for IBM i data workflows.</em>

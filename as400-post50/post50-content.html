@@ -1,0 +1,535 @@
+<p>The previous post covered IBM i ILE binding and activation groups — modules, programs, service programs, binding directories, activation group types (<strong>*NEW</strong>, <strong>*CALLER</strong>, named), commitment control scope, and designing service programs for maximum reuse. This post covers DB2 for i's built-in JSON and XML capabilities: extracting scalar values with <strong>JSON_VALUE</strong>, querying sub-objects with <strong>JSON_QUERY</strong>, shredding JSON arrays into relational rows with <strong>JSON_TABLE</strong>, constructing JSON with <strong>JSON_OBJECT</strong> and <strong>JSON_ARRAYAGG</strong>, producing JSON directly from result sets with <strong>FOR JSON</strong>, parsing XML into rows with <strong>XMLTABLE</strong>, and constructing XML with <strong>FOR XML</strong> and <strong>XMLELEMENT</strong>. A complete stored procedure that accepts a JSON REST payload, shreds it into header and detail rows, and returns a JSON confirmation response ties the concepts together.</p>
+
+<h2>Why JSON and XML in DB2 for i</h2>
+
+<p>IBM i REST services written in Node.js or Python (covered in earlier posts in this series) frequently need to perform two operations that are expensive to do in application code: shredding an incoming JSON payload into normalised DB2 rows, and serialising DB2 query results into JSON for API responses. Doing these transformations at the data layer — inside DB2 for i SQL — is more efficient for several reasons:</p>
+
+<ul>
+  <li>No round-trip: the JSON document never leaves the database engine to be parsed and re-inserted by application code</li>
+  <li>Single transaction boundary: shredding and inserting happen atomically in one SQL statement or stored procedure</li>
+  <li>Optimiser visibility: DB2 can pipeline JSON_TABLE output directly into an INSERT without materialising intermediate result sets</li>
+  <li>Reduced application complexity: the REST handler becomes a thin wrapper that passes the raw JSON body to a stored procedure and returns the procedure's JSON response</li>
+</ul>
+
+<p>DB2 for i has supported ISO SQL/JSON functions since IBM i 7.3 TR6 and 7.4 TR2. All examples in this post target IBM i 7.4 or later; most work on 7.3 with the appropriate Technology Refresh applied.</p>
+
+<h2>JSON_VALUE — Extracting a Scalar from a JSON String</h2>
+
+<p><strong>JSON_VALUE</strong> extracts a single scalar value (string, number, boolean) from a JSON document using a SQL/JSON path expression. It is the simplest JSON function and the one you will use most often for extracting individual fields from a stored JSON column or a parameter value.</p>
+
+<pre>
+-- Basic JSON_VALUE usage
+SELECT JSON_VALUE(payload, '$.ordNum')     AS ord_num,
+       JSON_VALUE(payload, '$.custNum')    AS cust_num,
+       JSON_VALUE(payload, '$.ordAmt' RETURNING DECIMAL(11,2)) AS ord_amt
+  FROM ORDLIB.INBOUND_PAYLOADS
+ WHERE received_ts > CURRENT_TIMESTAMP - 1 HOUR;
+</pre>
+
+<p>Extracting from a nested path:</p>
+
+<pre>
+-- Nested path: $.order.customer.name
+SELECT JSON_VALUE(payload, '$.order.customer.name')       AS cust_name,
+       JSON_VALUE(payload, '$.order.customer.email')      AS cust_email,
+       JSON_VALUE(payload, '$.order.shippingAddr.city')   AS ship_city,
+       JSON_VALUE(payload, '$.order.shippingAddr.country') AS ship_country
+  FROM ORDLIB.INBOUND_PAYLOADS;
+</pre>
+
+<p>The <strong>RETURNING</strong> clause performs type casting:</p>
+
+<pre>
+-- RETURNING with type casting and default on error
+SELECT JSON_VALUE(payload, '$.ordAmt'
+                 RETURNING DECIMAL(11,2)
+                 DEFAULT 0.00 ON EMPTY
+                 DEFAULT 0.00 ON ERROR)         AS ord_amt,
+       JSON_VALUE(payload, '$.priority'
+                 RETURNING INTEGER
+                 DEFAULT 5 ON EMPTY)            AS priority,
+       JSON_VALUE(payload, '$.orderDate'
+                 RETURNING DATE
+                 DEFAULT CURRENT_DATE ON ERROR) AS ord_date
+  FROM ORDLIB.INBOUND_PAYLOADS
+ WHERE batch_id = 'BATCH20260622';
+</pre>
+
+<p>A practical example extracting webhook fields from a VARCHAR column where a third-party e-commerce platform posts order notifications:</p>
+
+<pre>
+-- Webhook payload stored in ORDLIB.WEBHOOKS.PAYLOAD (VARCHAR(32000))
+SELECT hook_id,
+       JSON_VALUE(payload, '$.event')                          AS event_type,
+       JSON_VALUE(payload, '$.data.id')                        AS external_id,
+       JSON_VALUE(payload, '$.data.total' RETURNING DECIMAL(11,2)) AS total,
+       JSON_VALUE(payload, '$.data.status')                    AS status,
+       TIMESTAMP(JSON_VALUE(payload, '$.data.createdAt'
+                            RETURNING VARCHAR(30)))            AS created_at
+  FROM ORDLIB.WEBHOOKS
+ WHERE processed = 'N'
+ ORDER BY received_ts;
+</pre>
+
+<h2>JSON_QUERY — Extracting a JSON Sub-object or Array</h2>
+
+<p><strong>JSON_QUERY</strong> returns a JSON fragment — a sub-object or array — rather than a scalar. The result is always a VARCHAR containing valid JSON, which you can then pass to JSON_TABLE for further processing or return directly to a caller.</p>
+
+<pre>
+-- Extract the items array from a JSON order payload
+SELECT JSON_QUERY(payload, '$.items') AS items_json
+  FROM ORDLIB.INBOUND_PAYLOADS
+ WHERE pay_id = 42;
+</pre>
+
+<p>Result: <code>[{"id":"SKU001","quantity":2,"unitPrice":19.99},{"id":"SKU002","quantity":1,"unitPrice":49.99}]</code></p>
+
+<p>When the path expression matches a single value rather than an array, use <strong>WITH CONDITIONAL ARRAY WRAPPER</strong> to ensure the result is always an array (safe for downstream JSON_TABLE processing):</p>
+
+<pre>
+SELECT JSON_QUERY(payload, '$.shippingAddress'
+                 WITH CONDITIONAL ARRAY WRAPPER) AS addr_array
+  FROM ORDLIB.INBOUND_PAYLOADS
+ WHERE pay_id = 42;
+</pre>
+
+<p>Combining JSON_QUERY with JSON_VALUE in a single SELECT to extract both the scalar header fields and the array for later processing:</p>
+
+<pre>
+SELECT JSON_VALUE(payload, '$.ordNum')            AS ord_num,
+       JSON_VALUE(payload, '$.custNum')           AS cust_num,
+       JSON_QUERY(payload, '$.items')             AS items_json,
+       JSON_QUERY(payload, '$.shippingAddress')   AS ship_addr_json
+  FROM ORDLIB.INBOUND_PAYLOADS
+ WHERE pay_id = 42;
+</pre>
+
+<h2>JSON_TABLE — Shredding a JSON Array into Rows</h2>
+
+<p><strong>JSON_TABLE</strong> is the most powerful JSON function in DB2 for i. It acts as a table-valued function: it takes a JSON document and a path to an array, and returns one row per array element, with each element's fields mapped to named columns. The result can be joined to other tables, filtered with WHERE, and used directly as the source for an INSERT.</p>
+
+<pre>
+-- Shred the items array from a JSON payload into individual rows
+SELECT T.item_id, T.qty, T.unit_price, T.qty * T.unit_price AS line_total
+  FROM ORDLIB.INBOUND_PAYLOADS P,
+       JSON_TABLE(P.payload, '$.items[*]'
+         COLUMNS(
+           item_id    VARCHAR(20)    PATH '$.id',
+           qty        INTEGER        PATH '$.quantity',
+           unit_price DECIMAL(11,2)  PATH '$.unitPrice',
+           item_desc  VARCHAR(100)   PATH '$.description'
+                                     DEFAULT 'N/A' ON EMPTY
+         )
+       ) AS T
+ WHERE P.pay_id = 42;
+</pre>
+
+<p>A complete example: inserting order line items from a JSON webhook payload directly into <code>ORDLIB.ORDDET</code> in a single INSERT INTO ... SELECT FROM JSON_TABLE statement:</p>
+
+<pre>
+-- Insert order detail rows from JSON payload in one statement
+INSERT INTO ORDLIB.ORDDET
+  (ORDNUM, LINENUM, ITMNUM, QTY, UNITPRC, LINEPRC, ENTDTE)
+SELECT
+  JSON_VALUE(P.payload, '$.ordNum')                    AS ordnum,
+  ROW_NUMBER() OVER ()                                 AS linenum,
+  T.item_id,
+  T.qty,
+  T.unit_price,
+  T.qty * T.unit_price                                 AS lineprc,
+  CURRENT_DATE
+FROM ORDLIB.INBOUND_PAYLOADS P,
+     JSON_TABLE(P.payload, '$.items[*]'
+       COLUMNS(
+         item_id    VARCHAR(20)   PATH '$.id',
+         qty        INTEGER       PATH '$.quantity',
+         unit_price DECIMAL(11,2) PATH '$.unitPrice'
+       )
+     ) AS T
+WHERE P.pay_id = 42;
+</pre>
+
+<p>JSON_TABLE also handles nested arrays (arrays within arrays) using the NESTED PATH clause:</p>
+
+<pre>
+-- Nested path: order has lines, each line has components
+SELECT T.line_id, T.qty, C.comp_id, C.comp_qty
+  FROM ORDLIB.INBOUND_PAYLOADS P,
+       JSON_TABLE(P.payload, '$.lines[*]'
+         COLUMNS(
+           line_id  VARCHAR(20) PATH '$.lineId',
+           qty      INTEGER     PATH '$.quantity',
+           NESTED PATH '$.components[*]'
+             COLUMNS(
+               comp_id  VARCHAR(20) PATH '$.componentId',
+               comp_qty INTEGER     PATH '$.qty'
+             )
+         )
+       ) AS T
+ WHERE P.pay_id = 42;
+</pre>
+
+<h2>JSON_OBJECT and JSON_ARRAY — Constructing JSON in SQL</h2>
+
+<p><strong>JSON_OBJECT</strong> constructs a JSON object from key-value pairs. <strong>JSON_ARRAY</strong> constructs a JSON array from a list of values. <strong>JSON_ARRAYAGG</strong> is an aggregate function that collects rows into a JSON array — the key function for building nested JSON responses from relational data.</p>
+
+<pre>
+-- Build a simple JSON object for a single order
+SELECT JSON_OBJECT(
+         'ordNum'   VALUE ORDNUM,
+         'custName' VALUE TRIM(CUSTFNAM) || ' ' || TRIM(CUSTLNAM),
+         'total'    VALUE ORDAMT,
+         'status'   VALUE ORDSTS,
+         'orderDate' VALUE CHAR(ORDDTE)
+       ) AS order_json
+  FROM ORDLIB.ORDHDR H
+  JOIN ORDLIB.CUSTMST C ON C.CUSTNUM = H.CUSTNUM
+ WHERE H.ORDNUM = 'ORD001234';
+</pre>
+
+<p>Building a nested JSON response with line items using a correlated subquery and JSON_ARRAYAGG:</p>
+
+<pre>
+-- Full order JSON with nested line items array
+SELECT JSON_OBJECT(
+         'ordNum'   VALUE H.ORDNUM,
+         'custNum'  VALUE H.CUSTNUM,
+         'total'    VALUE H.ORDAMT,
+         'status'   VALUE H.ORDSTS,
+         'lines'    VALUE (
+           SELECT JSON_ARRAYAGG(
+                    JSON_OBJECT(
+                      'lineNum'   VALUE D.LINENUM,
+                      'itemNum'   VALUE D.ITMNUM,
+                      'qty'       VALUE D.QTY,
+                      'unitPrice' VALUE D.UNITPRC,
+                      'linePrice' VALUE D.LINEPRC
+                    )
+                  )
+             FROM ORDLIB.ORDDET D
+            WHERE D.ORDNUM = H.ORDNUM
+         )
+       ) AS order_json
+  FROM ORDLIB.ORDHDR H
+ WHERE H.ORDNUM = 'ORD001234';
+</pre>
+
+<p>JSON_ARRAYAGG collecting multiple orders into a single array response for a list endpoint:</p>
+
+<pre>
+-- Orders array for a given customer
+SELECT JSON_OBJECT(
+         'custNum' VALUE :custNum,
+         'orders'  VALUE JSON_ARRAYAGG(
+                           JSON_OBJECT(
+                             'ordNum' VALUE ORDNUM,
+                             'date'   VALUE CHAR(ORDDTE),
+                             'total'  VALUE ORDAMT,
+                             'status' VALUE ORDSTS
+                           )
+                           ORDER BY ORDDTE DESC
+                         )
+       ) AS response_json
+  FROM ORDLIB.ORDHDR
+ WHERE CUSTNUM = :custNum
+   AND ORDSTS <> 'X';
+</pre>
+
+<h2>FOR JSON — Producing JSON from a Result Set</h2>
+
+<p>The <strong>FOR JSON</strong> clause appended to any SELECT statement instructs DB2 to serialise the entire result set as a JSON array of objects, without needing explicit JSON_OBJECT calls. It is the quickest way to produce JSON from an existing query.</p>
+
+<pre>
+-- Produce JSON directly from a result set
+SELECT ORDNUM   AS "ordNum",
+       CUSTNUM  AS "custNum",
+       ORDAMT   AS "total",
+       ORDSTS   AS "status",
+       CHAR(ORDDTE) AS "orderDate"
+  FROM ORDLIB.ORDHDR
+ WHERE CUSTNUM = 'CUST0042'
+   AND ORDSTS <> 'X'
+ ORDER BY ORDDTE DESC
+ FOR JSON;
+</pre>
+
+<p>Result: a JSON array where each element is an object with keys matching the column aliases. Column aliases in double quotes preserve mixed-case key names in the output.</p>
+
+<p><strong>FOR JSON AUTO</strong> uses the table and column names directly from the query to determine the JSON structure. <strong>FOR JSON PATH</strong> (supported in some DB2 for i versions) gives finer control over nesting. In practice, FOR JSON without a sub-option defaults to AUTO mode on IBM i:</p>
+
+<pre>
+-- FOR JSON with a join — produces nested structure in AUTO mode
+SELECT H.ORDNUM   AS "ordNum",
+       H.ORDAMT   AS "total",
+       D.LINENUM  AS "lineNum",
+       D.ITMNUM   AS "itemNum",
+       D.QTY      AS "qty"
+  FROM ORDLIB.ORDHDR H
+  JOIN ORDLIB.ORDDET D ON D.ORDNUM = H.ORDNUM
+ WHERE H.CUSTNUM = 'CUST0042'
+ ORDER BY H.ORDNUM, D.LINENUM
+ FOR JSON;
+</pre>
+
+<p>FOR JSON is ideal for simple API endpoints where the query shape directly matches the JSON response shape. For complex nested structures with aggregated arrays, JSON_OBJECT with JSON_ARRAYAGG (shown above) gives more control over the output structure.</p>
+
+<h2>XMLTABLE — Parsing XML into Rows</h2>
+
+<p><strong>XMLTABLE</strong> is the XML equivalent of JSON_TABLE: it takes an XML document, applies an XPath expression to identify the repeating element, and returns one row per matching element with specified child elements mapped to columns.</p>
+
+<pre>
+-- Parse an XML order document into relational rows
+SELECT X.item_code,
+       X.qty,
+       X.unit_price,
+       X.qty * X.unit_price AS line_total
+  FROM ORDLIB.XML_PAYLOADS P,
+       XMLTABLE('//order/lines/line'
+         PASSING XMLPARSE(DOCUMENT P.xml_payload)
+         COLUMNS
+           item_code  VARCHAR(10)   PATH 'itemCode',
+           qty        INTEGER       PATH 'quantity',
+           unit_price DECIMAL(11,2) PATH 'unitPrice',
+           item_desc  VARCHAR(100)  PATH 'description'
+       ) AS X
+ WHERE P.doc_id = 101;
+</pre>
+
+<p>A complete example with XMLCAST for explicit type conversion and handling optional elements:</p>
+
+<pre>
+-- Full XMLTABLE with type casting and optional element handling
+INSERT INTO ORDLIB.ORDDET
+  (ORDNUM, LINENUM, ITMNUM, QTY, UNITPRC, LINEPRC, ENTDTE)
+SELECT
+  XMLCAST(XMLQUERY('$doc/order/@ordNum' PASSING
+                   XMLPARSE(DOCUMENT P.xml_payload) AS "doc")
+          AS VARCHAR(10))                            AS ordnum,
+  ROW_NUMBER() OVER ()                              AS linenum,
+  X.item_code,
+  X.qty,
+  X.unit_price,
+  X.qty * X.unit_price,
+  CURRENT_DATE
+FROM ORDLIB.XML_PAYLOADS P,
+     XMLTABLE('//order/lines/line'
+       PASSING XMLPARSE(DOCUMENT P.xml_payload)
+       COLUMNS
+         item_code  VARCHAR(10)   PATH 'itemCode',
+         qty        INTEGER       PATH 'quantity',
+         unit_price DECIMAL(11,2) PATH 'unitPrice'
+     ) AS X
+WHERE P.doc_id = 101;
+</pre>
+
+<p>XMLTABLE also supports the PASSING BY REF clause and namespace-aware XPath expressions for documents with XML namespaces, which are common in EDI and SOAP payloads:</p>
+
+<pre>
+-- XML with namespaces (e.g., EDI acknowledgement payload)
+SELECT X.ack_code, X.ack_msg
+  FROM ORDLIB.EDI_PAYLOADS P,
+       XMLTABLE(XMLNAMESPACES('http://www.example.com/edi' AS "edi"),
+                '//edi:acknowledgement/edi:item'
+         PASSING XMLPARSE(DOCUMENT P.xml_payload)
+         COLUMNS
+           ack_code VARCHAR(10)  PATH 'edi:code',
+           ack_msg  VARCHAR(200) PATH 'edi:message'
+       ) AS X
+ WHERE P.batch_id = 'EDI20260622';
+</pre>
+
+<h2>FOR XML — Producing XML from SQL</h2>
+
+<p>The <strong>FOR XML</strong> clause serialises a result set as XML. Combined with <strong>XMLELEMENT</strong> and <strong>XMLFOREST</strong>, you have fine-grained control over the element names, attributes, and nesting structure — useful for generating EDI-compatible or SOAP-compatible XML documents directly from DB2 for i data.</p>
+
+<pre>
+-- Simple FOR XML AUTO — column names become element names
+SELECT ORDNUM, CUSTNUM, ORDAMT, CHAR(ORDDTE) AS ORDDTE
+  FROM ORDLIB.ORDHDR
+ WHERE CUSTNUM = 'CUST0042'
+ ORDER BY ORDDTE DESC
+ FOR XML AUTO;
+</pre>
+
+<p>Using XMLELEMENT and XMLFOREST for a specific XML structure:</p>
+
+<pre>
+-- Produce an order XML document with explicit element names
+SELECT XMLELEMENT(
+         NAME "Order",
+         XMLATTRIBUTES(H.ORDNUM AS "ordNum"),
+         XMLELEMENT(NAME "Customer",
+           XMLFOREST(
+             H.CUSTNUM   AS "custNum",
+             C.CUSTFNAM  AS "firstName",
+             C.CUSTLNAM  AS "lastName"
+           )
+         ),
+         XMLELEMENT(NAME "Total",    H.ORDAMT),
+         XMLELEMENT(NAME "Status",   H.ORDSTS),
+         XMLELEMENT(NAME "OrderDate", CHAR(H.ORDDTE)),
+         (SELECT XMLAGG(
+                   XMLELEMENT(
+                     NAME "Line",
+                     XMLATTRIBUTES(D.LINENUM AS "num"),
+                     XMLELEMENT(NAME "Item",  D.ITMNUM),
+                     XMLELEMENT(NAME "Qty",   D.QTY),
+                     XMLELEMENT(NAME "Price", D.UNITPRC)
+                   )
+                 )
+            FROM ORDLIB.ORDDET D
+           WHERE D.ORDNUM = H.ORDNUM)
+       ) AS order_xml
+  FROM ORDLIB.ORDHDR H
+  JOIN ORDLIB.CUSTMST C ON C.CUSTNUM = H.CUSTNUM
+ WHERE H.ORDNUM = 'ORD001234';
+</pre>
+
+<p>The result is a complete XML document fragment that can be returned to an EDI partner or stored in an XML payload table for outbound transmission.</p>
+
+<h2>Practical Pattern: REST Payload Processor Stored Procedure</h2>
+
+<p>This section presents a complete IBM i stored procedure that:</p>
+<ul>
+  <li>Accepts a JSON VARCHAR parameter representing an inbound REST order payload</li>
+  <li>Uses JSON_VALUE to extract the order header fields</li>
+  <li>Uses JSON_TABLE to shred the line items array</li>
+  <li>Inserts the header and details in a single transaction</li>
+  <li>Returns a JSON confirmation response using JSON_OBJECT</li>
+</ul>
+
+<pre>
+-- Create the order processing stored procedure
+CREATE OR REPLACE PROCEDURE ORDLIB.PROCESS_ORDER_JSON (
+    IN  p_payload    VARCHAR(32000),
+    OUT p_response   VARCHAR(4000)
+)
+LANGUAGE SQL
+MODIFIES SQL DATA
+BEGIN
+    DECLARE v_ord_num    VARCHAR(10);
+    DECLARE v_cust_num   VARCHAR(10);
+    DECLARE v_ord_amt    DECIMAL(11,2);
+    DECLARE v_new_ord    VARCHAR(10);
+    DECLARE v_line_count INTEGER DEFAULT 0;
+    DECLARE SQLSTATE     CHAR(5);
+
+    -- Extract header fields from JSON
+    SET v_ord_num  = JSON_VALUE(p_payload, '$.ordNum');
+    SET v_cust_num = JSON_VALUE(p_payload, '$.custNum');
+    SET v_ord_amt  = JSON_VALUE(p_payload, '$.total'
+                                RETURNING DECIMAL(11,2)
+                                DEFAULT 0.00 ON ERROR);
+
+    -- Generate internal order number
+    SET v_new_ord = 'ORD' || LPAD(NEXT VALUE FOR ORDLIB.ORDNUM_SEQ, 7, '0');
+
+    -- Insert order header
+    INSERT INTO ORDLIB.ORDHDR
+      (ORDNUM, EXTORDNUM, CUSTNUM, ORDAMT, ORDSTS, ORDDTE, ENTDTE)
+    VALUES
+      (v_new_ord, v_ord_num, v_cust_num,
+       v_ord_amt, 'N', CURRENT_DATE, CURRENT_TIMESTAMP);
+
+    -- Insert order detail rows from JSON array
+    INSERT INTO ORDLIB.ORDDET
+      (ORDNUM, LINENUM, ITMNUM, QTY, UNITPRC, LINEPRC, ENTDTE)
+    SELECT
+      v_new_ord,
+      ROW_NUMBER() OVER (ORDER BY T.item_id),
+      T.item_id,
+      T.qty,
+      T.unit_price,
+      T.qty * T.unit_price,
+      CURRENT_DATE
+    FROM JSON_TABLE(p_payload, '$.items[*]'
+           COLUMNS(
+             item_id    VARCHAR(20)   PATH '$.id',
+             qty        INTEGER       PATH '$.quantity',
+             unit_price DECIMAL(11,2) PATH '$.unitPrice'
+           )
+         ) AS T;
+
+    GET DIAGNOSTICS v_line_count = ROW_COUNT;
+
+    -- Build JSON confirmation response
+    SET p_response = JSON_OBJECT(
+      'success'    VALUE 'true',
+      'ordNum'     VALUE v_new_ord,
+      'extOrdNum'  VALUE v_ord_num,
+      'custNum'    VALUE v_cust_num,
+      'total'      VALUE v_ord_amt,
+      'linesInserted' VALUE v_line_count,
+      'processedAt' VALUE CHAR(CURRENT_TIMESTAMP)
+    );
+
+    COMMIT;
+
+END;
+</pre>
+
+<p>Calling the procedure from a Node.js IBM i REST handler using <code>itoolkit</code> or <code>odbc</code>:</p>
+
+<pre>
+/* Node.js REST handler calling the stored procedure */
+const odbc = require('odbc');
+
+async function processOrderPayload(jsonPayload) {
+    const conn = await odbc.connect(process.env.IBMI_DSN);
+
+    const stmt = await conn.callProc(
+        'ORDLIB.PROCESS_ORDER_JSON',
+        [jsonPayload, null]   /* IN payload, OUT response */
+    );
+
+    const response = stmt.parameters[1];  /* OUT parameter */
+    await conn.close();
+    return JSON.parse(response);
+}
+
+/* Express route handler */
+app.post('/api/orders', async (req, res) => {
+    const payload = JSON.stringify(req.body);
+    const result  = await processOrderPayload(payload);
+    res.status(result.success === 'true' ? 201 : 400).json(result);
+});
+</pre>
+
+<p>Calling the same procedure from RPG using embedded SQL:</p>
+
+<pre>
+**FREE
+ctl-opt dftactgrp(*no) actgrp(*caller);
+
+dcl-s payload  varchar(32000);
+dcl-s response varchar(4000);
+
+payload = '{"ordNum":"WEB12345","custNum":"CUST0042",' +
+          '"total":149.97,' +
+          '"items":[' +
+            '{"id":"SKU001","quantity":2,"unitPrice":19.99},' +
+            '{"id":"SKU002","quantity":1,"unitPrice":109.99}' +
+          ']}';
+
+exec sql CALL ORDLIB.PROCESS_ORDER_JSON(:payload, :response);
+
+if sqlcode = 0;
+  dsply (%subst(response : 1 : 52));
+else;
+  dsply ('Procedure failed SQLCODE=' + %char(sqlcode));
+endif;
+
+*inlr = *on;
+</pre>
+
+<p><strong>Key design decisions in the stored procedure:</strong></p>
+<ul>
+  <li>A sequence object (<code>ORDLIB.ORDNUM_SEQ</code>) generates the internal order number atomically — no gap or duplicate risk under concurrent load</li>
+  <li>The header INSERT and the JSON_TABLE-driven detail INSERT are in the same implicit transaction, committed together at the end; if either fails, neither is committed</li>
+  <li>GET DIAGNOSTICS captures ROW_COUNT after the detail INSERT so the response includes how many lines were processed — useful for the caller to validate against the payload's line count</li>
+  <li>The response is built with JSON_OBJECT rather than string concatenation, ensuring correct escaping of all values</li>
+</ul>
+
+<p>This pattern — a stored procedure as the single entry point for JSON payload processing — keeps transformation logic inside DB2 for i, makes the procedure testable directly in ACS Run SQL Scripts, and means the REST handler requires no JSON parsing logic of its own.</p>
+
+<em>Next post: IBM i Integration with Microsoft Azure — connecting IBM i to Azure Event Hubs for real-time streaming, Azure Blob Storage for data lake offload, Azure Service Bus for reliable messaging, and accessing Azure SQL from PASE using Python and Node.js.</em>

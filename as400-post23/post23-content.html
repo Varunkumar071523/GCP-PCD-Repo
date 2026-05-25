@@ -1,0 +1,273 @@
+The previous post covered DB2 for i — the integrated database layer. This post covers the security model that sits around everything on IBM i: user profiles, object authority, adopted authority, and the practical patterns IBM i shops use to control what programs and users can do.
+
+IBM i security is object-based. Every object — program, file, data area, command, library — has an owner and an authority profile. Access control is enforced at the object level by the operating system, not by application code. This is architecturally different from most platforms, where security is typically enforced by the application layer sitting in front of a database. On IBM i, even if an attacker bypasses the application, they still face object-level authority checks at the OS.
+
+<h2>Security levels</h2>
+
+The system value QSECURITY controls how strictly IBM i enforces security. Six levels exist; IBM i ships at level 40 by default. Level 50 is the hardest and is required for Common Criteria certification.
+
+<ul>
+<li><strong>Level 10</strong> — no password required, all users have all authority. Development and test use only; never production.</li>
+<li><strong>Level 20</strong> — password required but all users have authority to all objects. Legacy shops sometimes still run at this level.</li>
+<li><strong>Level 30</strong> — resource security enforced. Object authority matters. The minimum for any production system.</li>
+<li><strong>Level 40</strong> — same as 30, plus user-state programs cannot call supervisor-state APIs directly. Most production systems run at 40.</li>
+<li><strong>Level 50</strong> — same as 40, plus additional restrictions on passing data between programs and using unsupported interfaces. Required for PCI-DSS, HIPAA, and financial services compliance in most audits.</li>
+</ul>
+
+<pre>-- Check current security level
+SELECT CURRENT_VALUE FROM QSYS2.SYSTEM_VALUE_INFO
+WHERE  SYSTEM_VALUE_NAME = 'QSECURITY';</pre>
+
+<h2>User profiles</h2>
+
+Every process on IBM i runs under a user profile. A user profile is an object (*USRPRF) stored in QSYS. It contains the password, special authorities, initial menu, initial program, message queue, output queue, and home directory.
+
+<strong>Viewing user profile details:</strong>
+
+<pre>-- All user profiles and key attributes
+SELECT USER_NAME, STATUS, SPECIAL_AUTHORITIES,
+       USER_CLASS_NAME, MAXIMUM_STORAGE_ALLOWED,
+       DAYS_UNTIL_PASSWORD_EXPIRES
+FROM   QSYS2.USER_INFO
+ORDER  BY USER_NAME;
+
+-- Users with *ALLOBJ authority (the most powerful special authority)
+SELECT USER_NAME, STATUS
+FROM   QSYS2.USER_INFO
+WHERE  SPECIAL_AUTHORITIES LIKE '%*ALLOBJ%'
+  AND  STATUS = '*ENABLED'
+ORDER  BY USER_NAME;</pre>
+
+<strong>Creating a service account profile (minimal authority):</strong>
+
+<pre>CRTUSRPRF USRPRF(ORDAPI) +
+           PASSWORD(*NONE) +           /* no interactive sign-on */
+           USRCLS(*USER) +
+           SPCAUT(*NONE) +             /* no special authorities */
+           INLPGM(*NONE) +
+           INLMNU(*SIGNOFF) +          /* immediately sign off if interactive */
+           LMTCPB(*YES) +             /* limited capabilities — no command line */
+           TEXT('Order API service account')</pre>
+
+<code>LMTCPB(*YES)</code> prevents the profile from accessing a command line in a 5250 session. <code>PASSWORD(*NONE)</code> prevents interactive sign-on entirely — the profile can only run programs, not log in. These two controls together are the baseline for any service account.
+
+<strong>Special authorities (granted via SPCAUT parameter):</strong>
+
+<ul>
+<li><code>*ALLOBJ</code> — access to all objects regardless of authority settings. Equivalent to root. Only system administrators should have this.</li>
+<li><code>*SECADM</code> — create and manage user profiles. Does not grant *ALLOBJ.</li>
+<li><code>*JOBCTL</code> — control all jobs, subsystems, and output queues.</li>
+<li><code>*SPLCTL</code> — control all spooled files.</li>
+<li><code>*SAVSYS</code> — save and restore objects regardless of authority.</li>
+<li><code>*SERVICE</code> — run service tools (hardware diagnostics, PTF operations).</li>
+<li><code>*AUDIT</code> — change auditing settings.</li>
+<li><code>*IOSYSCFG</code> — configure I/O devices and communications.</li>
+</ul>
+
+Minimise special authorities rigorously. Most application service profiles need none.
+
+<h2>Object authority</h2>
+
+Every IBM i object has an owner and an authority profile. When a program or user attempts to access an object, the system checks authority in a specific sequence.
+
+<strong>Authority types:</strong>
+
+<ul>
+<li><code>*ALL</code> — full control including the ability to delete the object and change its authority</li>
+<li><code>*CHANGE</code> — read and write data; cannot delete the object or change authority</li>
+<li><code>*USE</code> — read-only access (for files: read records; for programs: call them; for libraries: list contents)</li>
+<li><code>*EXCLUDE</code> — explicitly denied; overrides *PUBLIC if set on a user or group</li>
+<li><code>*AUTL</code> — take authority from an authorisation list (see below)</li>
+</ul>
+
+<strong>Checking who has authority to an object:</strong>
+
+<pre>-- SQL view of object authority
+SELECT OBJECT_AUTHORITY, USER_PROFILE
+FROM   TABLE(QSYS2.OBJECT_PRIVILEGES(
+             OBJECT_SCHEMA => 'ORDLIB',
+             OBJECT_NAME   => 'ORDHDR',
+             OBJECT_TYPE   => '*FILE'))
+ORDER  BY USER_PROFILE;</pre>
+
+<strong>Granting authority:</strong>
+
+<pre>/* Grant *CHANGE to the order API service account */
+GRTOBJAUT OBJ(ORDLIB/ORDHDR) OBJTYPE(*FILE) USER(ORDAPI) AUT(*CHANGE)
+
+/* Grant *USE to all programs in ORDLIB to the order API */
+GRTOBJAUT OBJ(ORDLIB/*ALL) OBJTYPE(*PGM) USER(ORDAPI) AUT(*USE)
+
+/* Revoke *PUBLIC authority on a sensitive file */
+RVKOBJAUT OBJ(ORDLIB/PAYROLL) OBJTYPE(*FILE) USER(*PUBLIC) AUT(*ALL)</pre>
+
+<strong>Authority checking sequence:</strong>
+
+When a user or program attempts to access an object, IBM i checks in this order:
+<ol>
+<li>Does the user have <code>*ALLOBJ</code>? If yes, access granted.</li>
+<li>Is the user the object owner? If yes, owner authority applies.</li>
+<li>Does the user have specific authority granted directly to their profile?</li>
+<li>Does any group profile the user belongs to have authority?</li>
+<li>Does an authorisation list referenced by the object grant authority?</li>
+<li>What is <code>*PUBLIC</code> authority for the object?</li>
+<li>If none of the above grant access — access denied.</li>
+</ol>
+
+<h2>Adopted authority</h2>
+
+Adopted authority is one of IBM i's most important and most misunderstood security features. When a program is created with <code>USRPRF(*OWNER)</code>, it runs with the authority of its owner, not the authority of the user calling it. The calling user "adopts" the owner's authority for the duration of that program's execution.
+
+<strong>Why adopted authority matters:</strong>
+
+It allows controlled privilege elevation without giving users broad authority. An order entry operator has *EXCLUDE to the inventory adjustment file — they cannot access it directly. But the inventory adjustment program, owned by a profile with *CHANGE to that file, runs with adopted authority. The operator can call the program and the program can update the file. The operator cannot update the file directly.
+
+<strong>Creating a program with adopted authority:</strong>
+
+<pre>CRTBNDRPG PGM(ORDLIB/INVADJ) SRCSTMF('/repo/src/rpgle/INVADJ.rpgle') +
+           USRPRF(*OWNER) +
+           DBGVIEW(*SOURCE)</pre>
+
+<strong>Verifying adopted authority settings:</strong>
+
+<pre>SELECT PROGRAM_NAME, PROGRAM_LIBRARY, PROGRAM_OWNER,
+       USER_PROFILE, USE_ADOPTED_AUTHORITY
+FROM   QSYS2.PROGRAM_INFO
+WHERE  PROGRAM_LIBRARY = 'ORDLIB'
+ORDER  BY PROGRAM_NAME;</pre>
+
+<strong>Adopted authority and ILE call stacks:</strong> In ILE, adopted authority flows through the call stack. If program A (USRPRF(*OWNER)) calls program B (USRPRF(*USER)), B does not adopt A's owner's authority — it runs under the original user's authority. If B also has USRPRF(*OWNER), it adopts its own owner's authority. Be deliberate about this in ILE service program design.
+
+<h2>Group profiles and authorisation lists</h2>
+
+<strong>Group profiles</strong> allow authority to be managed at a role level rather than individual user level. A user profile specifies its group profile with the GRPPRF parameter.
+
+<pre>/* Create a group profile for order entry operators */
+CRTUSRPRF USRPRF(ORDENTRY) PASSWORD(*NONE) USRCLS(*USER) TEXT('Order entry operators group')
+
+/* Assign a user to the group */
+CHGUSRPRF USRPRF(JSMITH) GRPPRF(ORDENTRY)
+
+/* Grant the group authority to order files */
+GRTOBJAUT OBJ(ORDLIB/ORDHDR) OBJTYPE(*FILE) USER(ORDENTRY) AUT(*CHANGE)
+GRTOBJAUT OBJ(ORDLIB/ORDLIN) OBJTYPE(*FILE) USER(ORDENTRY) AUT(*CHANGE)</pre>
+
+<strong>Authorisation lists</strong> (*AUTL) are objects that hold authority entries for multiple users. Securing an object to an authorisation list means managing authority in one place rather than on each object individually.
+
+<pre>/* Create an authorisation list */
+CRTAUTL AUTL(ORDFILES) TEXT('Authority list for order files')
+
+/* Grant authority entries on the list */
+ADDAUTLE AUTL(ORDFILES) USER(ORDENTRY) AUT(*CHANGE)
+ADDAUTLE AUTL(ORDFILES) USER(ORDAPI)   AUT(*CHANGE)
+ADDAUTLE AUTL(ORDFILES) USER(*PUBLIC)  AUT(*EXCLUDE)
+
+/* Secure files to the authorisation list */
+GRTOBJAUT OBJ(ORDLIB/ORDHDR) OBJTYPE(*FILE) USER(*AUTL) AUTL(ORDFILES)
+GRTOBJAUT OBJ(ORDLIB/ORDLIN) OBJTYPE(*FILE) USER(*AUTL) AUTL(ORDFILES)</pre>
+
+Now adding a new service account to the order files only requires one <code>ADDAUTLE</code> command — not one <code>GRTOBJAUT</code> per file.
+
+<h2>IBM i auditing</h2>
+
+IBM i writes security-relevant events to the security audit journal QAUDJRN in library QSYS. This journal captures object authority failures, user profile changes, object deletions, and many other events. It is the primary source of truth for security investigations and compliance audits.
+
+<strong>Enabling auditing:</strong>
+
+<pre>/* Enable system-wide auditing */
+CHGSECAUD QAUDLVL(*AUTFAIL *SECURITY *PGMADP *OBJMGT)
+/* *AUTFAIL — log authority failures
+   *SECURITY — log security changes
+   *PGMADP   — log program adopted authority use
+   *OBJMGT   — log object management (create, delete, rename) */</pre>
+
+<strong>Querying the audit journal with SQL:</strong>
+
+<pre>-- Recent authority failures (AF journal entries)
+SELECT ENTRY_TIMESTAMP, USER_NAME, OBJECT_LIBRARY,
+       OBJECT_NAME, OBJECT_TYPE, VIOLATION_TYPE
+FROM   TABLE(QSYS2.DISPLAY_JOURNAL(
+             JOURNAL_LIBRARY => 'QSYS',
+             JOURNAL_NAME    => 'QAUDJRN',
+             JOURNAL_ENTRY_TYPES => 'AF',
+             STARTING_TIMESTAMP  => CURRENT_TIMESTAMP - 24 HOURS))
+ORDER  BY ENTRY_TIMESTAMP DESC
+FETCH FIRST 100 ROWS ONLY;
+
+-- Profile changes in the last 7 days
+SELECT ENTRY_TIMESTAMP, USER_NAME, ENTRY_TYPE, OBJECT_NAME
+FROM   TABLE(QSYS2.DISPLAY_JOURNAL(
+             JOURNAL_LIBRARY     => 'QSYS',
+             JOURNAL_NAME        => 'QAUDJRN',
+             JOURNAL_ENTRY_TYPES => 'CP',
+             STARTING_TIMESTAMP  => CURRENT_TIMESTAMP - 7 DAYS))
+ORDER  BY ENTRY_TIMESTAMP DESC;</pre>
+
+<h2>Row and Column Access Control (RCAC)</h2>
+
+RCAC (available from IBM i 7.1 TR5) allows SQL tables to restrict access at the row and column level based on who is running the query. This is a database-level control, not an application-level control.
+
+<strong>Row permission — users can only see their own region's orders:</strong>
+
+<pre>CREATE PERMISSION ORDLIB.ORDHDR_REGION_PERM
+    ON ORDLIB.ORDHDR
+    FOR ROWS WHERE REGION = (
+        SELECT REGION FROM ORDLIB.USRREGION
+        WHERE  USRNAME = SESSION_USER
+    )
+    ENFORCED FOR ALL ACCESS
+    ENABLE;</pre>
+
+<strong>Column mask — hide credit card numbers except for authorised users:</strong>
+
+<pre>CREATE MASK ORDLIB.PAYMENT_MASK
+    ON ORDLIB.PAYINFO
+    FOR COLUMN CARDNUM
+    RETURN CASE
+        WHEN VERIFY_GROUP_FOR_USER(SESSION_USER, 'PAYMENTADMIN') = 1
+        THEN CARDNUM
+        ELSE 'XXXX-XXXX-XXXX-' || SUBSTR(CARDNUM, 16, 4)
+    END
+    ENABLE;</pre>
+
+RCAC rules are enforced transparently — existing RPG programs and JDBC queries are automatically filtered without code changes. This is the cleanest way to enforce data-level security across all access paths.
+
+<h2>Practical security patterns</h2>
+
+<strong>Least-privilege service account checklist:</strong>
+<ul>
+<li><code>PASSWORD(*NONE)</code> — prevent interactive sign-on</li>
+<li><code>LMTCPB(*YES)</code> — no command line</li>
+<li><code>SPCAUT(*NONE)</code> — no special authorities</li>
+<li><code>INLMNU(*SIGNOFF)</code> — sign off immediately if interactive session is somehow started</li>
+<li>Grant only the specific object authorities the profile needs — *CHANGE to files it writes, *USE to files it reads, *USE to programs it calls</li>
+<li>Use adopted authority in programs rather than granting authority directly to service accounts where possible</li>
+</ul>
+
+<strong>Auditing unused profiles:</strong>
+
+<pre>SELECT USER_NAME, LAST_USED_TIMESTAMP, STATUS,
+       DAYS_UNTIL_PASSWORD_EXPIRES
+FROM   QSYS2.USER_INFO
+WHERE  STATUS = '*ENABLED'
+  AND  (LAST_USED_TIMESTAMP < CURRENT_TIMESTAMP - 90 DAYS
+    OR  LAST_USED_TIMESTAMP IS NULL)
+ORDER  BY LAST_USED_TIMESTAMP NULLS FIRST;</pre>
+
+Profiles not used in 90 days should be reviewed and disabled if no longer needed. Dormant enabled profiles are the most common audit finding on IBM i systems.
+
+<strong>Checking *PUBLIC authority on sensitive libraries:</strong>
+
+<pre>SELECT OBJECT_NAME, OBJECT_TYPE, OBJECT_ATTRIBUTE,
+       PUBLIC_AUTHORITY
+FROM   QSYS2.OBJECT_PRIVILEGES
+WHERE  OBJECT_SCHEMA = 'ORDLIB'
+  AND  USER_PROFILE  = '*PUBLIC'
+  AND  PUBLIC_AUTHORITY NOT IN ('*EXCLUDE', '*USE')
+ORDER  BY OBJECT_TYPE, OBJECT_NAME;</pre>
+
+Any object in a production library where *PUBLIC has *CHANGE or *ALL authority is a security exposure. Production libraries should have *PUBLIC *EXCLUDE at the library level, with authority granted only to specific profiles.
+
+IBM i security is deep and well-designed. The object authority model, adopted authority, and built-in auditing give IBM i shops the tools to meet strict compliance requirements without third-party add-ons. The challenge is not capability — it is operational discipline in maintaining least-privilege configurations as systems evolve.
+
+<em>Next post: The IBM i IFS — the Integrated File System, stream files, directories, how the IFS relates to the library system, working with IFS from RPG and CL, Git in the IFS, and why the IFS matters for modern IBM i development.</em>

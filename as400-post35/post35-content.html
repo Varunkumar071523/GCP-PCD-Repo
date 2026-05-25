@@ -1,0 +1,513 @@
+<p>The previous post covered IBM i PTF management and OS upgrades — understanding PTF types, using <strong>WRKPTF</strong> and <strong>DSPPTF</strong>, managing SF99xxx group PTFs, and planning a Technology Refresh. This post covers display files and 5250 UX modernisation: the DDS-based screen programming model that has driven IBM i operator interfaces for decades, how RPG interacts with those screens, subfile programming, indicator management, and the realistic options for replacing or augmenting green-screen interfaces with modern web front-ends in 2026.</p>
+
+<h2>What Display Files Are</h2>
+
+<p>A <strong>display file</strong> (DSPF) is a compiled IBM i object that describes one or more screen record formats. Each record format defines fields, their positions, display attributes, function-key indicators, and error messages. The file is created from DDS (Data Description Specifications) source using the <strong>CRTDSPF</strong> command. The resulting <code>*FILE</code> object of type <code>DSPF</code> lives in a library and is opened by an RPG, COBOL, or CL program just like a database file.</p>
+
+<p>When a program opens a display file and writes a record format to it, the 5250 data stream is sent to the workstation session. The operator sees the rendered screen, fills in fields, and presses a function key or Enter. The program then reads the record format back, receiving the field data and the active indicator that identifies which key was pressed.</p>
+
+<p>Display files are compiled objects — changes to the DDS source require recompiling the DSPF and, in many cases, recompiling the RPG program that references it (if level-check is active). This is one reason display file changes have traditionally required a change-control window.</p>
+
+<h2>Basic DDS Display File Syntax</h2>
+
+<p>DDS source for a display file lives in a source physical file — typically <code>QDDSSRC</code> in your development library. Each line follows a fixed-column layout:</p>
+
+<ul>
+  <li>Columns 6–16: record/field name area</li>
+  <li>Column 17: type indicator (R = record format, blank = field)</li>
+  <li>Column 38 onward: keywords</li>
+</ul>
+
+<p>A minimal single-record display file looks like this:</p>
+
+<pre>
+     A          R CUSTINQ                    CF03(03 'Exit')
+     A                                       CF12(12 'Cancel')
+     A                                       BLINK
+     A                                       OVERLAY
+     A                                       MSGLOC(24)
+     A            CUSTNO         6Y 0B  8 10EDTCDE(Z)
+     A                                       DSPATR(UL)
+     A            CUSTNM        40A  O  8 20
+     A            ERRMSG1       79A  O 24  2
+     A                                       DSPATR(HI)
+</pre>
+
+<p>Key DDS keywords explained:</p>
+
+<ul>
+  <li><strong>CF03(03 'Exit')</strong> — assigns indicator 03 when F3 is pressed</li>
+  <li><strong>CF12(12 'Cancel')</strong> — assigns indicator 12 when F12 is pressed</li>
+  <li><strong>BLINK</strong> — cursor blinks on this record</li>
+  <li><strong>OVERLAY</strong> — writes this record without erasing other records already on screen</li>
+  <li><strong>MSGLOC(24)</strong> — message line is row 24</li>
+  <li><strong>B</strong> (column 38, usage) — input/output field (both input and output)</li>
+  <li><strong>O</strong> — output-only field</li>
+  <li><strong>DSPATR(UL)</strong> — underline display attribute</li>
+  <li><strong>DSPATR(HI)</strong> — high-intensity (bright) display attribute</li>
+  <li><strong>EDTCDE(Z)</strong> — edit code Z (suppress leading zeros)</li>
+</ul>
+
+<p>Conditional keywords use indicator conditioning. For example, to show an error message only when indicator 50 is on:</p>
+
+<pre>
+     A          R CUSTINQ
+     A  50         ERRMSG('Customer not found' 50)
+     A            CUSTNO         6Y 0B  8 10
+</pre>
+
+<p>The <code>50</code> in column 9 means the keyword applies only when IN50 is set to <code>'1'</code> before the write.</p>
+
+<h2>Creating a Display File with CRTDSPF</h2>
+
+<p>Compile a display file from DDS source with:</p>
+
+<pre>
+CRTDSPF FILE(DEVLIB/CUSTINQDF)
+        SRCFILE(DEVLIB/QDDSSRC)
+        SRCMBR(CUSTINQDF)
+        AUT(*USE)
+        TEXT('Customer Inquiry Display File')
+</pre>
+
+<p>Here is a more complete DDS example — a customer inquiry screen with a header record and a detail record:</p>
+
+<pre>
+     A*  ============================================================
+     A*  CUSTINQDF - Customer Inquiry Display File
+     A*  ============================================================
+     A                                       DSPSIZ(24 80 *DS3)
+     A                                       PRINT
+     A                                       INDARA
+     A*
+     A*  -- Header record (constant text, title, function key legend) --
+     A          R HEADER
+     A                                       OVERLAY
+     A                                       1  2'AS400 DECODED'
+     A                                       1 30'CUSTOMER INQUIRY'
+     A                                       DSPATR(HI)
+     A                                       1 65DATE
+     A                                       EDTCDE(Y)
+     A                                       1 75TIME
+     A                                       23  2'F3=Exit'
+     A                                       23 12'F5=Refresh'
+     A                                       23 25'F12=Cancel'
+     A*
+     A*  -- Detail record (input/output fields) ----------------------
+     A          R DETAIL                     CF03(03 'Exit')
+     A                                       CF05(05 'Refresh')
+     A                                       CF12(12 'Cancel')
+     A                                       OVERLAY
+     A                                       MSGLOC(24)
+     A  50         ERRMSG('Customer number not found' 50)
+     A  51         ERRMSG('Customer number is required' 51)
+     A            PROMCUST      30A  O  5  2VALUE('Enter Customer Number:')
+     A            CUSTNO         6Y 0B  5 35EDTCDE(Z)
+     A                                       DSPATR(UL)
+     A                                       CHECK(RZ)
+     A  30         DSPATR(PR)
+     A            CUSTNM        40A  O  8  5
+     A            CUSTADDR      40A  O  9  5
+     A            CUSTCITY      30A  O 10  5
+     A            CUSTSTATE      2A  O 10 38
+     A            CUSTZIP       10A  O 10 43
+     A            CUSTPHONE     15A  O 12  5
+     A            CUSTSTATUS    10A  O 13  5
+     A                                       DSPATR(HI)
+</pre>
+
+<p>The <strong>INDARA</strong> keyword at the file level tells the system to use a separate 99-byte indicator area rather than embedding indicators within the data buffer — this is the modern approach and required for the free-format RPG indicator techniques shown below.</p>
+
+<p>The <strong>DSPSIZ(24 80 *DS3)</strong> keyword specifies a 24-row by 80-column display in 3270-compatible mode, the standard 5250 terminal size. <strong>CHECK(RZ)</strong> right-adjusts and zero-fills a numeric input field.</p>
+
+<h2>RPG Free-Format Display File I/O</h2>
+
+<p>In free-format RPG IV (ILE RPG), you declare a display file in the file definition using <code>DCL-F</code>:</p>
+
+<pre>
+**FREE
+Ctl-Opt DftActGrp(*No) ActGrp('CUSTINQ') Option(*SrcStmt *NoDebugIO);
+
+// ── File declarations ────────────────────────────────────────────────
+DCL-F CUSTINQDF WORKSTN INDDS(Indic) INFDS(WsInfo) USROPN;
+
+// ── Indicator data structure (maps to the 99-byte INDARA) ────────────
+DCL-DS Indic LEN(99);
+  In03  IND  POS(3);    // F3 = Exit
+  In05  IND  POS(5);    // F5 = Refresh
+  In12  IND  POS(12);   // F12 = Cancel
+  In30  IND  POS(30);   // Protect CUSTNO field
+  In50  IND  POS(50);   // Customer not found error
+  In51  IND  POS(51);   // Customer number required error
+END-DS;
+
+// ── File information data structure ─────────────────────────────────
+DCL-DS WsInfo INFDS(CUSTINQDF);
+  WsFunction  CHAR(1)  POS(369);  // AID byte (function key pressed)
+END-DS;
+
+// ── Standalone fields ────────────────────────────────────────────────
+DCL-S WkCustNo  PACKED(6:0);
+DCL-S WkCustNm  CHAR(40);
+DCL-S WkAddr    CHAR(40);
+DCL-S WkCity    CHAR(30);
+DCL-S WkState   CHAR(2);
+DCL-S WkZip     CHAR(10);
+DCL-S WkPhone   CHAR(15);
+DCL-S WkStatus  CHAR(10);
+
+// ────────────────────────────────────────────────────────────────────
+// Main procedure
+// ────────────────────────────────────────────────────────────────────
+DCL-PROC Main;
+  OPEN CUSTINQDF;
+  WRITE HEADER;
+
+  DOW '1';
+    // Clear error indicators before each display
+    In50 = *OFF;
+    In51 = *OFF;
+    In30 = *OFF;
+
+    EXFMT DETAIL;  // Write screen to workstation, wait for keypress
+
+    SELECT;
+      WHEN In03 = *ON;   // F3 pressed — exit
+        LEAVE;
+      WHEN In12 = *ON;   // F12 pressed — cancel / return to menu
+        LEAVE;
+      WHEN In05 = *ON;   // F5 pressed — refresh without processing
+        ITER;
+      OTHER;             // Enter pressed — process the request
+        EXSR ReadCustomer;
+    ENDSL;
+  ENDDO;
+
+  CLOSE CUSTINQDF;
+  *INLR = *ON;
+END-PROC;
+
+// ────────────────────────────────────────────────────────────────────
+// Subroutine: read customer from DB2 for i
+// ────────────────────────────────────────────────────────────────────
+DCL-PROC ReadCustomer;
+  IF WkCustNo = 0;
+    In51 = *ON;   // Required field
+    RETURN;
+  ENDIF;
+
+  // Chain to CUSTMST physical file
+  CHAIN WkCustNo CUSTMST;
+
+  IF %FOUND(CUSTMST);
+    WkCustNm  = CMNAME;
+    WkAddr    = CMADDR;
+    WkCity    = CMCITY;
+    WkState   = CMSTATE;
+    WkZip     = CMZIP;
+    WkPhone   = CMPHONE;
+    WkStatus  = CMSTATUS;
+    In30 = *ON;   // Protect the CUSTNO field — show result, don't allow edit
+  ELSE;
+    In50 = *ON;   // Customer not found
+    WkCustNm  = *BLANKS;
+    WkAddr    = *BLANKS;
+  ENDIF;
+END-PROC;
+</pre>
+
+<p>Key points in this code:</p>
+
+<ul>
+  <li><strong>INDDS(Indic)</strong> — binds the file's indicator area to the <code>Indic</code> data structure, so you reference named Boolean fields (<code>In03</code>, <code>In50</code>) instead of <code>*IN03</code>, <code>*IN50</code>.</li>
+  <li><strong>EXFMT</strong> — a combined WRITE + READ. It sends the record format to the screen and waits for the operator to respond. This is the standard display file interaction verb.</li>
+  <li><strong>CHAIN</strong> — random read by key from a database file; <code>%FOUND</code> tests whether the record was located.</li>
+  <li>Indicators are set to <code>*ON</code> or <code>*OFF</code> before each <strong>EXFMT</strong>, controlling conditional DDS keywords such as <strong>ERRMSG</strong> and <strong>DSPATR(PR)</strong>.</li>
+</ul>
+
+<h2>Subfile Programming</h2>
+
+<p>A <strong>subfile</strong> is a scrollable list of records displayed within a display file. It requires two record formats: the <strong>SFL</strong> (subfile) record that defines one row of the list, and the <strong>SFLCTL</strong> (subfile control) record that manages the overall subfile — page size, display, clear, and end-of-file markers.</p>
+
+<p>DDS for a basic order-list subfile:</p>
+
+<pre>
+     A*  ORDLISTDF - Order List Subfile Display File
+     A                                       DSPSIZ(24 80 *DS3)
+     A                                       INDARA
+     A*
+     A*  -- Subfile record (one row per order) -----------------------
+     A          R ORDROW                     SFL
+     A            SFLRRN         4Y 0H
+     A            ORDNUM         7Y 0O  8  3EDTCDE(Z)
+     A            ORDDATE        L   O  8 13EDTCDE(Y)
+     A            CUSTNUM        6Y 0O  8 22EDTCDE(Z)
+     A            ORDAMT        11Y 2O  8 32EDTCDE(1)
+     A            ORDSTAT       10A  O  8 47
+     A*
+     A*  -- Subfile control record ------------------------------------
+     A          R ORDCTL                     SFLCTL(ORDROW)
+     A                                       CF03(03 'Exit')
+     A                                       CF07(07 'Page Up')
+     A                                       CF08(08 'Page Down')
+     A                                       OVERLAY
+     A                                       SFLSIZ(0200)
+     A                                       SFLPAG(0014)
+     A  41                                   SFLDSP
+     A  42                                   SFLDSPCTL
+     A  43                                   SFLCLR
+     A  44                                   SFLEND(*MORE)
+     A                                        6  3'Order#'
+     A                                        6 13'Date'
+     A                                        6 22'Cust#'
+     A                                        6 32'Amount'
+     A                                        6 47'Status'
+     A                                       DSPATR(HI)
+</pre>
+
+<p>In this DDS, four indicators on <strong>SFLCTL</strong> control the subfile lifecycle:</p>
+
+<ul>
+  <li><strong>IN41</strong> on &rarr; <strong>SFLDSP</strong>: display the subfile records</li>
+  <li><strong>IN42</strong> on &rarr; <strong>SFLDSPCTL</strong>: display the control record (the header row with column labels)</li>
+  <li><strong>IN43</strong> on &rarr; <strong>SFLCLR</strong>: clear the subfile before loading new records</li>
+  <li><strong>IN44</strong> on &rarr; <strong>SFLEND(*MORE)</strong>: show "+ More" at the bottom when more records exist</li>
+</ul>
+
+<p>The RPG subfile loading loop in free format:</p>
+
+<pre>
+**FREE
+// ── Subfile load procedure ─────────────────────────────────────────
+DCL-PROC LoadOrderSubfile;
+
+  DCL-S SubRrn    PACKED(4:0) INZ(0);
+  DCL-S MaxRows   PACKED(4:0) INZ(0);
+
+  // Step 1: Clear the existing subfile
+  In43 = *ON;    // SFLCLR on
+  In41 = *OFF;   // SFLDSP off (must be off during clear)
+  In42 = *OFF;   // SFLDSPCTL off
+  In44 = *OFF;   // SFLEND off
+  WRITE ORDCTL;
+  In43 = *OFF;   // Turn clear off after write
+
+  // Step 2: Load records into the subfile
+  SubRrn = 0;
+  MaxRows = 0;
+  SETLL *LOVAL ORDHDR;
+
+  DOW '1';
+    READ ORDHDR;
+    IF %EOF(ORDHDR);
+      LEAVE;
+    ENDIF;
+
+    SubRrn += 1;
+    SFLRRN  = SubRrn;
+    ORDNUM  = OHORDNO;
+    ORDDATE = OHORDT;
+    CUSTNUM = OHCUST;
+    ORDAMT  = OHAMT;
+    ORDSTAT = OHSTAT;
+
+    WRITE ORDROW;
+    MaxRows += 1;
+
+    IF MaxRows >= 1000;   // Safety limit — prevent runaway loads
+      LEAVE;
+    ENDIF;
+  ENDDO;
+
+  // Step 3: Display the subfile
+  IF MaxRows > 0;
+    In41 = *ON;    // SFLDSP on — show records
+    In42 = *ON;    // SFLDSPCTL on — show control / header
+    In44 = *OFF;   // SFLEND: turn on if truncated at limit
+    IF MaxRows >= 1000;
+      In44 = *ON;
+    ENDIF;
+  ELSE;
+    In41 = *OFF;   // No records — just show the control header
+    In42 = *ON;
+  ENDIF;
+
+  EXFMT ORDCTL;    // Display and wait for operator response
+
+END-PROC;
+</pre>
+
+<p>Paging in subfiles is handled automatically by the 5250 data stream when <strong>SFLPAG</strong> and <strong>SFLSIZ</strong> are set. <strong>SFLPAG(0014)</strong> means 14 rows are visible at once; <strong>SFLSIZ(0200)</strong> means the subfile buffer holds up to 200 records. The terminal handles Page Up / Page Down scrolling within the already-loaded buffer without RPG involvement.</p>
+
+<p>For very large result sets, a <strong>paginate-on-demand</strong> approach loads one page at a time. The program tracks the current page cursor, reloads the subfile on each Page Down keypress, and adjusts <strong>SFLEND</strong> accordingly.</p>
+
+<h2>Indicator Variables in Free RPG</h2>
+
+<p>IBM i display files rely heavily on indicators — 99 numbered single-bit flags that control screen behaviour. In traditional fixed-format RPG, these were referenced as <code>*IN03</code>, <code>*IN50</code> etc., scattered throughout the program with little documentation of meaning. This is the classic "indicator spaghetti".</p>
+
+<p>Free-format RPG with <strong>INDARA</strong> and a named indicator data structure eliminates this problem:</p>
+
+<pre>
+**FREE
+// Named indicator data structure — maps to the 99-byte INDARA buffer
+DCL-DS Ind LEN(99);
+  // Navigation
+  KF3_Exit        IND  POS(3);
+  KF5_Refresh     IND  POS(5);
+  KF12_Cancel     IND  POS(12);
+  // Screen control
+  ProtectInput    IND  POS(30);
+  // Error conditions
+  ErrNotFound     IND  POS(50);
+  ErrRequired     IND  POS(51);
+  ErrDuplicate    IND  POS(52);
+  ErrDateRange    IND  POS(53);
+  // Subfile control
+  SflDisplay      IND  POS(41);
+  SflDisplayCtl   IND  POS(42);
+  SflClear        IND  POS(43);
+  SflMoreRecords  IND  POS(44);
+END-DS;
+</pre>
+
+<p>With named indicators, every reference in the RPG code is self-documenting. Setting <code>ErrNotFound = *ON</code> is immediately clear; setting <code>*IN50 = *ON</code> is not. The rule is simple: <strong>always use INDARA with a named DS</strong> in any new or refactored display file program.</p>
+
+<p>Another technique is to define a separate indicator DS per record format, keeping each record's indicator set cleanly isolated:</p>
+
+<pre>
+// Per-record indicator DSes
+DCL-DS DetailInd LEN(99);
+  DI_F3Exit     IND  POS(3);
+  DI_F12Cancel  IND  POS(12);
+  DI_Protect    IND  POS(30);
+  DI_ErrMsg1    IND  POS(50);
+END-DS;
+
+DCL-DS SflInd LEN(99);
+  SI_F3Exit     IND  POS(3);
+  SI_F7PageUp   IND  POS(7);
+  SI_F8PageDown IND  POS(8);
+  SI_SflDsp     IND  POS(41);
+  SI_SflDspCtl  IND  POS(42);
+  SI_SflClr     IND  POS(43);
+  SI_SflEnd     IND  POS(44);
+END-DS;
+</pre>
+
+<p>Both DSes share the same underlying 99-byte INDARA buffer (because the display file was opened with a single <code>INDDS</code> reference). Positions overlap intentionally — indicators 3 (F3) and 12 (F12) appear in both because both records respond to those keys.</p>
+
+<h2>Modernisation Path Options</h2>
+
+<p>IBM i 5250 green-screen applications continue to run reliably in 2026. However, there are legitimate business drivers to modernise: training new staff on 5250 terminals is harder, customers increasingly expect web or mobile interfaces, and organisations want consistent UX standards across all their applications. The choices are not binary.</p>
+
+<h2>Option 1 — Profound UI and Screen Transformation Tools</h2>
+
+<p><strong>Profound UI</strong> (from Profound Logic) intercepts the 5250 data stream and dynamically renders the screen content as a web page in a browser. No RPG source changes are required for a basic transformation. The tool parses record format metadata from the compiled DSPF object and maps fields to HTML/CSS elements.</p>
+
+<p>A basic Profound UI configuration entry (in its Node.js-based server configuration):</p>
+
+<pre>
+// profound_config.js (excerpt)
+module.exports = {
+  host:     'ibmi.example.com',
+  port:      23,                // Standard Telnet / 5250 port
+  ssl:       true,
+  sslPort:   992,
+  theme:     'carbon',          // IBM Carbon design system
+  appName:   'AS400 Decoded Customer Inquiry',
+  screenMap: {
+    'CUSTINQDF/DETAIL': {
+      layout: 'responsive',
+      fieldOverrides: {
+        CUSTNO: { type: 'number', label: 'Customer Number', placeholder: 'Enter 6-digit ID' },
+        CUSTNM: { type: 'text',   label: 'Customer Name',   readOnly: true },
+      }
+    }
+  }
+};
+</pre>
+
+<p><strong>Lansa</strong> offers a similar transformation product. Both tools sit in front of the existing 5250 application, meaning your existing RPG investment is preserved. The limitation is that the underlying UX remains constrained by what 5250 can represent — you cannot add drag-and-drop or real-time charts without also changing the RPG source.</p>
+
+<h2>Option 2 — Node.js REST API Approach</h2>
+
+<p>This approach, discussed in earlier posts in this series, builds a new web front-end that calls IBM i business logic via REST APIs rather than via display files. The display file RPG program is refactored to separate the business logic into a service program (<code>*SRVPGM</code>), which is then exposed via a Node.js or PHP REST layer:</p>
+
+<pre>
+// ibmi-customer-api.js — Node.js REST layer calling DB2 for i via ODBC
+const express  = require('express');
+const odbc     = require('odbc');
+const app      = express();
+app.use(express.json());
+
+const DB_CONN  = 'DSN=IBMI_PROD;UID=APIUSER;PWD=secret';
+
+app.get('/api/customers/:id', async (req, res) => {
+  let conn;
+  try {
+    conn = await odbc.connect(DB_CONN);
+    const custNo = parseInt(req.params.id, 10);
+    if (isNaN(custNo) || custNo <= 0) {
+      return res.status(400).json({ error: 'Invalid customer number' });
+    }
+    const result = await conn.query(
+      `SELECT CMNO, CMNAME, CMADDR, CMCITY, CMSTATE, CMZIP, CMPHONE, CMSTATUS
+         FROM ORDLIB.CUSTMST
+        WHERE CMNO = ?`,
+      [custNo]
+    );
+    if (result.length === 0) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+    const row = result[0];
+    res.json({
+      customerNumber: row.CMNO,
+      name:           row.CMNAME.trim(),
+      address:        row.CMADDR.trim(),
+      city:           row.CMCITY.trim(),
+      state:          row.CMSTATE.trim(),
+      postCode:       row.CMZIP.trim(),
+      phone:          row.CMPHONE.trim(),
+      status:         row.CMSTATUS.trim(),
+    });
+  } catch (err) {
+    console.error('DB error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    if (conn) await conn.close();
+  }
+});
+
+app.listen(3000, () => console.log('Customer API listening on port 3000'));
+</pre>
+
+<p>The web front-end — React, Vue, or plain HTML — calls this API. The 5250 display file is retired. The RPG business logic (validation, calculations, workflow) is preserved in the service program and called by the API layer. This is the most complete modernisation but requires the most investment.</p>
+
+<h2>Option 3 — IBM i Access Client Solutions</h2>
+
+<p><strong>IBM i Access Client Solutions (ACS)</strong> is IBM's free downloadable Java application that provides 5250 emulation with a modern GUI shell, database browsing, IFS navigator, and SQL scripting. It is the recommended replacement for the older System i Navigator and iSeries Access for Windows clients.</p>
+
+<p>For organisations that need to retain 5250 access but want a supportable, modern-looking client, ACS is the pragmatic choice. Its 5250 emulator supports macros, keyboard remapping, and screen customisation via GUI configuration — without touching IBM i source code. Deploying ACS across the organisation standardises the client environment and removes dependency on ageing PC hardware that ran the old ActiveX-based clients.</p>
+
+<pre>
+# ACS deployment via silent install (Windows, MSI wrapper)
+msiexec /i "IBMiACS.msi" /quiet /norestart ^
+  INSTALLDIR="C:\Program Files\IBM\ClientSolutions" ^
+  ADDLOCAL=ALL ^
+  /l*v "C:\Logs\acs_install.log"
+</pre>
+
+<h2>When Green Screen Is Still Valid</h2>
+
+<p>Not every IBM i interface needs a web UI. There are categories of screen that are legitimate long-term green-screen citizens in 2026:</p>
+
+<ul>
+  <li><strong>Internal operational tools</strong> — batch job submission screens, WRKJOB, WRKSPLF, STRSEU: these are used by IBMi-skilled staff who are faster on 5250 than on any web equivalent.</li>
+  <li><strong>DBA and system administration screens</strong> — STRSQL, WRKOBJ, WRKLIBPDM: these are purpose-built for IBM i expertise and require no modernisation.</li>
+  <li><strong>High-frequency data-entry screens</strong> — order entry used by trained operators who have memorised keystrokes. 5250 is exceptionally fast for keyboard-centric, eyes-on-data entry: no mouse, no tab-to-next-field confusion, direct function-key navigation.</li>
+  <li><strong>Screens that are genuinely stable</strong> — if a screen has not changed in 10 years and the users are content, the ROI of modernisation is negative.</li>
+</ul>
+
+<p>The modernisation decision should be driven by user pain, business requirements, or integration needs — not by the assumption that all green screens are bad. A realistic IBM i shop in 2026 typically has a mixture: new customer-facing workflows on the web, internal operational screens still on 5250, and a small number of high-value operator screens transformed with Profound UI.</p>
+
+<em>Next post: IBM i and Apache Kafka — connecting IBM i to event streaming platforms, journal-based change data capture to Kafka topics, and consuming Kafka messages from IBM i using Node.js and Python in PASE.</em>

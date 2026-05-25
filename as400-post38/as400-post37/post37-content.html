@@ -1,0 +1,371 @@
+<p>The previous post covered IBM i and Apache Kafka — producing IBM i DB2 changes to Kafka topics, journal-based change data capture, the Kafka Connect approach via IBM MQ, and consuming Kafka events from Python in PASE. This post covers DB2 for i replication in depth: the journal infrastructure that makes all replication possible, journal-based logical replication using remote journals, Q-Replication (InfoSphere Data Replication) and its Capture/Apply architecture, MIMIX from Precisely and how it differs, and how to design a replication strategy that suits your workload.</p>
+
+<h2>Why Replication — The Business Case</h2>
+
+<p>Production DB2 for i systems under OLTP load were never designed for concurrent analytical queries. A long-running report scanning millions of order rows takes table-level locks, degrades interactive response times, and irritates everyone. Replication solves this by maintaining a second copy of the data on a separate system or in a separate schema, letting reports run freely without touching production.</p>
+
+<p>The four main use cases for DB2 for i replication are:</p>
+
+<ul>
+  <li><strong>Reporting offload</strong> — replicate transaction tables to a read-only reporting system, data warehouse, or cloud analytics platform. Run BI queries there instead of against production.</li>
+  <li><strong>High-availability secondary</strong> — maintain a warm standby that can take over production reads (or full production) within minutes if the primary fails.</li>
+  <li><strong>Disaster recovery secondary</strong> — replicate to a geographically separate system so that a data-centre loss does not mean data loss.</li>
+  <li><strong>Cross-platform data distribution</strong> — feed DB2 for i changes downstream to PostgreSQL, SQL Server, Db2 LUW, Oracle, Kafka, or a cloud data lake. The IBM i is the master; everyone else receives a continuous stream of changes.</li>
+</ul>
+
+<p>All four scenarios on IBM i depend on the same underlying mechanism: the journal.</p>
+
+<h2>IBM i Journalling as the Replication Foundation</h2>
+
+<p>The IBM i journal is an append-only log that records every before-image and after-image of every committed change to a journalled object. When a row is inserted, the journal receives the new row image. When updated, it records both the before (for rollback and CDC) and after (for replication). When deleted, it captures the before image. The journal is the source of truth for every replication tool on the platform.</p>
+
+<p>A journal is stored in a library and consists of a journal object (JRNTYPE *JRN) and one or more journal receivers (JRNTYPE *JRNRCV). Receivers are chains: when one fills, IBM i automatically attaches the next. You inspect journal receiver status with:</p>
+
+<pre>WRKJRNA JRN(ORDLIB/ORDJRN)</pre>
+
+<p>To see the current journal receiver and its size:</p>
+
+<pre>DSPJRN JRN(ORDLIB/ORDJRN) RCVRNG(*CURRENT) OUTPUT(*PRINT)</pre>
+
+<p>The QSYS2.DISPLAY_JOURNAL table function lets you query journal entries directly in SQL:</p>
+
+<pre>SELECT
+    ENTRY_TIMESTAMP,
+    JOURNAL_CODE,
+    ENTRY_TYPE,
+    TABLE_NAME,
+    RELATIVE_RECORD_NUMBER,
+    SUBSTR(ENTRY_DATA, 1, 200) AS ENTRY_PREVIEW
+FROM TABLE(
+    QSYS2.DISPLAY_JOURNAL(
+        JOURNAL_LIBRARY   => 'ORDLIB',
+        JOURNAL_NAME      => 'ORDJRN',
+        JOURNAL_ENTRY_TYPES => 'PT,UP,DL',
+        STARTING_TIMESTAMP => CURRENT_TIMESTAMP - 1 HOUR
+    )
+) AS T
+ORDER BY ENTRY_TIMESTAMP DESC
+FETCH FIRST 50 ROWS ONLY;</pre>
+
+<p>Journal codes <code>PT</code> (Put/Insert), <code>UP</code> (Update), and <code>DL</code> (Delete) are the DML operations that replication tools consume. Code <code>CM</code> marks a commit boundary. The journal is the replication source — you do not need to query the live table at all.</p>
+
+<p>To change journal receiver attributes (e.g., to set a receiver size threshold that triggers automatic attachment of a new receiver):</p>
+
+<pre>CHGJRN JRN(ORDLIB/ORDJRN)
+       MNGRCV(*SYSTEM)
+       DLTRCV(*NO)
+       RCVSIZOPT(*MAXOPT1)</pre>
+
+<p><code>MNGRCV(*SYSTEM)</code> tells IBM i to automatically create and attach new receivers. <code>DLTRCV(*NO)</code> keeps old receivers available for replication tools that may still be reading from them.</p>
+
+<h2>Enabling Journalling and Remote Journals</h2>
+
+<p>Before any replication tool can replicate a table, that table must be journalled. Physical files (tables) and their associated logical files (views/indexes) must be added to a journal.</p>
+
+<p>Start journalling a physical file:</p>
+
+<pre>STRJRNPF FILE(ORDLIB/ORDERS)
+          JRN(ORDLIB/ORDJRN)
+          IMAGES(*BOTH)
+          OMTJRNE(*OPNCLO)</pre>
+
+<p><code>IMAGES(*BOTH)</code> captures both before and after images — essential for replication. Without before images, UPDATE statements cannot be correctly applied on the target. <code>OMTJRNE(*OPNCLO)</code> suppresses open/close journal entries which add noise without replication value.</p>
+
+<p>For all tables in a library at once, use STRJRNLIB (available via PTF or QUSRJOBI approach) or a CL loop:</p>
+
+<pre>PGM
+DCL VAR(&FILE) TYPE(*CHAR) LEN(10)
+DCLF FILE(QSYS/QADSPOBJ) RCDFMT(QLIDOBJD)
+
+OVRDBF FILE(QSYS/QADSPOBJ) TOFILE(QTEMP/TBLIST)
+/* Build the table list first with DSPOBJD into QTEMP/TBLIST */
+
+LOOP:
+    RCVF
+    MONMSG MSGID(CPF0864) EXEC(GOTO CMDLBL(DONE))
+    STRJRNPF FILE(ORDLIB/&FILE) JRN(ORDLIB/ORDJRN) IMAGES(*BOTH) OMTJRNE(*OPNCLO)
+    MONMSG MSGID(CPF0000)
+    GOTO CMDLBL(LOOP)
+DONE:
+    ENDPGM</pre>
+
+<p>A <strong>remote journal</strong> allows IBM i to asynchronously ship journal entries to a second system over TCP/IP. The target system hosts a receive journal that mirrors the source journal stream. Remote journalling is the transport layer for logical replication — both Q-Replication and MIMIX in logical mode use it.</p>
+
+<p>Create a journal receiver on the target system first:</p>
+
+<pre>/* On target system TGTSYS */
+CRTJRNRCV JRNRCV(ORDLIB/ORDJRCV0001)
+           THRESHOLD(500000)
+           TEXT('Remote journal receiver for ORDLIB/ORDJRN')</pre>
+
+<p>Create the target journal referencing the receiver:</p>
+
+<pre>CRTJRN JRN(ORDLIB/ORDJRN)
+        JRNRCV(ORDLIB/ORDJRCV0001)
+        MNGRCV(*SYSTEM)
+        DLTRCV(*NO)
+        TEXT('Remote journal mirror of SRCSYS ORDLIB/ORDJRN')</pre>
+
+<p>Add the remote journal relationship from the source system:</p>
+
+<pre>/* On source system SRCSYS */
+ADDRMTJRN JRN(ORDLIB/ORDJRN)
+           RMTSYS('TGTSYS')
+           RMTJRN(ORDLIB/ORDJRN)
+           DLYALW(*YES)
+           MINACT(10)
+           MAXACT(100)
+           CNNTYPE(*OPTIMIZED)</pre>
+
+<p><code>DLYALW(*YES)</code> permits asynchronous delivery — the source does not wait for the remote system to confirm receipt before committing. This is the standard configuration for replication. <code>MINACT</code> and <code>MAXACT</code> control the number of active remote journal connections.</p>
+
+<p>Monitor remote journal lag:</p>
+
+<pre>SELECT
+    JRN_LIBRARY,
+    JRN_NAME,
+    REMOTE_SYSTEM,
+    REMOTE_JRN_LIBRARY,
+    REMOTE_JRN_NAME,
+    REPLICATION_STATE,
+    JOURNAL_ENTRIES_DELIVERED,
+    DELIVERY_LAG_SECONDS
+FROM QSYS2.JOURNAL_INFO
+WHERE JRN_LIBRARY = 'ORDLIB'
+  AND JRN_NAME    = 'ORDJRN';</pre>
+
+<h2>Q-Replication — InfoSphere Data Replication Architecture</h2>
+
+<p>IBM InfoSphere Data Replication (IIDR), known as Q-Replication in the IBM i context, is IBM's enterprise CDC and replication product. It uses a Capture agent on the source and an Apply agent on the target, connected through an IBM MQ queue. The journal is the source feed for the Capture agent — it never touches live tables during normal operation.</p>
+
+<p>The Q-Replication architecture has three logical components:</p>
+
+<ul>
+  <li><strong>Capture agent</strong> — reads journal entries from the source DB2 for i journal, converts them into replication messages, and puts them onto an MQ queue (the send queue, IBMQREP.SPILL.MESSAGES by default).</li>
+  <li><strong>MQ transport</strong> — the queue manager carries messages from source to target. This decouples capture speed from apply speed and provides a natural buffer for network interruptions.</li>
+  <li><strong>Apply agent</strong> — reads from the receive queue and applies the changes to the target database (DB2 for i, Db2 LUW, SQL Server, Oracle, etc.).</li>
+</ul>
+
+<p>Subscriptions define what gets replicated. Each subscription maps a source table to a target table with column-level selection and filtering. A subscription set groups related tables so they are replicated together with consistent commit boundaries.</p>
+
+<p>The ASNCLP command-line tool controls Q-Replication configuration. A minimal setup script to create a subscription looks like:</p>
+
+<pre>/* ASNCLP script — source is IBM i, target is Db2 LUW */
+SET SERVER CAPTURE TO DB SRCDB ID SRCUSER PASSWORD SRCPWD;
+SET SERVER TARGET TO DB TGTDB ID TGTUSER PASSWORD TGTPWD;
+SET MQ MANAGER TO QMGR 'QM_REPL';
+
+CREATE REPLQMAP ORDLIB_TO_TGTDB
+    USING SENDQ 'IBMQREP.SRCSYS.TO.TGTSYS'
+    RECVQ  'IBMQREP.TGTSYS.FROM.SRCSYS';
+
+SET SUBNAME 'ORDERS_SUB';
+CREATE SUBSCRIPTION ORDERS_SUB
+    REPLQMAP ORDLIB_TO_TGTDB
+    SOURCE TABLE ORDLIB.ORDERS
+    TARGET TABLE TGTSCHEMA.ORDERS
+    COLUMNS (ORDNUM, CUSTNUM, ORDDATE, TOTAL, STATUS)
+    KEY COLUMNS (ORDNUM)
+    CONFLICT ACTION E
+    ADD ROW CHANGES;</pre>
+
+<p><code>CONFLICT ACTION E</code> means on conflict (both source and target changed the same row), raise an error and stop replication for investigation. In read-only reporting scenarios this should not occur — conflicts are only relevant in bidirectional replication.</p>
+
+<p>Start and monitor the Capture agent from the source IBM i:</p>
+
+<pre>STRDPRCAP SRCLIB(ORDLIB) SRCSYS(*LOCAL)</pre>
+
+<p>Check Capture status in the IBMSNAP_CAPMON table:</p>
+
+<pre>SELECT
+    MONITOR_TIME,
+    WAKEUP_INTERVAL,
+    CURRENT_MEMORY,
+    ROWS_CAPTURED,
+    ROWS_IN_QUEUE,
+    LAST_COMMIT_TIME
+FROM ASN.IBMSNAP_CAPMON
+ORDER BY MONITOR_TIME DESC
+FETCH FIRST 10 ROWS ONLY;</pre>
+
+<h2>MIMIX Replication — What Precisely's Tool Adds</h2>
+
+<p>MIMIX, owned by Precisely (formerly HelpSystems and before that Vision Solutions), is the market-leading IBM i replication product. It is not a reskin of Q-Replication — it is an independent product with its own journal reading engine, its own transport, and capabilities that go beyond table replication.</p>
+
+<p>MIMIX operates in two primary modes:</p>
+
+<ul>
+  <li><strong>Journal-based logical replication</strong> — like Q-Replication, MIMIX reads DB2 for i journal entries and applies them to a target system. This works at the SQL record level and is suitable for cross-platform replication or reporting offload.</li>
+  <li><strong>Object-level replication</strong> — MIMIX can also replicate entire IFS objects, data areas, data queues, user spaces, and other IBM i native objects that have no SQL equivalent. This is why MIMIX is favoured for HA and DR: a full IBM i production system has much more than just DB2 tables — it has IFS files, message queues, configuration data, and CL programs that also need to be mirrored.</li>
+</ul>
+
+<p>MIMIX deployment scenarios:</p>
+
+<ul>
+  <li><strong>MIMIX for HA</strong> — near-synchronous replication with a warm standby. Latency is typically sub-second over a LAN or fast WAN. A planned switchover (STRMIMSWT) is non-disruptive; users reconnect to the secondary within a few seconds.</li>
+  <li><strong>MIMIX for DR</strong> — asynchronous replication to a geographically separate site. Latency might be seconds to minutes. Switchover involves replaying the outstanding journal backlog before activating the secondary.</li>
+  <li><strong>MIMIX for reporting</strong> — replicate a subset of tables to a local or remote system dedicated to BI queries. The reporting secondary runs in read-only mode permanently; no switchover is intended.</li>
+</ul>
+
+<p>Key MIMIX commands you will encounter on a managed IBM i system:</p>
+
+<pre>/* Check overall replication status */
+WRKMIMSTS
+
+/* Display active replication processes */
+DSPMIMINF
+
+/* Display replication activity (lag, throughput) */
+WRKMIMACT TYPE(*ALL)
+
+/* Check a specific data group */
+WRKDTAARA DTAARA(MIMIXSYS/MMXDGRPSTS)</pre>
+
+<p>MIMIX data groups define the replication unit — source system, target system, which objects and tables, and the replication mode. A data group is the MIMIX equivalent of Q-Replication's subscription set.</p>
+
+<h2>Designing a Replication Strategy</h2>
+
+<p>The right replication architecture depends on four decisions: latency target, what to replicate, where to replicate to, and how you will monitor and handle failures.</p>
+
+<p><strong>Synchronous vs asynchronous</strong></p>
+
+<p>Synchronous replication means the source system waits for the target to confirm receipt before the commit returns to the application. This gives zero data loss (RPO = 0) but adds network round-trip latency to every transaction. On a LAN this is acceptable; over a WAN it kills throughput. Asynchronous replication lets the source commit immediately and ships the journal entries in the background. RPO is the current replication lag — typically seconds to minutes.</p>
+
+<p>For most IBM i production systems, asynchronous replication is the right choice. Synchronous is reserved for the most critical HA scenarios where data loss is absolutely unacceptable.</p>
+
+<p><strong>What to replicate</strong></p>
+
+<p>Not every table needs replication. Classify tables:</p>
+
+<ul>
+  <li><strong>Transaction tables</strong> (ORDERS, ORDERLINES, INVOICES, PAYMENTS) — high change volume, high business value, must be replicated.</li>
+  <li><strong>Reference/code tables</strong> (STATUSCODES, CURRENCY, TAXRATES) — low change volume, worth replicating for join completeness on the target.</li>
+  <li><strong>Work tables and temporary staging files</strong> — no replication value; exclude them.</li>
+  <li><strong>History tables</strong> — replicate once in bulk, then replicate ongoing appends. Large initial load may require a separate initialisation step.</li>
+</ul>
+
+<p><strong>Latency targets</strong></p>
+
+<p>Define your SLA before choosing a product. A reporting offload that can tolerate 60-second lag has very different infrastructure requirements from an HA secondary that must be current within 1 second. Q-Replication over MQ typically delivers sub-10-second lag on a well-tuned IBM i. MIMIX in HA mode typically delivers sub-second lag on a LAN.</p>
+
+<p><strong>Monitoring replication lag</strong></p>
+
+<p>For remote journalling, QSYS2.JOURNAL_INFO (shown earlier) gives per-journal lag. For Q-Replication, monitor IBMSNAP_CAPMON and IBMSNAP_APPLYTRAIL. For MIMIX, WRKMIMACT provides a real-time lag display.</p>
+
+<p>A simple SQL alert you can wrap in a scheduled job:</p>
+
+<pre>/* Alert if remote journal lag exceeds 5 minutes */
+SELECT
+    JRN_LIBRARY,
+    JRN_NAME,
+    REMOTE_SYSTEM,
+    DELIVERY_LAG_SECONDS,
+    CURRENT_TIMESTAMP AS CHECKED_AT
+FROM QSYS2.JOURNAL_INFO
+WHERE DELIVERY_LAG_SECONDS > 300
+  AND REPLICATION_STATE = 'ACTIVE';</pre>
+
+<h2>Practical SQL — Checking Journal and Replication Status</h2>
+
+<p>The following queries are immediately useful on any IBM i where replication is configured or planned.</p>
+
+<p>List all journalled tables in a library:</p>
+
+<pre>SELECT
+    TABLE_SCHEMA,
+    TABLE_NAME,
+    JOURNAL_LIBRARY,
+    JOURNAL_NAME,
+    JOURNAL_IMAGES,
+    JOURNAL_OMIT_OPEN_CLOSE
+FROM QSYS2.SYSTABLES
+WHERE TABLE_SCHEMA = 'ORDLIB'
+  AND JOURNAL_NAME IS NOT NULL
+ORDER BY TABLE_NAME;</pre>
+
+<p>Find tables in a library that are NOT journalled (these cannot be replicated):</p>
+
+<pre>SELECT
+    TABLE_SCHEMA,
+    TABLE_NAME,
+    TABLE_TYPE
+FROM QSYS2.SYSTABLES
+WHERE TABLE_SCHEMA = 'ORDLIB'
+  AND TABLE_TYPE   = 'T'
+  AND JOURNAL_NAME IS NULL
+ORDER BY TABLE_NAME;</pre>
+
+<p>Check journal receiver chain and sizes:</p>
+
+<pre>SELECT
+    JRN_LIBRARY,
+    JRN_NAME,
+    RECEIVER_LIBRARY,
+    RECEIVER_NAME,
+    RECEIVER_STATE,
+    ATTACH_TIMESTAMP,
+    DETACH_TIMESTAMP,
+    RECEIVER_SIZE_BYTES / 1048576 AS SIZE_MB
+FROM QSYS2.JOURNAL_RECEIVER_INFO
+WHERE JRN_LIBRARY = 'ORDLIB'
+  AND JRN_NAME    = 'ORDJRN'
+ORDER BY ATTACH_TIMESTAMP DESC
+FETCH FIRST 20 ROWS ONLY;</pre>
+
+<p>Count rows in source vs target to validate replication completeness (run from the target system with a database link or via a linked server query):</p>
+
+<pre>/* Source row count — run on source */
+SELECT COUNT(*) AS SRC_COUNT FROM ORDLIB.ORDERS
+WHERE ORDDATE >= CURRENT DATE - 1 DAY;
+
+/* Target row count — run on target */
+SELECT COUNT(*) AS TGT_COUNT FROM TGTSCHEMA.ORDERS
+WHERE ORDDATE >= CURRENT DATE - 1 DAY;</pre>
+
+<p>A more sophisticated row-count comparison using a DB2 for i distributed database link (DDM/DRDA):</p>
+
+<pre>/* Assumes a relational database directory entry TGTDB exists */
+SELECT
+    'SOURCE' AS SYSTEM,
+    COUNT(*) AS ROW_COUNT
+FROM ORDLIB.ORDERS
+WHERE ORDDATE = CURRENT DATE
+
+UNION ALL
+
+SELECT
+    'TARGET' AS SYSTEM,
+    COUNT(*) AS ROW_COUNT
+FROM TGTSCHEMA.ORDERS AT TGTDB
+WHERE ORDDATE = CURRENT DATE;</pre>
+
+<p>Identify the highest journal sequence number applied on the target (Q-Replication):</p>
+
+<pre>SELECT
+    SUBNAME,
+    LASTCOMMIT,
+    APPLIED_SQNO,
+    ROWS_APPLIED,
+    DELETES_APPLIED,
+    UPDATES_APPLIED,
+    INSERTS_APPLIED
+FROM ASN.IBMSNAP_APPLYTRAIL
+WHERE SUBNAME = 'ORDERS_SUB'
+ORDER BY LASTCOMMIT DESC
+FETCH FIRST 5 ROWS ONLY;</pre>
+
+<p>Find the current replication throughput from the Q-Replication Capture monitor:</p>
+
+<pre>SELECT
+    MONITOR_TIME,
+    ROWS_CAPTURED - LAG(ROWS_CAPTURED) OVER (ORDER BY MONITOR_TIME) AS ROWS_CAPTURED_SINCE_LAST,
+    WAKEUP_INTERVAL
+FROM ASN.IBMSNAP_CAPMON
+ORDER BY MONITOR_TIME DESC
+FETCH FIRST 20 ROWS ONLY;</pre>
+
+<h2>Summary</h2>
+
+<p>IBM i journalling is the foundation of every replication approach on the platform. Enabling journalling with <code>IMAGES(*BOTH)</code>, setting up remote journal transport with ADDRMTJRN, and monitoring with QSYS2.JOURNAL_INFO are the common steps regardless of whether you use Q-Replication, MIMIX, or a custom CDC consumer. Q-Replication suits cross-platform replication and reporting offload; MIMIX adds object-level replication and is preferred for HA and DR where the full IBM i environment must be mirrored. Designing your strategy around latency targets and table classification — not replicating work tables, journalling all transaction and reference tables with <code>IMAGES(*BOTH)</code> — will save considerable troubleshooting later.</p>
+
+<em>Next post: IBM i Save and Restore Strategy — SAVLIB, SAVOBJ, SAV for IFS, GO SAVE options 21 and 23, virtual optical media with IMGCLG, BRMS for automated backup management, and building a reliable IBM i backup schedule.</em>

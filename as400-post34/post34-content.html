@@ -1,0 +1,407 @@
+<p>The previous post covered High Availability and Disaster Recovery on IBM i — geographic mirroring, switchable IASPs, journal-based replication, and third-party HA tools such as MIMIX and iTera. This post covers PTF management and OS upgrades: understanding the four fix types IBM ships, keeping your system current with cumulative packages and SF99xxx groups, ordering and applying PTFs safely, and planning a full IBM i version upgrade using IMGCLG virtual optical media.</p>
+
+<h2>PTF Types — Individual, Cumulative, Group, and Technology Refresh</h2>
+
+<p>IBM ships fixes for IBM i in four distinct forms. Understanding the difference matters because each type has its own ordering mechanism, application procedure, and scheduling discipline.</p>
+
+<p><strong>Individual PTFs (Hxxxxx):</strong> A single fix for a specific APAR (Authorised Program Analysis Report). Individual PTFs have an ID in the format <code>MFxxxxx</code> (for base OS fixes) or product-specific prefixes such as <code>SI</code> (for licensed programs). They are ordered individually when you encounter a specific problem, or they arrive as prerequisites of a larger package. Individual PTFs may be superseded by later PTFs; applying a superseded PTF is harmless but wasteful.</p>
+
+<p><strong>Cumulative PTF Package (TCxxxxx):</strong> A cumulative package is a single deliverable containing all individual PTFs for the IBM i base OS up to a specific date, plus all Group PTFs that IBM recommends at that point. The ID follows the format <code>TCyymmdd</code> where <code>yymmdd</code> is the package date. IBM ships a new cumulative package roughly quarterly. Applying the latest cumulative package is the single most effective way to bring a system up to date.</p>
+
+<p><strong>Group PTFs (SF99xxx):</strong> A group PTF is a named collection of individual PTFs that relate to a specific functional area — DB2 for i, Java, open source, HTTP server, TCP/IP, security, and so on. Group PTFs are identified by a six-character name beginning with <code>SF99</code>. They are updated more frequently than the cumulative package — sometimes monthly — and they supersede each other within the group. The current level of each group is shown by a level number (e.g., SF99725 level 20).</p>
+
+<p><strong>Technology Refresh (TR):</strong> A Technology Refresh is a collection of new functions and enhancements delivered between major OS releases. IBM i 7.5 TR1, TR2, TR3, and so on each add new SQL capabilities, new CL commands, new APIs, and enhancements to existing features. TRs are delivered as a group PTF (e.g., SF99950 for IBM i 7.5 TRs) and require the cumulative package to be at or above a specific level first. Applying a TR is not strictly a PTF operation — it adds new function — so it warrants more careful testing than a routine fix.</p>
+
+<h2>Checking What Is Installed — DSPPTF, WRKPTF, DSPSFWRSC</h2>
+
+<p>Before ordering or applying anything, establish a baseline of what is already on the system.</p>
+
+<p><strong>DSPPTF</strong> displays the PTF status for a specific licensed program:</p>
+
+<pre>
+/* Display all PTFs for the IBM i base OS (product 5770SS1) */
+DSPPTF LICPGM(5770SS1)
+
+/* Display a specific PTF */
+DSPPTF LICPGM(5770SS1) PTF(SI85432)
+
+/* Display PTFs for DB2 Query Manager and SQL Development Kit */
+DSPPTF LICPGM(5770ST1)
+</pre>
+
+<p>The output shows each PTF's ID, status (<code>APPLIED</code>, <code>PERMANENTLY APPLIED</code>, <code>TEMPORARILY APPLIED</code>, <code>NOT APPLIED</code>, <code>SUPERSEDED</code>), and whether an IPL is required to activate it.</p>
+
+<p><strong>WRKPTF</strong> provides an interactive list view with more filtering options:</p>
+
+<pre>
+/* Work with all PTFs for the base OS */
+WRKPTF LICPGM(5770SS1)
+
+/* Show only PTFs that are temporarily applied (pending permanent application) */
+WRKPTF LICPGM(5770SS1) SELECT(*TEMP)
+
+/* Show only PTFs that have not yet been applied */
+WRKPTF LICPGM(5770SS1) SELECT(*NOTAPL)
+
+/* Show PTFs that require an IPL before they activate */
+WRKPTF LICPGM(5770SS1) SELECT(*IPLREQ)
+</pre>
+
+<p>From the WRKPTF list, option <strong>5</strong> displays full PTF details including the APAR description, superseded PTFs, and co-requisites. Option <strong>8</strong> applies a single PTF immediately.</p>
+
+<p><strong>DSPSFWRSC</strong> (Display Software Resources) shows all installed licensed programs and their release levels — useful for confirming exactly which version and modification level is running before an upgrade:</p>
+
+<pre>
+DSPSFWRSC
+</pre>
+
+<p>To check the current cumulative PTF package level applied to the system, look at the LICPGM <code>5770SS1</code> PTF whose description begins with "CUMULATIVE PTF PACKAGE". Alternatively, query it via SQL:</p>
+
+<pre>
+SELECT PTF_IDENTIFIER, PTF_LOADED_STATUS, PTF_PRODUCT_ID
+FROM QSYS2.PTF_INFO
+WHERE PTF_PRODUCT_ID = '5770SS1'
+  AND PTF_IDENTIFIER LIKE 'TC%'
+ORDER BY PTF_IDENTIFIER DESC
+FETCH FIRST 5 ROWS ONLY;
+</pre>
+
+<p>To check all group PTF levels currently installed:</p>
+
+<pre>
+SELECT PTF_GROUP_NAME, PTF_GROUP_LEVEL, PTF_GROUP_STATUS
+FROM QSYS2.GROUP_PTF_INFO
+ORDER BY PTF_GROUP_NAME;
+</pre>
+
+<h2>Key SF99xxx Groups — What Each Covers</h2>
+
+<p>IBM maintains dozens of SF99xxx groups, but six are particularly important for most production IBM i environments in 2026.</p>
+
+<p><strong>SF99725 — DB2 for i:</strong> Contains fixes for the DB2 for i database engine, SQL compiler, query optimiser, ODBC/JDBC drivers, and related utilities. This is the highest-priority group for any shop running significant SQL workloads. IBM updates SF99725 frequently — sometimes fortnightly — and many fixes address query plan regressions or data integrity edge cases. Apply this group on a quarterly basis at minimum.</p>
+
+<p><strong>SF99727 — Java:</strong> Contains the IBM Technology for Java (J9 JVM) fixes and updates for the IBM i PASE Java runtime. If your system runs any Java-based middleware (WebSphere, Kafka clients, custom Java applications), keeping SF99727 current is essential. Outdated Java PTFs are a common source of TLS handshake failures and JVM crashes.</p>
+
+<p><strong>SF99729 — Open Source / PASE:</strong> Covers the RPM-based open source ecosystem on IBM i — Python, Node.js, Git, Nginx, and the PASE runtime itself. From IBM i 7.4 onwards, the open source packages are delivered via <code>yum</code> rather than PTFs for most components, but SF99729 still covers the underlying PASE runtime and <code>5733OPS</code> licensed program fixes.</p>
+
+<p><strong>SF99738 — IBM HTTP Server for i (powered by Apache):</strong> Covers the Apache-based HTTP server used for IBM i web applications, including Web Services for IBM i and the IBM i Navigator web console. If you run any HTTP-based services on the system, keep this group current.</p>
+
+<p><strong>SF99740 — TCP/IP:</strong> Contains fixes for the IBM i TCP/IP stack, including TLS/SSL, SSH, FTP, SMTP, and network infrastructure. Security vulnerabilities in the TCP stack are addressed here. Given that most IBM i systems are network-exposed, this group should be applied promptly whenever a new level is available.</p>
+
+<p><strong>SF99920 — IBM i Security:</strong> Collects security-related PTFs from across the base OS. This is the group to watch for CVE remediations on IBM i. IBM publishes security bulletins referencing SF99920 when vulnerabilities are addressed. Apply new levels of this group within your defined patching SLA — typically within 30 days of release for production systems.</p>
+
+<pre>
+/* Check current level of the security group PTF */
+WRKPTFGRP PTFGRP(SF99920)
+
+/* Display details of a specific group */
+DSPPTFGRP PTFGRP(SF99725)
+</pre>
+
+<p>The <code>DSPPTFGRP</code> output lists every individual PTF in the group, its current status on the system, and whether any are missing. PTFs shown as <code>NOT APPLIED</code> within a group PTF you have partially applied indicate either that they were not included in the download or that their prerequisites were not met.</p>
+
+<h2>Ordering PTFs — SNDPTFORD and Fix Central</h2>
+
+<p>IBM i can order PTFs directly from IBM's fix delivery infrastructure using <strong>SNDPTFORD</strong> (Send PTF Order), provided the system has internet connectivity or is connected to a Universal Connection service.</p>
+
+<p>To order a specific individual PTF:</p>
+
+<pre>
+SNDPTFORD PTFID((SI85432 5770SS1))
+</pre>
+
+<p>To order the latest cumulative PTF package for IBM i 7.5:</p>
+
+<pre>
+SNDPTFORD PTFID(*CUMPKG)
+</pre>
+
+<p>To order a specific group PTF at its latest available level:</p>
+
+<pre>
+SNDPTFORD PTFID((SF99725 5770SS1))
+</pre>
+
+<p>To order multiple PTFs in a single order:</p>
+
+<pre>
+SNDPTFORD PTFID((SI85432 5770SS1) (SI84901 5770SS1) (SI83745 5770ST1))
+</pre>
+
+<p>The <code>DLVRYMTH</code> parameter controls how the PTFs are delivered. <code>*SAVF</code> downloads them into save files in <code>QGPL</code>; <code>*LINKONLY</code> provides a download link; <code>*IMAGE</code> loads them into an image catalogue. For most environments, <code>*SAVF</code> is the default and most convenient.</p>
+
+<p>Alternatively, use <strong>IBM Fix Central</strong> (https://www.ibm.com/support/fixcentral) to browse, select, and download PTFs via a web browser. Fix Central allows you to:</p>
+<ul>
+  <li>Upload your system's installed PTF inventory (exported via <code>DSPPTF OUTPUT(*PRINT)</code> and converted) for gap analysis.</li>
+  <li>Download cumulative packages and group PTFs as ISO images for loading via IMGCLG.</li>
+  <li>Subscribe to email notifications for new levels of specific group PTFs.</li>
+</ul>
+
+<p>To check the current available level of a group PTF from the command line (requires connectivity):</p>
+
+<pre>
+WRKPTFGRP PTFGRP(SF99725) SLTOPT(*AVLLVL)
+</pre>
+
+<h2>Applying PTFs — APYPTF, APYGRPPF, Hold and Release</h2>
+
+<p>Once PTFs have been downloaded into save files or loaded via IMGCLG, they are applied using <strong>APYPTF</strong> (Apply PTF) or <strong>APYGRPPF</strong> (Apply Group PTF).</p>
+
+<p>To apply a single PTF immediately (if it does not require an IPL):</p>
+
+<pre>
+APYPTF LICPGM(5770SS1) PTF(SI85432) APY(*IMMD)
+</pre>
+
+<p>To apply a PTF in delayed mode — it will be activated at the next IPL rather than immediately:</p>
+
+<pre>
+APYPTF LICPGM(5770SS1) PTF(SI85432) APY(*DLYALL)
+</pre>
+
+<p>To apply all downloaded PTFs for a licensed program at once:</p>
+
+<pre>
+APYPTF LICPGM(5770SS1) PTF(*ALL) APY(*DLYALL)
+</pre>
+
+<p>To apply a group PTF (all PTFs in the group that are not yet applied):</p>
+
+<pre>
+APYGRPPF GRPPF(SF99725) LICPGM(5770SS1)
+</pre>
+
+<p>After applying PTFs in delayed mode, an IPL is required to activate them. PTFs that require an IPL are shown with status <code>APPLY PENDING</code> in the WRKPTF output. To identify all pending IPL-required PTFs before scheduling a maintenance window:</p>
+
+<pre>
+WRKPTF LICPGM(*ALL) SELECT(*IPLREQ)
+</pre>
+
+<p>Some PTFs are delivered with <strong>hold</strong> status — IBM has placed them on hold because of known issues with specific configurations. Do not apply held PTFs without first reading the PTF cover letter. To check for held PTFs:</p>
+
+<pre>
+WRKPTF LICPGM(5770SS1) SELECT(*HELD)
+</pre>
+
+<p>To release a held PTF after confirming it is safe to apply in your environment:</p>
+
+<pre>
+RLSPTF LICPGM(5770SS1) PTF(SI85432)
+</pre>
+
+<p>To place a specific PTF on hold (for example, if you need to defer a mandatory fix that conflicts with a current project):</p>
+
+<pre>
+HLDPTF LICPGM(5770SS1) PTF(SI85432)
+</pre>
+
+<p>After applying PTFs, confirm the applied status:</p>
+
+<pre>
+DSPPTF LICPGM(5770SS1) PTF(SI85432)
+</pre>
+
+<p>The status should show <code>TEMPORARILY APPLIED</code> (active but reversible) or <code>PERMANENTLY APPLIED</code> (cannot be removed without reloading). To permanently apply all temporarily applied PTFs:</p>
+
+<pre>
+APYPTF LICPGM(*ALL) PTF(*ALL) APY(*PERM)
+</pre>
+
+<h2>Using IMGCLG for Virtual Optical Media</h2>
+
+<p>For cumulative PTF packages and OS upgrade media, IBM ships ISO image files that are several gigabytes in size. Rather than writing these to physical media, IBM i can mount them as a virtual optical device using an <strong>Image Catalogue (IMGCLG)</strong>.</p>
+
+<p>An image catalogue is a directory in the IFS that holds one or more image files (.iso or .bin). The catalogue is associated with a virtual optical device, which the system treats identically to a physical CD/DVD drive for purposes of loading and installing software.</p>
+
+<p>Step 1 — Create the image catalogue directory in the IFS and upload or copy the ISO file there:</p>
+
+<pre>
+/* Create the IFS directory for the image catalogue */
+CRTDIR DIR('/QIBM/UserData/OS/Service/ECS/PTF/CUMPKG')
+
+/* The ISO file is transferred here via FTP, mapped network drive,
+   or downloaded directly using SNDPTFORD DLVRYMTH(*IMAGE) */
+</pre>
+
+<p>Step 2 — Create the image catalogue object:</p>
+
+<pre>
+CRTIMGCLG IMGCLG(CUMPKG) DIR('/QIBM/UserData/OS/Service/ECS/PTF/CUMPKG') +
+           TYPE(*OPT) REPLACE(*YES)
+</pre>
+
+<p>Step 3 — Add the image file(s) to the catalogue:</p>
+
+<pre>
+ADDIMGCLGE IMGCLG(CUMPKG) FROMFILE('/QIBM/UserData/OS/Service/ECS/PTF/CUMPKG/V7R5_CUM.ISO') +
+            TOFILE(*FROMFILE)
+</pre>
+
+<p>Step 4 — Verify the catalogue contents:</p>
+
+<pre>
+DSPIMGCLG IMGCLG(CUMPKG) DETAIL(*ENTRY)
+</pre>
+
+<p>Step 5 — Load the image catalogue into the virtual optical device:</p>
+
+<pre>
+LODIMGCLG IMGCLG(CUMPKG) DEV(OPT01)
+</pre>
+
+<p>Step 6 — Vary on the virtual optical device:</p>
+
+<pre>
+VRYCFG CFGOBJ(OPT01) CFGTYPE(*DEV) STATUS(*ON)
+</pre>
+
+<p>The system now sees <code>OPT01</code> as a loaded optical drive. You can install the cumulative package from it using:</p>
+
+<pre>
+RSTLICPGM LICPGM(5770SS1) DEV(OPT01) RSTOBJ(*PTF)
+</pre>
+
+<p>Or load PTFs from it using the standard PTF load procedure:</p>
+
+<pre>
+LODPTF LICPGM(5770SS1) DEV(OPT01)
+</pre>
+
+<p>When finished, unload the image catalogue:</p>
+
+<pre>
+LODIMGCLG IMGCLG(CUMPKG) DEV(OPT01) OPTION(*UNLOAD)
+VRYCFG CFGOBJ(OPT01) CFGTYPE(*DEV) STATUS(*OFF)
+</pre>
+
+<p>For OS upgrades, you will typically have multiple image files (volumes 1, 2, 3, and so on) in the catalogue. The system automatically advances through volumes as the install progresses. Ensure all volumes are added to the catalogue before starting the upgrade:</p>
+
+<pre>
+ADDIMGCLGE IMGCLG(I75UPGRD) FROMFILE('/QIBM/UserData/OS/Install/I75V1R1/I75R1V01.ISO')
+ADDIMGCLGE IMGCLG(I75UPGRD) FROMFILE('/QIBM/UserData/OS/Install/I75V1R1/I75R1V02.ISO')
+ADDIMGCLGE IMGCLG(I75UPGRD) FROMFILE('/QIBM/UserData/OS/Install/I75V1R1/I75R1V03.ISO')
+DSPIMGCLG IMGCLG(I75UPGRD) DETAIL(*ENTRY)
+</pre>
+
+<h2>Planning an OS Upgrade</h2>
+
+<p>An IBM i OS version upgrade — for example, from 7.4 to 7.5 — is a major operation requiring careful planning. The upgrade replaces the base OS licensed programs, retains all user data and objects, and typically takes two to four hours of system downtime depending on the system's size and the number of licensed programs installed.</p>
+
+<p><strong>Step 1 — Inventory licensed programs:</strong> Use <code>GO LICPGM</code>, option 10 to display all installed licensed programs and their current versions. Identify any licensed programs that do not have a 7.5 equivalent or that require a separate licence for the new release.</p>
+
+<pre>
+GO LICPGM
+/* Select option 10 — Display installed licensed programs */
+</pre>
+
+<p><strong>Step 2 — Check for product incompatibilities:</strong> Run <code>CHKPRDOPT</code> (Check Product Option) to verify that all installed licensed programs are consistent and that no options are missing prerequisites:</p>
+
+<pre>
+CHKPRDOPT
+</pre>
+
+<p>Resolve any reported inconsistencies before beginning the upgrade. Missing product options or corrupted licensed program objects will cause the upgrade to fail or produce unpredictable results.</p>
+
+<p><strong>Step 3 — Verify licence keys:</strong> Some licensed programs (Rational Developer for i, IBM i Access, and others) require new licence keys for the upgraded release. Obtain these from IBM Passport Advantage before starting the upgrade. Use <code>WRKLICINF</code> to review current licence information:</p>
+
+<pre>
+WRKLICINF
+</pre>
+
+<p><strong>Step 4 — Apply the latest cumulative PTF package for the current release:</strong> The upgrade media expects a certain minimum PTF level. Applying the latest cumulative package before the upgrade reduces the number of PTFs that will need to be applied on the new release and resolves any known upgrade-path defects.</p>
+
+<p><strong>Step 5 — Perform a full system save:</strong> Always take a complete <code>SAVSYS</code> and <code>SAVLIB LIB(*ALLUSR)</code> backup immediately before an OS upgrade. This is your recovery point if the upgrade fails at a late stage.</p>
+
+<pre>
+/* Full system save — requires restricted state */
+ENDSBS *ALL OPTION(*CNTRLD) DELAY(600)
+SAVSYS DEV(TAP01)
+SAVLIB LIB(*ALLUSR) DEV(TAP01) ACCPTH(*YES)
+SAVDLO DLO(*ALL) FLR(*ANY) DEV(TAP01)
+SAV DEV('/QSYS.LIB/TAP01.DEVD') OBJ(('/') ('/QSYS.LIB' *OMIT) ('/QDLS' *OMIT))
+</pre>
+
+<p><strong>Step 6 — Load the upgrade media and start the upgrade:</strong></p>
+
+<pre>
+/* Load the image catalogue */
+LODIMGCLG IMGCLG(I75UPGRD) DEV(OPT01)
+VRYCFG CFGOBJ(OPT01) CFGTYPE(*DEV) STATUS(*ON)
+
+/* Start the licensed program install */
+GO LICPGM
+/* Select option 11 — Install licensed programs */
+/* Follow the prompts to select 5770SS1 (IBM i) and other LPs */
+</pre>
+
+<p>Alternatively, the automated upgrade can be initiated with:</p>
+
+<pre>
+RSTLICPGM LICPGM(5770SS1) DEV(OPT01) OPTION(*BASE) RLS(*FIRST)
+</pre>
+
+<p>The system will IPL into the restricted state install environment, apply the new OS, and return to normal operation. After the upgrade IPL, verify the new release:</p>
+
+<pre>
+DSPSYSVAL SYSVAL(Qrelease)
+/* Should now show V7R5M0 */
+
+DSPSFWRSC
+/* Confirm all licensed programs show the new release level */
+</pre>
+
+<p><strong>Step 7 — Apply post-upgrade PTFs:</strong> Immediately after the upgrade, order and apply the latest cumulative PTF package and all relevant SF99xxx group PTFs for the new release. The new release ships with a specific PTF level; newer fixes will already be available.</p>
+
+<pre>
+SNDPTFORD PTFID(*CUMPKG)
+SNDPTFORD PTFID((SF99725 5770SS1))
+SNDPTFORD PTFID((SF99920 5770SS1))
+</pre>
+
+<h2>PTF Management Best Practices</h2>
+
+<p>A disciplined PTF management programme prevents the accumulation of security vulnerabilities and stability issues that come from running on an outdated fix level.</p>
+
+<p><strong>Test LPAR first:</strong> Every organisation running IBM i in 2026 should have at least one non-production LPAR (Logical Partition) that mirrors the production configuration. Apply PTFs to the test LPAR at least one week before production. Run regression tests against key batch jobs, interactive transactions, and any RPG or COBOL programmes that touch the files modified by the PTFs.</p>
+
+<p><strong>Quarterly cumulative package application:</strong> IBM releases a new cumulative PTF package roughly every quarter. Align your maintenance calendar to apply the latest cumulative package to production quarterly. This is the single most impactful PTF discipline you can adopt — it ensures you are never more than one quarter behind the current fix level.</p>
+
+<p><strong>Security PTF priority:</strong> SF99920 (security) and SF99740 (TCP/IP) fixes should be applied within 30 days of release. IBM i is increasingly targeted by network-based attacks; an unpatched TCP/IP or authentication vulnerability on a production system is an unacceptable risk. Consider subscribing to IBM's security bulletin mailing list so you are notified when new SF99920 levels are published.</p>
+
+<p><strong>QMAXSIGN and authentication hardening:</strong> While not strictly a PTF topic, many security PTFs in SF99920 address vulnerabilities in the sign-on and authentication subsystem. After applying security PTFs, review <code>QMAXSIGN</code> (maximum sign-on attempts), <code>QPWDEXPITV</code> (password expiry interval), and <code>QSSLPCL</code> (SSL/TLS protocol control) system values to ensure your configuration matches the post-PTF hardening guidance in the PTF cover letters.</p>
+
+<pre>
+/* Review key security system values */
+WRKSYSVAL SYSVAL(QMAXSIGN)
+WRKSYSVAL SYSVAL(QPWDEXPITV)
+WRKSYSVAL SYSVAL(QSSLPCL)
+WRKSYSVAL SYSVAL(QSSLCSL)
+</pre>
+
+<p><strong>Document your PTF baseline:</strong> After each maintenance window, capture the applied PTF level to a log. The easiest approach is to spool the DSPPTF output:</p>
+
+<pre>
+DSPPTF LICPGM(*ALL) OUTPUT(*PRINT)
+</pre>
+
+<p>Store the resulting spooled file or a PDF export alongside your change management records. When a problem is reported, you can immediately compare the PTF level at the time of the incident against the current level and identify whether a relevant fix has since been applied.</p>
+
+<p><strong>Automate group PTF level checks:</strong> A simple CL programme or scheduled job can query <code>QSYS2.GROUP_PTF_INFO</code> and alert the operations team when the installed level of a critical group PTF falls more than two levels behind the current available level:</p>
+
+<pre>
+/* SQL to identify group PTFs where installed level is more than 2 behind available */
+SELECT PTF_GROUP_NAME,
+       PTF_GROUP_LEVEL        AS INSTALLED_LEVEL,
+       PTF_GROUP_STATUS
+FROM   QSYS2.GROUP_PTF_INFO
+WHERE  PTF_GROUP_STATUS &lt;&gt; 'INSTALLED AT CURRENT LEVEL'
+  AND  PTF_GROUP_NAME IN ('SF99725','SF99727','SF99729',
+                          'SF99738','SF99740','SF99920')
+ORDER BY PTF_GROUP_NAME;
+</pre>
+
+<h2>Summary</h2>
+
+<p>PTF management on IBM i in 2026 is a structured discipline, not an ad hoc activity. Individual PTFs address specific defects; cumulative packages bring the base OS current in a single operation; SF99xxx group PTFs keep functional areas — DB2, Java, open source, HTTP, TCP/IP, and security — current between cumulative releases; and Technology Refreshes deliver new platform capability between major OS versions. The toolset — DSPPTF, WRKPTF, SNDPTFORD, APYPTF, APYGRPPF, and IMGCLG — is mature and consistent across releases. A quarterly cumulative package cycle, priority treatment of security group PTFs, a test LPAR for pre-production validation, and documented PTF baselines are the four practices that distinguish well-managed IBM i estates from those that accumulate risk silently over time.</p>
+
+<em>Next post: IBM i Display Files and 5250 UX Modernisation — DDS syntax for display files, subfile programming in RPG, indicator variables, and the modernisation options for moving beyond green-screen interfaces in 2026.</em>

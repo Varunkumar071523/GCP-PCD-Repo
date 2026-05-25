@@ -1,0 +1,530 @@
+<p>The previous post covered IBM i application modernisation strategy — the modernisation spectrum from screen transformation to full rewrite, the strangler fig pattern, API wrapping of RPG service programmes, and how to build a business case for modernisation investment. This post covers something that underpins any serious modernisation or refactoring effort: unit testing for ILE RPG using the RPGUnit framework. Without a test suite, any change to RPG business logic carries risk that is difficult to quantify and impossible to eliminate systematically.</p>
+
+<h2>Why Unit Testing Matters for IBM i RPG</h2>
+
+<p>RPG programmes on IBM i are frequently changed by developers who did not write them. A calculation engine that was authored in 1998 may now be maintained by a team whose members were not yet in the workforce when it was written. The original developer's intent exists only in the code itself — and often the code is dense, undocumented fixed-format RPG with implicit data types and positional field definitions.</p>
+
+<p>Three specific risks make unit testing valuable for IBM i estates:</p>
+
+<ul>
+<li><strong>PTF and OS upgrade regressions.</strong> IBM i cumulative PTFs and Technology Refresh releases occasionally change the behaviour of built-in functions, SQL optimiser decisions, or CL command defaults in subtle ways. A test suite that runs after every PTF application catches these regressions before they reach production.</li>
+<li><strong>Refactoring safety net.</strong> Converting fixed-format RPG to free-format, splitting a large monolithic programme into service programme procedures, or extracting reusable logic from an RPG cycle programme are all valuable but risky operations. Tests that verify the output before and after the refactoring prove equivalence.</li>
+<li><strong>Modernisation confidence.</strong> When API wrapping exposes RPG service programmes to HTTP clients, there is suddenly much more at stake if a procedure returns a wrong value. Tests catch the regression before it escapes through the API into a downstream system.</li>
+</ul>
+
+<h2>RPGUnit Overview</h2>
+
+<p>RPGUnit is an open-source unit testing framework for ILE RPG, hosted on GitHub at <strong>tools400/rpgunit</strong>. It follows the xUnit pattern used by JUnit (Java), NUnit (.NET), and pytest (Python): test cases are procedures, assertions are procedure calls, and a test runner executes all tests and reports pass or fail.</p>
+
+<p>The key design decisions that make RPGUnit practical for IBM i:</p>
+
+<ul>
+<li>Test modules are ordinary ILE RPG modules, compiled with CRTRPGMOD and bound into a test service programme with CRTSRVPGM.</li>
+<li>The test runner — the RURUN command — is a CL command that accepts a service programme name and executes all procedures whose names begin with <code>test</code>.</li>
+<li>Assertions are exported procedures from the RPGUnit binding directory (RPGUNIT in library RPGUNITLIB). You bind your test service programme to the RPGUnit binding directory and call assertions like <code>assertEqual</code> or <code>assertCharEquals</code> directly in your test procedures.</li>
+<li>Output is emitted in TAP (Test Anything Protocol) format, which every modern CI system can parse.</li>
+<li>setUp and tearDown procedures (if present) are called before and after each test procedure automatically.</li>
+</ul>
+
+<h2>Installing RPGUnit</h2>
+
+<p>RPGUnit is installed from source, available in PASE via Git. The build requires GNU make, which is available from the IBM i open-source package repository.</p>
+
+<p>First, ensure Git and GNU make are installed in PASE:</p>
+
+<pre>
+# Run in PASE shell (ssh to IBM i or use QP2TERM)
+dnf install git make
+</pre>
+
+<p>Clone the repository from PASE and build:</p>
+
+<pre>
+cd /home/myuser
+git clone https://github.com/tools400/rpgunit.git
+cd rpgunit
+</pre>
+
+<p>The repository ships with a <code>Makefile</code> and a set of source members. The build targets a library that you specify:</p>
+
+<pre>
+# Build RPGUnit into library RPGUNITLIB
+# The Makefile compiles all framework modules, binds the service programme,
+# and creates the RURUN, RUCRT, and RUCRTTST commands.
+
+make BIN_LIB=RPGUNITLIB install
+</pre>
+
+<p>If you are using the Bob build framework (covered in the Bob post), RPGUnit ships with a compatible <code>Rules.mk</code> and can be built with Bob instead of GNU make:</p>
+
+<pre>
+# Bob-based build (if Bob is installed in /opt/bob)
+/opt/bob/bin/makei build
+</pre>
+
+<p>After installation, add RPGUNITLIB to your library list before running tests:</p>
+
+<pre>
+ADDLIBLE LIB(RPGUNITLIB)
+</pre>
+
+<p>Verify the installation by displaying the RURUN command:</p>
+
+<pre>
+DSPCMD CMD(RPGUNITLIB/RURUN)
+</pre>
+
+<h2>Writing Your First Test Case</h2>
+
+<p>A test module is an ILE RPG source member that binds to the RPGUnit framework. The structure is straightforward:</p>
+
+<ul>
+<li>The member must include the RPGUnit copy member <code>TESTCASE</code> from RPGUNITLIB (or the equivalent <code>/copy</code> directive).</li>
+<li>Any procedure whose name begins with <code>test</code> (case-insensitive) is treated as a test case by the runner.</li>
+<li>The optional <code>setUp</code> procedure runs before each test case.</li>
+<li>The optional <code>tearDown</code> procedure runs after each test case.</li>
+<li>Assertions are called directly — they raise a test failure if the condition is not met.</li>
+</ul>
+
+<p>Available assertion procedures exported by the RPGUnit service programme:</p>
+
+<ul>
+<li><code>assertEqual(expected: integer, actual: integer)</code> — asserts two integers are equal.</li>
+<li><code>assertCharEquals(expected: char, actual: char)</code> — asserts two character values are equal, trimming trailing blanks.</li>
+<li><code>assertDecimalEquals(expected: packed, actual: packed, delta: packed)</code> — asserts two packed decimal values are equal within a tolerance.</li>
+<li><code>assertNotNull(pointer)</code> — asserts a pointer is not null.</li>
+<li><code>aEqual(expected: char, actual: char)</code> — shorthand alias for assertCharEquals.</li>
+<li><code>iEqual(expected: integer, actual: integer)</code> — shorthand alias for assertEqual.</li>
+<li><code>fail(message: char)</code> — unconditionally fails the test with a message.</li>
+<li><code>assert(condition: ind, message: char)</code> — fails the test if the indicator is off.</li>
+</ul>
+
+<h2>A Complete Example: Testing the ORDVAL Service Programme</h2>
+
+<p>The service programme being tested is <strong>ORDVAL</strong> in library <strong>MYLIB</strong>. It validates an order and returns a return code:</p>
+
+<ul>
+<li>0 — order is valid</li>
+<li>1 — order amount is below the minimum threshold (£50.00)</li>
+<li>2 — customer is inactive</li>
+<li>3 — order number is blank</li>
+</ul>
+
+<p>The service programme source (ORDVAL.RPGLE):</p>
+
+<pre>
+**FREE
+// ORDVAL.RPGLE — Order validation service programme
+// Compile: CRTRPGMOD MODULE(MYLIB/ORDVAL) SRCFILE(MYLIB/QRPGLESRC)
+// Bind:    CRTSRVPGM SRVPGM(MYLIB/ORDVAL) MODULE(MYLIB/ORDVAL) EXPORT(*ALL)
+
+ctl-opt dftactgrp(*no) actgrp('QILE') nomain;
+
+dcl-proc ValidateOrder export;
+  dcl-pi *n int(10);
+    i_ordNum  char(10) const;
+    i_custId  char(10) const;
+    i_amount  packed(13:2) const;
+  end-pi;
+
+  dcl-s custActive ind;
+  dcl-s minAmount  packed(13:2) inz(50.00);
+
+  // Blank order number
+  if %trim(i_ordNum) = '';
+    return 3;
+  endif;
+
+  // Amount below minimum
+  if i_amount < minAmount;
+    return 1;
+  endif;
+
+  // Check customer active status via DB2 for i
+  exec sql
+    SELECT CASE WHEN STATUS = 'A' THEN '1' ELSE '0' END
+    INTO   :custActive
+    FROM   MYLIB.CUSTOMERS
+    WHERE  CUSTID = :i_custId
+    FETCH FIRST 1 ROW ONLY;
+
+  if sqlcode <> 0 or not custActive;
+    return 2;
+  endif;
+
+  return 0;
+
+end-proc;
+</pre>
+
+<p>The test module (ORDVALTEST.RPGLE) exercises all four return code paths:</p>
+
+<pre>
+**FREE
+// ORDVALTEST.RPGLE — RPGUnit test module for ORDVAL service programme
+// Compile:  CRTRPGMOD MODULE(MYLIB/ORDVALTEST) SRCFILE(MYLIB/QRPGLESRC)
+//           Bind directory must include RPGUNITLIB/RPGUNIT
+// Bind:     RUCRTTST TSTPGM(MYLIB/ORDVALTEST)
+//           (RUCRTTST handles CRTSRVPGM with correct binding)
+
+ctl-opt dftactgrp(*no) actgrp('QILE') nomain;
+
+/copy RPGUNITLIB/QINCLUDE,TESTCASE
+
+// Prototype for the procedure under test
+dcl-pr ValidateOrder int(10) extproc(*dclcase);
+  i_ordNum  char(10) const;
+  i_custId  char(10) const;
+  i_amount  packed(13:2) const;
+end-pr;
+
+// ─── setUp — runs before every test procedure ──────────────────────────────
+dcl-proc setUp export;
+  // Insert a known-good active customer for tests that need one
+  exec sql
+    MERGE INTO MYLIB.CUSTOMERS AS tgt
+    USING (VALUES('CUST000001', 'A', 'Test Customer')) AS src(CUSTID, STATUS, NAME)
+    ON tgt.CUSTID = src.CUSTID
+    WHEN MATCHED THEN UPDATE SET STATUS = src.STATUS, NAME = src.NAME
+    WHEN NOT MATCHED THEN INSERT (CUSTID, STATUS, NAME)
+                          VALUES (src.CUSTID, src.STATUS, src.NAME);
+end-proc;
+
+// ─── tearDown — runs after every test procedure ────────────────────────────
+dcl-proc tearDown export;
+  // Remove test data to keep the database clean between test runs
+  exec sql
+    DELETE FROM MYLIB.CUSTOMERS WHERE CUSTID = 'CUST000001';
+end-proc;
+
+// ─── Test 1: Valid order returns 0 ────────────────────────────────────────
+dcl-proc testValidOrderReturnsZero export;
+  dcl-s result int(10);
+
+  result = ValidateOrder(
+    'ORD0000001':   // valid order number
+    'CUST000001':   // active customer inserted by setUp
+    250.00          // amount above minimum
+  );
+
+  iEqual(0: result);   // assertEqual(0, result)
+end-proc;
+
+// ─── Test 2: Amount below minimum returns 1 ───────────────────────────────
+dcl-proc testAmountBelowMinimumReturnsOne export;
+  dcl-s result int(10);
+
+  result = ValidateOrder(
+    'ORD0000002':
+    'CUST000001':
+    10.00           // below £50.00 minimum
+  );
+
+  iEqual(1: result);
+end-proc;
+
+// ─── Test 3: Inactive customer returns 2 ──────────────────────────────────
+dcl-proc testInactiveCustomerReturnsTwo export;
+  dcl-s result int(10);
+
+  // Insert an inactive customer specifically for this test
+  exec sql
+    INSERT INTO MYLIB.CUSTOMERS (CUSTID, STATUS, NAME)
+    VALUES ('CUST000099', 'I', 'Inactive Test Customer')
+    ON CONFLICT DO NOTHING;
+
+  result = ValidateOrder(
+    'ORD0000003':
+    'CUST000099':   // inactive customer
+    500.00
+  );
+
+  iEqual(2: result);
+
+  // Clean up inline — tearDown only removes CUST000001
+  exec sql DELETE FROM MYLIB.CUSTOMERS WHERE CUSTID = 'CUST000099';
+end-proc;
+
+// ─── Test 4: Blank order number returns 3 ─────────────────────────────────
+dcl-proc testBlankOrderNumberReturnsThree export;
+  dcl-s result int(10);
+
+  result = ValidateOrder(
+    '          ':   // ten blank characters
+    'CUST000001':
+    500.00
+  );
+
+  iEqual(3: result);
+end-proc;
+</pre>
+
+<h2>Compiling and Running Tests</h2>
+
+<p>RPGUnit provides several commands for compiling and running test modules.</p>
+
+<p><strong>RUCRTTST</strong> compiles a test module source member and binds it into a test service programme in a single step. It handles CRTRPGMOD and CRTSRVPGM with the correct binding directory reference to RPGUnit:</p>
+
+<pre>
+RUCRTTST TSTPGM(MYLIB/ORDVALTEST)
+         SRCFILE(MYLIB/QRPGLESRC)
+         SRCMBR(ORDVALTEST)
+         BNDSRVPGM(MYLIB/ORDVAL)
+         BNDDIR(RPGUNITLIB/RPGUNIT)
+</pre>
+
+<p><strong>RUCRT</strong> is the lower-level command that only binds (CRTSRVPGM) an already-compiled module. Use RUCRT when you are compiling the module separately with your own CRTRPGMOD call (for example, in a Bob makefile) and only need RPGUnit to bind it:</p>
+
+<pre>
+CRTRPGMOD MODULE(MYLIB/ORDVALTEST)
+          SRCFILE(MYLIB/QRPGLESRC)
+          SRCMBR(ORDVALTEST)
+          DBGVIEW(*ALL)
+
+RUCRT TSTPGM(MYLIB/ORDVALTEST)
+      MODULE(MYLIB/ORDVALTEST)
+      BNDSRVPGM(MYLIB/ORDVAL)
+      BNDDIR(RPGUNITLIB/RPGUNIT)
+</pre>
+
+<p><strong>RURUN</strong> executes the test service programme and reports results. By default it prints to the job log; with OUTPUT(*TAP) it emits TAP-format output to stdout:</p>
+
+<pre>
+-- Run all test procedures in ORDVALTEST
+RURUN TSTPGM(MYLIB/ORDVALTEST)
+
+-- Run with TAP output (useful for CI)
+RURUN TSTPGM(MYLIB/ORDVALTEST) OUTPUT(*TAP)
+</pre>
+
+<p>TAP output from RURUN looks like this when all four tests pass:</p>
+
+<pre>
+TAP version 13
+1..4
+ok 1 - testValidOrderReturnsZero
+ok 2 - testAmountBelowMinimumReturnsOne
+ok 3 - testInactiveCustomerReturnsTwo
+ok 4 - testBlankOrderNumberReturnsThree
+# Tests run: 4, Passed: 4, Failed: 0
+</pre>
+
+<p>When a test fails, TAP output includes the diagnostic:</p>
+
+<pre>
+not ok 2 - testAmountBelowMinimumReturnsOne
+  ---
+  message: 'Expected 1 but was 0'
+  severity: fail
+  at:
+    file: ORDVALTEST
+    line: 52
+  ...
+</pre>
+
+<p><strong>RUCALLTST</strong> is an alternative runner that executes tests without requiring RURUN to be on the library list — it calls the test service programme directly and is useful for scripted test execution from CL:</p>
+
+<pre>
+CALL PGM(RPGUNITLIB/RUCALLTST)
+     PARM('MYLIB' 'ORDVALTEST' '*TAP')
+</pre>
+
+<h2>Test Suites and Fixtures</h2>
+
+<p>As the test suite grows beyond a handful of test modules, organisation becomes important. RPGUnit supports running multiple test service programmes in sequence, and the setUp/tearDown fixture pattern enables shared test data management.</p>
+
+<p>Run all test service programmes in a library using a wildcard:</p>
+
+<pre>
+-- Run every *SVCPGM in MYLIB whose name ends in TEST
+RURUN TSTPGM(MYLIB/*ALL) NAMEFILTER(*TEST) OUTPUT(*TAP)
+</pre>
+
+<p>A dedicated test library separates test objects from production objects and prevents test data from contaminating production tables:</p>
+
+<pre>
+CRTLIB LIB(MYTESTLIB) TEXT('Unit test objects and data')
+
+-- Compile test modules into the test library
+RUCRTTST TSTPGM(MYTESTLIB/ORDVALTEST)
+         SRCFILE(MYLIB/QRPGLESRC)
+         SRCMBR(ORDVALTEST)
+         BNDSRVPGM(MYLIB/ORDVAL)
+         BNDDIR(RPGUNITLIB/RPGUNIT)
+
+-- Run all tests in the test library
+RURUN TSTPGM(MYTESTLIB/*ALL) OUTPUT(*TAP)
+</pre>
+
+<p>A shared fixture module can be bound into every test service programme to provide common setUp logic, such as connecting to a test schema or populating a reference data table:</p>
+
+<pre>
+**FREE
+// TESTFIXTURE.RPGLE — shared fixture module
+// Bound into every test service programme via BNDSRVPGM(MYTESTLIB/TESTFIXTURE)
+
+ctl-opt dftactgrp(*no) actgrp('QILE') nomain;
+
+dcl-proc CreateTestSchema export;
+  exec sql
+    CREATE SCHEMA TESTSCHEMA IF NOT EXISTS;
+  exec sql
+    CREATE OR REPLACE TABLE TESTSCHEMA.CUSTOMERS
+      LIKE MYLIB.CUSTOMERS INCLUDING IDENTITY;
+  exec sql
+    INSERT INTO TESTSCHEMA.CUSTOMERS
+    SELECT * FROM MYLIB.CUSTOMERS
+    WHERE CUSTID LIKE 'TEST%';
+end-proc;
+
+dcl-proc DropTestSchema export;
+  exec sql DROP SCHEMA TESTSCHEMA CASCADE IF EXISTS;
+end-proc;
+</pre>
+
+<h2>CI Integration: Running RPGUnit from a Shell Script</h2>
+
+<p>RPGUnit tests can be run from a PASE shell script, making them straightforward to integrate into a Bob build pipeline or a Jenkins job running on IBM i.</p>
+
+<p>A PASE shell script that runs the test suite and fails the build on any test failure:</p>
+
+<pre>
+#!/QOpenSys/pkgs/bin/bash
+# run-tests.sh — Run RPGUnit tests from PASE shell
+# Used by Bob makefile or Jenkins pipeline
+# Exit code 0 = all tests passed; non-zero = failure
+
+set -euo pipefail
+
+TESTLIB="MYTESTLIB"
+TAPFILE="/tmp/rpgunit-results.tap"
+
+echo "Running RPGUnit test suite in library ${TESTLIB}..."
+
+# RUCALLTST via system() writes TAP to stdout
+/QOpenSys/pkgs/bin/system \
+  "RURUN TSTPGM(${TESTLIB}/*ALL) OUTPUT(*TAP)" \
+  > "${TAPFILE}" 2>&1
+
+echo "TAP output written to ${TAPFILE}"
+cat "${TAPFILE}"
+
+# Count failures in TAP output
+FAIL_COUNT=$(grep -c '^not ok' "${TAPFILE}" || true)
+
+if [ "${FAIL_COUNT}" -gt 0 ]; then
+    echo "TEST FAILURE: ${FAIL_COUNT} test(s) failed."
+    exit 1
+fi
+
+echo "All tests passed."
+exit 0
+</pre>
+
+<p>In a Bob <code>Makefile</code>, the test step is a target that depends on the compile targets:</p>
+
+<pre>
+# Makefile excerpt — Bob build with RPGUnit test step
+
+.PHONY: test
+
+# Compile production service programme
+MYLIB/ORDVAL.SRVPGM: MYLIB/ORDVAL.MODULE
+	$(BOB) CRTSRVPGM SRVPGM(MYLIB/ORDVAL) MODULE(MYLIB/ORDVAL) EXPORT(*ALL)
+
+# Compile test module and bind
+MYTESTLIB/ORDVALTEST.SRVPGM: MYLIB/ORDVAL.SRVPGM
+	$(BOB) RUCRTTST TSTPGM(MYTESTLIB/ORDVALTEST) \
+	    SRCFILE(MYLIB/QRPGLESRC) SRCMBR(ORDVALTEST) \
+	    BNDSRVPGM(MYLIB/ORDVAL) BNDDIR(RPGUNITLIB/RPGUNIT)
+
+# Run test suite
+test: MYTESTLIB/ORDVALTEST.SRVPGM
+	/QOpenSys/pkgs/bin/bash run-tests.sh
+</pre>
+
+<p>For a Jenkins pipeline running on IBM i (via the Jenkins SSH Agent plugin or a Jenkins agent process running in PASE):</p>
+
+<pre>
+// Jenkinsfile — IBM i RPGUnit CI pipeline
+pipeline {
+    agent { label 'ibmi-pase' }
+
+    stages {
+        stage('Compile') {
+            steps {
+                sh '/opt/bob/bin/makei build'
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                sh 'bash run-tests.sh'
+            }
+            post {
+                always {
+                    // Archive TAP results — Jenkins TAP plugin can parse these
+                    archiveArtifacts artifacts: '/tmp/rpgunit-results.tap', allowEmptyArchive: true
+                    // If using the TAP Jenkins plugin:
+                    // tap testResults: '/tmp/rpgunit-results.tap'
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo 'Build or tests failed. Check the TAP output in the archived artefacts.'
+        }
+    }
+}
+</pre>
+
+<h2>Test-Driven Development (TDD) Mindset for RPG</h2>
+
+<p>Test-Driven Development applied to ILE RPG follows the same red-green-refactor cycle used in any language: write a failing test first, write the minimum RPG to make it pass, then refactor for clarity and efficiency while keeping the tests green.</p>
+
+<p>The TDD discipline changes the way RPG service programmes are designed. When you write the test first, you are forced to define the procedure's interface before implementing it — what it receives, what it returns, and what it should do when inputs are invalid. This naturally leads to:</p>
+
+<ul>
+<li><strong>Smaller, more focused procedures.</strong> A procedure that does ten things is hard to test in isolation. TDD pushes you toward procedures that do one thing well.</li>
+<li><strong>Explicit error handling.</strong> Tests for error conditions — null inputs, out-of-range values, not-found SQL results — force the implementation to handle them deliberately rather than letting them cause unpredictable behaviour.</li>
+<li><strong>No implicit global state.</strong> Procedures that read and modify module-level data structures are difficult to test because the test must know about and manage that state. TDD pressure encourages passing data in and out through parameters rather than relying on shared variables.</li>
+</ul>
+
+<p>A TDD session for a new procedure CalcDiscount in service programme PRICING might begin with the test:</p>
+
+<pre>
+**FREE
+// Write this test BEFORE writing CalcDiscount
+dcl-proc testPremiumCustomerGets15PctDiscount export;
+  dcl-s result packed(5:2);
+
+  // CalcDiscount(orderAmount, customerTier) returns discount percentage
+  result = CalcDiscount(1000.00: 'PREMIUM');
+
+  assertDecimalEquals(15.00: result: 0.001);
+end-proc;
+
+dcl-proc testStandardCustomerGets5PctDiscount export;
+  dcl-s result packed(5:2);
+
+  result = CalcDiscount(1000.00: 'STANDARD');
+
+  assertDecimalEquals(5.00: result: 0.001);
+end-proc;
+
+dcl-proc testUnknownTierGetsZeroDiscount export;
+  dcl-s result packed(5:2);
+
+  result = CalcDiscount(1000.00: 'UNKNOWN');
+
+  assertDecimalEquals(0.00: result: 0.001);
+end-proc;
+</pre>
+
+<p>Running RURUN against this test module before implementing CalcDiscount produces three <code>not ok</code> TAP lines — the red phase. Implementing the minimum CalcDiscount logic to satisfy these three tests produces three <code>ok</code> lines — the green phase. The refactor phase then improves the implementation without changing the tests or the observed behaviour.</p>
+
+<p>This discipline is particularly valuable during modernisation. When API wrapping exposes RPG procedures to HTTP clients, the test suite is the proof that the RPG logic behaves correctly across all known input cases — including edge cases that would previously have been handled silently by the 5250 screen validation layer and are now exposed directly to the outside world.</p>
+
+<em>Next post: DB2 for i Triggers — SQL and external triggers, BEFORE and AFTER trigger timing, using triggers for audit logging and referential integrity, trigger buffer layout, and how to call an RPG program from a DB2 trigger.</em>

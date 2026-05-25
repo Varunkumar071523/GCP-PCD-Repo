@@ -1,0 +1,174 @@
+The previous post covered Node.js on IBM i — building REST APIs that expose IBM i data and programs. This post covers performance: understanding how IBM i uses memory, how to read the tools that show you what the system is doing, and how to diagnose the causes of slow jobs and batch processes.
+
+IBM i performance tuning is different from performance tuning on Linux or Windows because the resource model is different. IBM i uses a concept called memory pools to allocate main storage to groups of jobs. The storage model, the subsystem structure, and the way the system queues work all affect performance in ways that are specific to IBM i. Understanding the model is the prerequisite for reading the tools correctly.
+
+<h2>Memory pools and auxiliary storage pools</h2>
+
+IBM i divides main storage (RAM) into memory pools. Each pool has a fixed allocation of storage, and the jobs running in a subsystem draw storage from that subsystem's pool. When a pool runs short of storage, the system pages jobs out to disk (auxiliary storage). Paging is the primary performance problem on IBM i — not CPU contention.
+
+<strong>System-defined memory pools:</strong>
+<ul>
+<li><strong>*MACHINE</strong> — licensed internal code and OS kernel. Cannot be modified.</li>
+<li><strong>*BASE</strong> — all jobs not assigned to a private pool. The default for most subsystems.</li>
+<li><strong>*INTERACT</strong> — interactive jobs. On most systems, given a dedicated pool to prevent batch jobs from starving interactive users.</li>
+<li><strong>*SPOOL</strong> — spooled file (print queue) processing.</li>
+</ul>
+
+<strong>Shared and private pools:</strong> Subsystems can use shared system pools (*BASE, *INTERACT) or have dedicated private pools. High-volume batch subsystems benefit from private pools to prevent resource contention.
+
+<pre>-- Current pool allocation and usage
+SELECT POOL_NAME, SUBSYSTEM_NAME, DEFINED_SIZE_KB,
+       CURRENT_SIZE_KB, PAGING_FAULTS_PER_SEC
+FROM   QSYS2.MEMORY_POOL_INFO
+ORDER  BY CURRENT_SIZE_KB DESC;</pre>
+
+<h2>Key system values affecting performance</h2>
+
+<strong>QMCHPOOL</strong> — machine pool size. IBM recommends leaving at least 30% of total storage for the machine pool. Too small and the OS itself pages, causing system-wide degradation.
+
+<strong>QBASPOOL</strong> — base pool size in kilobytes. The floor below which *BASE cannot drop.
+
+<strong>QPFRADJ</strong> — performance adjustment. Set to 2 (enabled, adjust both pools and activity levels) on most production systems. Values:
+<ul>
+<li>0 — no automatic adjustment</li>
+<li>1 — adjust only when operator requests it</li>
+<li>2 — continuous automatic adjustment (recommended)</li>
+<li>3 — adjust on IPL and when requested</li>
+</ul>
+
+<strong>QMAXACTLVL</strong> — maximum activity level for *BASE pool. The maximum number of threads that can be active simultaneously in *BASE. Setting this too low creates wait conditions; too high causes thrashing.
+
+<pre>SELECT SYSTEM_VALUE_NAME, CURRENT_NUMERIC_VALUE, CURRENT_CHARACTER_VALUE
+FROM   QSYS2.SYSTEM_VALUE_INFO
+WHERE  SYSTEM_VALUE_NAME IN ('QPFRADJ','QMAXACTLVL','QBASACTLVL',
+                              'QMCHPOOL','QBASPOOL','QTOTLAUX')
+ORDER  BY SYSTEM_VALUE_NAME;</pre>
+
+<h2>Reading WRKSYSSTS correctly</h2>
+
+WRKSYSSTS (Work with System Status) is the primary screen for an IBM i system status snapshot. The key metrics:
+
+<pre>WRKSYSSTS RESET(*YES)    /* Reset statistics counters for a clean baseline */</pre>
+
+<strong>% CPU used</strong> — total CPU utilisation. On a well-tuned production system, this should stay below 70% at peak. Above 80% sustained means CPU is a constraint; add capacity or reduce workload.
+
+<strong>DB fault/s, DB pages</strong> — database page faults per second. A fault occurs when the OS needs a database page that is not in main storage. High DB faults (above 20–30/s as a rough guide for an interactive system) indicate the database pool is undersized relative to the working set.
+
+<strong>Non-DB fault/s</strong> — non-database page faults. High non-DB faults indicate the base or interactive pool is undersized.
+
+<strong>Active to wait, Wait to Ineligible</strong> — transitions through the job state machine. A high "Active to Wait" rate means jobs are frequently waiting on I/O or other resources. "Wait to Ineligible" means the pool activity level is capping the number of active threads — increase the pool's activity level or its storage allocation.
+
+<h2>Reading WRKACTJOB</h2>
+
+WRKACTJOB (Work with Active Jobs) shows all active jobs on the system. The columns that matter for performance diagnosis:
+
+<pre>WRKACTJOB SBS(*ALL)     /* Show all subsystems */</pre>
+
+<strong>Opt</strong> — select option 5 (Work with) on any job to drill into its details, including the job log.
+
+<strong>Status</strong> — the most important column:
+<ul>
+<li><code>RUN</code> — actively using CPU</li>
+<li><code>DEQW</code> — waiting on a data queue</li>
+<li><code>EVTW</code> — waiting on an event (semaphore, IPC)</li>
+<li><code>SELW</code> — waiting on a select() call (network I/O)</li>
+<li><code>DSKW</code> — waiting on disk I/O — <strong>investigate if many jobs show this</strong></li>
+<li><code>LCKW</code> — waiting on an object lock — <strong>immediate investigation priority</strong></li>
+<li><code>THDW</code> — thread wait</li>
+<li><code>MSGW</code> — waiting for operator reply to a message</li>
+</ul>
+
+<strong>Diagnosing a LCKW:</strong>
+
+<pre>-- Find what object a job is waiting to lock, and who holds it
+SELECT LOCK_NAME, LOCK_STATE, JOB_NAME, LOCK_SCOPE
+FROM   QSYS2.OBJECT_LOCK_INFO
+WHERE  OBJECT_NAME    = 'ORDHDR'
+  AND  OBJECT_LIBRARY = 'ORDLIB'
+  AND  OBJECT_TYPE    = '*FILE'
+ORDER  BY JOB_NAME;</pre>
+
+<h2>Collection Services</h2>
+
+Collection Services is IBM i's built-in performance data collector. It runs as a system service and collects hundreds of performance metrics at configurable intervals into a performance database.
+
+<strong>Starting Collection Services:</strong>
+
+<pre>STRPFRCOL    /* Start collection with default settings (interval: 5 minutes) */
+
+/* Or specify a shorter interval for problem investigation */
+STRPFRCOL INTERVAL(1) COLTYPE(*INTERVAL)</pre>
+
+<strong>Viewing Collection Services data via SQL:</strong>
+
+<pre>-- CPU utilisation over the last hour
+SELECT INTSTTSP AS INTERVAL_START,
+       CPUPCT   AS CPU_PCT,
+       DSKRDS   AS DISK_READS,
+       DSKWRTS  AS DISK_WRITES
+FROM   QSYS2.SYSPERFCOL
+WHERE  INTSTTSP > CURRENT_TIMESTAMP - 1 HOUR
+ORDER  BY INTSTTSP;</pre>
+
+IBM Navigator for i provides graphical views of Collection Services data — CPU, disk I/O, memory pool utilisation, and network throughput — over configurable time ranges. This is the tool to use for identifying whether a performance problem is resource constraint (CPU, memory, disk) or a workload pattern issue.
+
+<h2>Diagnosing slow batch jobs</h2>
+
+<strong>Step 1 — Check if the job is actually running:</strong> In WRKACTJOB, is the job in RUN status? If it is in DSKW constantly, the disk subsystem is a bottleneck. If it is in LCKW, another job holds a lock it needs.
+
+<strong>Step 2 — Check the job log:</strong> Press F10 on the job in WRKACTJOB, or use DSPJOBLOG. Look for CPF messages, SQL messages (SQ prefix), or timing messages. In particular, watch for:
+<ul>
+<li>CPI2777 — DB2 is performing a table scan instead of using an index</li>
+<li>CPI4322 — temporary index was built for a query (index Advisor is recommending one)</li>
+</ul>
+
+<strong>Step 3 — Check SQL performance with the Plan Cache:</strong>
+
+<pre>-- Find the slowest SQL statements run by a specific job in the last hour
+SELECT QUERY_TEXT,
+       AVG_TIME_PER_RUN / 1000 AS AVG_SECONDS,
+       RUN_COUNT,
+       ROWS_PROCESSED
+FROM   QSYS2.SYSQRYSLT
+WHERE  QUERY_CREATOR = 'BATCHJOB'
+ORDER  BY AVG_TIME_PER_RUN DESC
+FETCH FIRST 10 ROWS ONLY;</pre>
+
+<strong>Step 4 — Index Advisor:</strong>
+
+<pre>-- Check if DB2 is recommending indexes for your queries
+SELECT SYSTEM_TABLE_NAME, MTI_USED, MTI_CREATED, TIMES_ADVISED,
+       ADVISED_INDEX_KEYS
+FROM   QSYS2.SYSIXADV
+WHERE  SYSTEM_TABLE_SCHEMA = 'ORDLIB'
+ORDER  BY TIMES_ADVISED DESC
+FETCH FIRST 20 ROWS ONLY;</pre>
+
+If the Index Advisor shows a frequently advised index that does not exist — create it. This is the single most impactful performance action for SQL-based batch jobs.
+
+<h2>Disk I/O and auxiliary storage pools</h2>
+
+IBM i organises disk storage into Auxiliary Storage Pools (ASPs). The system ASP (ASP 1) holds the OS and most libraries. User ASPs (ASPs 2–32) and Independent ASPs (iASPs, ASPs 33–255) can hold application data.
+
+Separating high-I/O database files to a dedicated ASP (with its own disk drives) reduces contention with system paging and OS activity. This is relevant for large IBM i installations with significant concurrent batch I/O.
+
+<pre>-- Check ASP utilisation
+SELECT ASP_NUMBER, ASP_TYPE, TOTAL_CAPACITY_GB,
+       USED_CAPACITY_GB,
+       ROUND(USED_CAPACITY_GB / TOTAL_CAPACITY_GB * 100, 1) AS PCT_USED
+FROM   QSYS2.ASP_INFO
+ORDER  BY ASP_NUMBER;</pre>
+
+<h2>Common performance anti-patterns</h2>
+
+<strong>Full table scans in batch loops:</strong> An RPG program that loops over all records in ORDHDR and does a CHAIN into ORDLIN for each — with no index on the join key — performs one random I/O per record. On a million-record file, this is the difference between a 2-minute batch job and a 4-hour one. Move the join to SQL.
+
+<strong>Open Data Path (ODP) reuse:</strong> When an RPG program opens the same file repeatedly in a loop, each open allocates an ODP. ODP reuse (OVRDBF OVRSCOPE(*JOB)) or restructuring to open once outside the loop avoids repeated ODP creation.
+
+<strong>Commitment control with journalling overhead:</strong> Running SQL updates inside a commitment control boundary with COMMIT(*CHG) journals every change. For large batch updates where rollback is not needed, COMMIT(*NONE) eliminates journalling overhead. Use deliberately — this trades recovery capability for performance.
+
+<strong>Interactive jobs doing heavy batch work:</strong> Interactive jobs run in the interactive pool, which is sized for response time, not throughput. Submit heavy processing with SBMJOB to a batch subsystem with appropriate pool sizing.
+
+IBM i performs extraordinarily well when jobs run in correctly sized pools, when SQL uses indexes, and when batch workloads are designed for throughput rather than adapted from interactive patterns. The diagnostic path is always the same: WRKSYSSTS for resource constraints, WRKACTJOB for job-level state, the plan cache and Index Advisor for SQL, and Collection Services for historical trend analysis.
+
+<em>Next post: Advanced DB2 for i SQL — Materialized Query Tables, the SQE versus CQE split, index statistics, and the SQL patterns that matter most for query performance on IBM i.</em>

@@ -1,0 +1,398 @@
+<p>The previous post covered vector search and text embeddings on IBM i — generating embeddings with OpenAI and watsonx.ai, storing vectors in DB2 for i, implementing cosine similarity in SQL, and building a RAG pipeline over IBM i data. This post steps back to look at the broader picture: how to plan an IBM i application modernisation programme in 2026, choose the right strategy for each part of your estate, and avoid the traps that sink well-intentioned projects.</p>
+
+<h2>Why Modernise — and Why Not Everything Needs It</h2>
+
+<p>IBM i is not a problem to be solved. The platform runs business-critical workloads with extraordinary reliability, and the RPG and COBOL programmes sitting on most IBM i systems encode decades of validated business logic. The question is never "how do we get off IBM i?" The question is which interfaces, integrations, and user experiences need to change, and which should be left exactly as they are.</p>
+
+<p>A 5250 green-screen application that is only ever used by two operators who know it perfectly is not a modernisation candidate. An RPG batch job that reconciles accounts at midnight and has never failed in fifteen years is not a modernisation candidate. What <em>are</em> candidates:</p>
+
+<ul>
+<li>5250 screens used by staff who also work in web browsers and mobile apps — the cognitive gap between those two worlds costs onboarding time and introduces errors.</li>
+<li>RPG programmes that other systems try to integrate with via flat files, data queues, or screen scraping — those integration patterns should be replaced with REST APIs.</li>
+<li>Business logic that changes frequently and is currently locked inside a large monolithic RPG programme — making that logic testable and independently deployable reduces risk.</li>
+<li>Reporting and analytics that route IBM i data through complex extract-load pipelines — in-database SQL and open-source tooling can often eliminate those pipelines entirely.</li>
+</ul>
+
+<p>Starting from this triage mindset — modernise what earns modernisation, leave alone what works — is the single most important factor in a successful programme.</p>
+
+<h2>The Modernisation Spectrum: Six Strategies</h2>
+
+<p>Modernisation strategies exist on a spectrum from least to most invasive. Each has a different risk profile, cost, and lead time. You will almost certainly use several of them simultaneously on different parts of the same IBM i estate.</p>
+
+<h2>Strategy 1: Screen Transformation</h2>
+
+<p><strong>Screen transformation</strong> leaves the RPG application and 5250 data stream completely untouched and places a translation layer in front of it. Tools such as Profound UI, Rocket TN5250, and IBM i Access Client Solutions intercept the 5250 stream and render it as HTML or a modern web UI.</p>
+
+<p>This is the fastest path to a browser-based user experience. There is no RPG change, no recompile, and no risk to the business logic. The trade-off is that the user experience is constrained by the structure of the original 5250 screens. You can restyle a screen, add context-sensitive help, and remove irrelevant function keys, but you cannot fundamentally reorganise the workflow without changing the RPG.</p>
+
+<p>Profound UI adds a JavaScript configuration layer on top of the 5250 stream. A screen definition that previously required RPG-side field mapping can be enriched client-side:</p>
+
+<pre>
+// Profound UI enhancement — applied via the customization script
+// Hides the legacy F24 key list and adds a styled button panel
+Profound.on('screenReady', function(screenName) {
+    if (screenName === 'ORDENTRY') {
+        document.getElementById('fkey-bar').style.display = 'none';
+        Profound.addButton({ label: 'Submit Order', action: 'F6', style: 'primary' });
+        Profound.addButton({ label: 'Cancel',       action: 'F3', style: 'secondary' });
+    }
+});
+</pre>
+
+<p>Screen transformation is the right choice when business pressure demands a browser UI quickly and the RPG programmes are stable. It is not a long-term substitute for a proper API layer when integration with other systems is required.</p>
+
+<h2>Strategy 2: API Wrapping</h2>
+
+<p><strong>API wrapping</strong> exposes existing RPG business logic as HTTP endpoints without changing the RPG. A thin service layer — Node.js, Python, or a Java servlet — accepts HTTP requests, calls the RPG service programme via XMLSERVICE or itoolkit, and returns the result as JSON.</p>
+
+<p>This is the most common and most practical first step for integration modernisation. The RPG logic is validated, trusted, and already correct. There is no value in rewriting it. The value is in making it callable from web frontends, mobile apps, cloud functions, and partner systems.</p>
+
+<p>A practical example is covered in full in a later section of this post.</p>
+
+<h2>Strategy 3: Service Enablement</h2>
+
+<p><strong>Service enablement</strong> goes one step further: the IBM i HTTP server is configured to expose ILE RPG service programmes directly as HTTP endpoints using the integrated web application framework (IWS) or CGI handlers, without a Node.js or Python intermediary.</p>
+
+<p>IBM i ships with an Apache-based HTTP server that can be configured to call ILE programmes directly. A CGI programme written in RPG or C receives the HTTP request in stdin and writes the HTTP response to stdout:</p>
+
+<pre>
+**FREE
+// ORDSTSCGI.RPGLE — minimal CGI handler that returns order status as JSON
+// Compile: CRTRPGMOD + CRTPGM, add to HTTP server configuration
+
+ctl-opt dftactgrp(*no) actgrp('QILE');
+
+dcl-pr GetOrderStatus extpgm('GETORDSTS');
+  ordNum  char(10);
+  status  char(20);
+  amount  packed(13:2);
+end-pr;
+
+dcl-s ordNum  char(10);
+dcl-s status  char(20);
+dcl-s amount  packed(13:2);
+dcl-s qstring char(256);
+dcl-s jsonOut  varchar(512);
+
+// Read QUERY_STRING from environment
+qstring = %trim(%str(getenv('QUERY_STRING':*omit)));
+// Parse ordNum= from query string (simplified)
+ordNum = %subst(qstring: %scan('ordNum=': qstring) + 7: 10);
+
+GetOrderStatus(ordNum: status: amount);
+
+jsonOut = '{"ordNum":"' + %trim(ordNum) + '",' +
+          '"status":"' + %trim(status) + '",' +
+          '"amount":' + %char(amount) + '}';
+
+// Write HTTP response header + body to stdout
+dsply ('Content-Type: application/json') *inlr *on;
+// Production implementation uses write() to stdout file descriptor
+</pre>
+
+<p>Service enablement is appropriate when a Node.js or Python runtime is not available or desired, and the team is comfortable with IBM i HTTP server administration.</p>
+
+<h2>Strategy 4: UI Replacement</h2>
+
+<p><strong>UI replacement</strong> builds a completely new web or mobile frontend while keeping the IBM i backend — data, business logic, and batch processing — entirely unchanged. The new UI communicates with the IBM i through an API layer (strategy 2 or 3).</p>
+
+<p>This is the correct choice when the 5250 screens are genuinely limiting the user experience and screen transformation is not sufficient, but the RPG business logic is sound and should not be touched. React, Vue, or Angular frontends calling IBM i REST APIs are a common outcome of this strategy.</p>
+
+<h2>Strategy 5: Selective Rewrite</h2>
+
+<p><strong>Selective rewrite</strong> identifies specific modules of the IBM i estate where the business logic itself needs to change — because the original design is wrong, the requirements have changed, or the RPG is so entangled that adding a feature costs more than rewriting the module cleanly. Only those modules are rewritten, in a modern language or in modernised free-format RPG, while the rest of the estate is untouched.</p>
+
+<p>The key discipline here is to define clear module boundaries before rewriting. A module that previously called fifteen other RPG programmes via dynamic calls must have those dependencies made explicit and contracted before any rewrite begins.</p>
+
+<h2>Strategy 6: Full Rewrite or Cloud Migration</h2>
+
+<p>A <strong>full rewrite</strong> replaces the entire IBM i application estate with a new system on a different platform. This is the highest-risk, highest-cost, longest-lead-time option, and it is the one most frequently championed by vendors who do not have to live with the consequences.</p>
+
+<p>A full rewrite is justified when: the IBM i hardware lease is ending and renewal is not economically viable; the business model has changed so fundamentally that the existing system cannot be adapted; or the entire business logic is being replaced, not just the technology. In every other situation, one of strategies 1 through 5 will deliver better outcomes at lower risk and cost.</p>
+
+<h2>The Strangler Fig Pattern on IBM i</h2>
+
+<p>The <strong>strangler fig pattern</strong> — named after the tropical fig tree that grows around a host tree and eventually replaces it — provides a safe, incremental approach to replacing IBM i functionality over time. The IBM i is never switched off suddenly; instead, it is gradually surrounded by new components that handle increasingly more of the workload.</p>
+
+<p>The pattern works as follows on IBM i:</p>
+
+<ul>
+<li>A routing layer (an API gateway, a Node.js proxy, or an IBM DataPower instance) sits in front of all client requests.</li>
+<li>New functionality is implemented in the new system; legacy functionality remains in the IBM i.</li>
+<li>The router directs each request to whichever system currently owns that capability.</li>
+<li>Over time, more capabilities migrate from the IBM i to the new system, and the IBM i handles a smaller and smaller share of traffic.</li>
+<li>The IBM i remains the authoritative data source throughout the transition — data is not migrated until the new system's data layer is proven.</li>
+</ul>
+
+<p>A Node.js Express router implementing strangler fig routing for an order management system:</p>
+
+<pre>
+// strangler-router.js
+// Routes requests to either the IBM i legacy API or the new order service
+// depending on which capabilities have been migrated
+
+const express = require('express');
+const { createProxyMiddleware } = require('http-proxy-middleware');
+
+const app = express();
+
+// Feature flag store — in production this would be Redis or a config service
+const migratedCapabilities = new Set([
+    'GET /orders/:id/tracking',   // migrated to new service
+    'POST /orders/:id/cancel',    // migrated to new service
+]);
+
+function isMigrated(method, path) {
+    // Normalise path parameters for matching
+    const normPath = path.replace(/\/[0-9]+/g, '/:id');
+    return migratedCapabilities.has(`${method} ${normPath}`);
+}
+
+// Proxy to new order service (Node.js / cloud)
+const newServiceProxy = createProxyMiddleware({
+    target: 'http://new-order-service:3001',
+    changeOrigin: true,
+});
+
+// Proxy to IBM i legacy REST adapter
+const ibmiProxy = createProxyMiddleware({
+    target: 'http://ibmi-api-adapter:8080',
+    changeOrigin: true,
+});
+
+app.use((req, res, next) => {
+    if (isMigrated(req.method, req.path)) {
+        console.log(`[STRANGLER] Routing ${req.method} ${req.path} → new service`);
+        return newServiceProxy(req, res, next);
+    }
+    console.log(`[STRANGLER] Routing ${req.method} ${req.path} → IBM i`);
+    return ibmiProxy(req, res, next);
+});
+
+app.listen(3000, () => console.log('Strangler router listening on :3000'));
+</pre>
+
+<p>The critical discipline is that the IBM i remains the <em>system of record</em> for all data during the transition. Any new service that handles a migrated capability must read and write through the IBM i data layer (via DB2 for i or the IBM i API layer) until the data itself is formally migrated and verified.</p>
+
+<h2>Assessment Framework: Classifying Your IBM i Programmes</h2>
+
+<p>Before choosing a modernisation strategy, every programme in the IBM i estate needs to be classified. A four-category framework works well in practice:</p>
+
+<ul>
+<li><strong>Keep:</strong> Stable, correct, and not a source of integration or UX pain. Batch jobs, financial calculation engines, EDI processing programmes. These should not be touched.</li>
+<li><strong>Modernise UI:</strong> Sound business logic but 5250 interface that is limiting productivity or cannot be accessed from mobile or web contexts. Apply screen transformation or UI replacement.</li>
+<li><strong>Replace integration:</strong> Programmes whose only purpose is to move data between systems — via flat files, data queues, or scheduled FTP transfers. Replace these with REST APIs or message-queue integrations.</li>
+<li><strong>Retire:</strong> Programmes that perform functions now handled by other systems, that are no longer called, or that duplicate functionality elsewhere. Identify these carefully before modernising anything that depends on them.</li>
+</ul>
+
+<p>A quick inventory query against IBM i object metadata can give you a starting list of programme usage patterns:</p>
+
+<pre>
+-- DB2 for i: find programmes with no recent journal activity
+-- Requires *SYSVAL QAUDLVL to include *PGMADP or similar
+-- A simpler proxy: look at last-used date on programme objects
+
+SELECT
+    OBJNAME,
+    OBJTYPE,
+    OBJSIZE,
+    LAST_USED_TIMESTAMP,
+    DAYS_USED_COUNT
+FROM TABLE(QSYS2.OBJECT_STATISTICS('MYLIB', '*PGM *SVCPGM')) AS X
+WHERE LAST_USED_TIMESTAMP < CURRENT_TIMESTAMP - 180 DAYS
+   OR LAST_USED_TIMESTAMP IS NULL
+ORDER BY LAST_USED_TIMESTAMP ASC NULLS FIRST;
+</pre>
+
+<p>Programmes not used in the past six months are candidates for the Retire category. This query alone often surfaces 20–30% of the estate as candidates for retirement or consolidation.</p>
+
+<h2>Practical API Wrapping Example: Exposing GETORDSTS via Node.js</h2>
+
+<p>This section shows a complete, working example of API wrapping — taking an existing RPG service programme and exposing it as a REST endpoint. No RPG changes are required.</p>
+
+<p>Assume the IBM i has a service programme <strong>GETORDSTS</strong> in library <strong>MYLIB</strong> with the following prototype:</p>
+
+<pre>
+**FREE
+// GETORDSTS.RPGLE — service programme procedure
+// Returns order status and amount for a given order number
+// Bound into service programme GETORDSTS in MYLIB
+
+dcl-proc GetOrderStatus export;
+  dcl-pi *n;
+    i_ordNum  char(10) const;
+    o_status  char(20);
+    o_amount  packed(13:2);
+    o_retCode int(10);
+  end-pi;
+
+  // Simplified — real implementation queries DB2 for i
+  exec sql
+    SELECT STATUS, AMOUNT
+    INTO  :o_status, :o_amount
+    FROM  MYLIB.ORDERS
+    WHERE ORDNUM = :i_ordNum
+    FETCH FIRST 1 ROW ONLY;
+
+  if sqlcode = 0;
+    o_retCode = 0;
+  elseif sqlcode = 100;
+    o_retCode = 1;   // Not found
+  else;
+    o_retCode = -1;  // Error
+  endif;
+
+end-proc;
+</pre>
+
+<p>The Node.js Express adapter calls this service programme via <strong>itoolkit</strong> (the IBM i open-source XMLSERVICE Node.js binding), which must be installed in PASE:</p>
+
+<pre>
+// order-status-route.js
+// Node.js Express route that wraps GETORDSTS RPG service programme
+// Run on IBM i PASE: node server.js
+// itoolkit installed via: npm install itoolkit
+
+const express = require('express');
+const { iConn, iSrvPgm, iDataQueue, xmlToJson } = require('itoolkit');
+const { XMLParser } = require('fast-xml-parser');
+
+const router = express.Router();
+
+// IBM i connection — uses *LOCAL when running on PASE
+function getConnection() {
+    return new iConn('*LOCAL', '', '');
+}
+
+router.get('/orders/:ordNum/status', async (req, res) => {
+    const ordNum = (req.params.ordNum || '').padEnd(10).substring(0, 10);
+
+    if (!/^[A-Z0-9 ]{10}$/.test(ordNum)) {
+        return res.status(400).json({ error: 'Invalid order number format' });
+    }
+
+    const conn = getConnection();
+
+    // Build the XMLSERVICE call descriptor for GETORDSTS
+    const pgm = new iSrvPgm('GETORDSTS', 'MYLIB', 'GetOrderStatus');
+    pgm.addParam({ type: '10A', io: 'in',  value: ordNum });     // i_ordNum
+    pgm.addParam({ type: '20A', io: 'out', value: '' });          // o_status
+    pgm.addParam({ type: '13p2', io: 'out', value: '0' });        // o_amount
+    pgm.addParam({ type: '10i0', io: 'out', value: '0' });        // o_retCode
+
+    conn.add(pgm);
+
+    try {
+        const xmlResult = await new Promise((resolve, reject) => {
+            conn.run((xmlOut) => {
+                if (!xmlOut) return reject(new Error('No XML output from XMLSERVICE'));
+                resolve(xmlOut);
+            });
+        });
+
+        const parser = new XMLParser({ ignoreAttributes: false });
+        const parsed = parser.parse(xmlResult);
+
+        // Navigate the XMLSERVICE response structure
+        const parms = parsed?.myscript?.pgm?.parm;
+        if (!parms || !Array.isArray(parms)) {
+            return res.status(500).json({ error: 'Unexpected XMLSERVICE response structure' });
+        }
+
+        const retCode = parseInt(parms[3]?.data?._text ?? '-1', 10);
+
+        if (retCode === 1) {
+            return res.status(404).json({ error: 'Order not found', ordNum: ordNum.trim() });
+        }
+        if (retCode !== 0) {
+            return res.status(500).json({ error: 'IBM i error', retCode });
+        }
+
+        return res.json({
+            ordNum:  ordNum.trim(),
+            status:  (parms[1]?.data?._text ?? '').trim(),
+            amount:  parseFloat(parms[2]?.data?._text ?? '0'),
+        });
+
+    } catch (err) {
+        console.error('GETORDSTS call failed:', err);
+        return res.status(500).json({ error: 'Internal error calling IBM i service programme' });
+    }
+});
+
+module.exports = router;
+</pre>
+
+<p>The Express application mounts this router and can be run as a persistent PASE service managed by PM2 or a CL startup programme:</p>
+
+<pre>
+// server.js
+const express = require('express');
+const orderRoutes = require('./order-status-route');
+
+const app = express();
+app.use(express.json());
+app.use('/api/v1', orderRoutes);
+
+const PORT = process.env.PORT || 8081;
+app.listen(PORT, () => {
+    console.log(`IBM i API adapter listening on port ${PORT}`);
+});
+</pre>
+
+<p>Calling the endpoint from any HTTP client, including a browser, a React frontend, or a cloud function, now looks like this:</p>
+
+<pre>
+GET http://ibmi-host:8081/api/v1/orders/ORD0001234/status
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "ordNum": "ORD0001234",
+  "status": "SHIPPED",
+  "amount": 4250.75
+}
+</pre>
+
+<p>No RPG change has been made. The GETORDSTS service programme continues to run exactly as before; it simply has a new HTTP-accessible front door.</p>
+
+<h2>Tooling Landscape in 2026</h2>
+
+<p>The IBM i modernisation tooling ecosystem has matured considerably. The major categories are:</p>
+
+<ul>
+<li><strong>IBM i ACS (Access Client Solutions):</strong> The replacement for iSeries Navigator, ACS provides SQL scripts, IFS file browsing, and 5250 emulation in a Java-based desktop client. Essential for day-to-day IBM i administration and SQL development.</li>
+<li><strong>Profound UI:</strong> Screen transformation and RPG-native web application framework. Supports both 5250 wrapping and native Node.js-based IBM i web applications written in a proprietary DSL. Strong in organisations that need rapid 5250 modernisation without RPG changes.</li>
+<li><strong>LANSA:</strong> Low-code IBM i development platform with its own 4GL, web deployment, and mobile generation. Well-suited to organisations that want to build new IBM i applications using a modern toolset without switching off the platform.</li>
+<li><strong>Rocket Software modernisation tools:</strong> Rocket TN5250, Rocket Mobius, and the Rocket Multi-Value platform provide screen transformation and data virtualisation for IBM i and related mainframe environments.</li>
+<li><strong>Open-source PASE stack:</strong> Node.js (22.x in 2026), Python 3.12, Git, GNU tools, and rpm-based package management via the IBM i Open Source package repository (dnf/yum). This stack is free, installed via <code>dnf install nodejs22</code>, and supports the full itoolkit / XMLSERVICE integration model.</li>
+<li><strong>IBM Merlin IDE:</strong> IBM's browser-based IDE for IBM i development, providing VS Code-like editing for RPG, COBOL, CL, and SQL directly against the IBM i IFS. Lowers the barrier for developers who do not want to configure a local VS Code environment.</li>
+<li><strong>VS Code with IBM i extension (Code for IBM i):</strong> The open-source Code for IBM i extension turns VS Code into a full IBM i development environment — source member editing, compile, object browser, and SQL execution. This is the most widely adopted modern RPG development environment in 2026.</li>
+</ul>
+
+<h2>Building the Business Case</h2>
+
+<p>Modernisation investment is easier to justify when framed in terms of business outcomes, not technology replacement. The most persuasive business cases centre on three levers:</p>
+
+<ul>
+<li><strong>Reduce developer onboarding time.</strong> If it takes a new developer six months to become productive on a 5250-only estate with no source control, no unit testing, and no documentation, that cost is real and measurable. A modernised estate with Git, VS Code, REST APIs, and unit tests reduces onboarding to four to six weeks.</li>
+<li><strong>Enable new channels.</strong> If customers want a mobile app and your entire order processing system is locked inside 5250 screens, the modernisation cost is dwarfed by the revenue opportunity. Frame API wrapping as "enabling mobile and web access to existing, proven IBM i logic" rather than "replacing the AS400."</li>
+<li><strong>Reduce integration maintenance.</strong> Flat-file integrations, FTP schedules, and data queue polling represent ongoing maintenance cost and fragility. Replacing them with REST APIs or IBM MQ reduces that cost and improves reliability.</li>
+</ul>
+
+<p>The argument that should never be made is "we need to modernise because IBM i is old." IBM i 7.5 is a current, actively developed operating system. IBM i is not the problem. Specific interface patterns and integration approaches are the problem, and those can be solved without replacing the platform.</p>
+
+<h2>Common Mistakes</h2>
+
+<p>Several patterns appear repeatedly in IBM i modernisation programmes that fail or underdeliver:</p>
+
+<ul>
+<li><strong>The big-bang full rewrite.</strong> Attempting to rewrite the entire IBM i estate in a single project, over two to four years, with a hard cutover. These projects fail at a high rate because the scope expands, the timeline slips, and the business changes faster than the rewrite progresses. Incremental modernisation with the strangler fig pattern is almost always superior.</li>
+<li><strong>Modernising what does not need modernising.</strong> Investing in a modern UI for a programme that runs unattended in batch, or rewriting business logic that is correct and stable, consumes budget and introduces risk with no benefit.</li>
+<li><strong>Neglecting the IBM i skill base.</strong> Every modernisation programme needs people who understand IBM i deeply — the job scheduler, the authority model, the commitment control, the physical file structure. Replacing all RPG developers with JavaScript developers before the transition is complete leaves the organisation unable to maintain the IBM i systems that are still running.</li>
+<li><strong>Ignoring the PASE open-source layer.</strong> Many organisations are unaware that Node.js, Python, Git, and a full GNU toolchain are available on IBM i today, for free. Projects that spin up a separate Linux server to host a Node.js adapter — when that Node.js adapter could run directly on IBM i in PASE — add unnecessary infrastructure complexity.</li>
+<li><strong>Treating modernisation as a one-time project.</strong> Modernisation is a continuous programme, not a project with an end date. The technology landscape, business requirements, and team capabilities all change; the modernisation approach must evolve with them.</li>
+</ul>
+
+<em>Next post: RPG Unit Testing with RPGUnit — installing and configuring the RPGUnit framework, writing test cases and test suites for ILE RPG service programs, running tests from the command line and integrating them into a CI pipeline on IBM i.</em>

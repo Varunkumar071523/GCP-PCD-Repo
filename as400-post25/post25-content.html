@@ -1,0 +1,269 @@
+The previous post covered the IBM i IFS — stream files, Git, and the foundation of modern tooling on IBM i. This post covers the newest frontier: AI integration with IBM i systems, and what that actually means in practice in 2026.
+
+AI is not a separate topic from IBM i modernisation. It is rapidly becoming a tool that touches every layer of IBM i development: calling AI APIs directly from RPG and SQL programs, using AI assistants to understand and rewrite legacy code, integrating IBM watsonx into IBM i data pipelines, and using AI to generate documentation for systems where the original developers are long gone. This post separates the practical from the speculative and focuses on what IBM i developers can actually use today.
+
+<h2>Three ways AI intersects with IBM i</h2>
+
+Before diving into implementation, it helps to distinguish three distinct use cases that often get conflated:
+
+<strong>1. AI as an integration target</strong> — IBM i programs call AI APIs (OpenAI, watsonx, Azure OpenAI) over HTTP the same way they would call any REST endpoint. The AI processes data and returns a result. The IBM i program uses that result in business logic. This is a software engineering task, not an AI task.
+
+<strong>2. AI as a development tool</strong> — developers use AI assistants (GitHub Copilot, Claude, ChatGPT) to write, explain, and modernise RPG and CL code. The AI is a tool in the developer's workflow, not part of the running system.
+
+<strong>3. AI as a data platform feature</strong> — IBM watsonx.data can federate queries across IBM i DB2 for i data and cloud data stores, with AI-powered query optimisation. This sits at the infrastructure level and is relevant for organisations running both IBM i and cloud analytics.
+
+All three are real and in use in 2026. This post covers the first two in practical depth.
+
+<h2>Calling AI APIs from IBM i: the HTTP foundation</h2>
+
+IBM i can make outbound HTTP and HTTPS calls through several mechanisms. The cleanest for SQL-integrated workflows is the QSYS2 HTTP scalar functions, available since IBM i 7.4 TR6 / 7.5.
+
+<strong>QSYS2.HTTP_GET and QSYS2.HTTP_POST</strong> execute HTTP requests directly from SQL. They return CLOB (character large object) values, making them easy to use in SQL statements and embedded SQL in RPG.
+
+<strong>Simple HTTP POST to an AI API from SQL:</strong>
+
+<pre>-- Call OpenAI chat completions endpoint
+SELECT CAST(
+    QSYS2.HTTP_POST(
+        'https://api.openai.com/v1/chat/completions',
+        -- Request headers as JSON
+        '{"Content-Type":"application/json",
+          "Authorization":"Bearer ' || (SELECT PARMVAL FROM ORDLIB.APICREDS WHERE PARMKEY = 'OPENAI_KEY') || '"}',
+        -- Request body
+        '{"model":"gpt-4o-mini",
+          "messages":[{"role":"user","content":"Classify this customer complaint as BILLING, DELIVERY, or PRODUCT: ' ||
+          REPLACE(COMPLAINTTXT, '"', '''') ||
+          '"}],
+          "max_tokens":20}'
+    ) AS VARCHAR(4000)
+) AS AI_CLASSIFICATION
+FROM ORDLIB.COMPLAINTS
+WHERE COMPSTAT = 'NEW'
+FETCH FIRST 5 ROWS ONLY;</pre>
+
+This runs directly in ACS Run SQL Scripts or embedded in an SQLRPGLE program. The AI API key is retrieved from a secured table rather than hardcoded — storing credentials in application tables with appropriate object authority is the IBM i-native approach.
+
+<h2>Calling AI APIs from SQLRPGLE</h2>
+
+The same HTTP_POST function works in embedded SQL within RPG programs:
+
+<pre>**FREE
+ctl-opt dftactgrp(*no) actgrp('AIGRP') option(*srcstmt);
+
+dcl-s complaintText varchar(2000);
+dcl-s requestBody   varchar(4000);
+dcl-s responseClob  sqltype(clob: 32000);
+dcl-s classification varchar(20);
+dcl-s apiKey         varchar(100);
+
+// Load API key from secured credentials table
+exec sql
+  select PARMVAL into :apiKey
+  from   ORDLIB.APICREDS
+  where  PARMKEY = 'OPENAI_KEY'
+  fetch first 1 rows only;
+
+// Build the request body
+requestBody = '{"model":"gpt-4o-mini","messages":[{"role":"user",' ||
+              '"content":"Classify as BILLING, DELIVERY, or PRODUCT: ' ||
+              %trim(complaintText) || '"}],"max_tokens":20}';
+
+// Call the AI API
+exec sql
+  values(QSYS2.HTTP_POST(
+    'https://api.openai.com/v1/chat/completions',
+    '{"Content-Type":"application/json","Authorization":"Bearer ' || :apiKey || '"}',
+    :requestBody
+  )) into :responseClob;
+
+// Parse classification from JSON response
+// JSON_VALUE extracts a scalar from a JSON document
+exec sql
+  values(JSON_VALUE(:responseClob,
+    'lax $.choices[0].message.content'))
+  into :classification;
+
+classification = %trim(classification);
+
+*inlr = *on;</pre>
+
+<strong>IBM i JSON support:</strong> DB2 for i supports JSON functions including JSON_VALUE, JSON_QUERY, JSON_TABLE, and JSON_OBJECT natively in SQL. These are the right tool for parsing AI API responses — no custom string parsing needed.
+
+<pre>-- Extract multiple fields from an AI API JSON response
+SELECT
+    JSON_VALUE(RESPONSE_CLOB, 'lax $.choices[0].message.content')    AS AI_RESULT,
+    JSON_VALUE(RESPONSE_CLOB, 'lax $.usage.prompt_tokens')            AS PROMPT_TOKENS,
+    JSON_VALUE(RESPONSE_CLOB, 'lax $.usage.completion_tokens')        AS COMPLETION_TOKENS,
+    JSON_VALUE(RESPONSE_CLOB, 'lax $.model')                          AS MODEL_USED
+FROM  ORDLIB.AI_RESPONSE_LOG
+WHERE LOG_ID = :logId;</pre>
+
+<h2>IBM watsonx integration patterns</h2>
+
+IBM watsonx is IBM's AI and data platform. For IBM i shops, the most relevant components are:
+
+<strong>watsonx.ai</strong> — IBM's hosted foundation model service. Accessible via REST API with the same HTTP_POST pattern shown above, using IBM Cloud IAM tokens for authentication. Offers IBM-developed Granite models alongside open-source models, with data residency options relevant for regulated industries.
+
+<strong>Calling watsonx.ai from IBM i SQL:</strong>
+
+<pre>-- Get an IBM Cloud IAM token first (done once per session, cached in a table)
+-- Then call watsonx.ai text generation endpoint
+SELECT CAST(
+    QSYS2.HTTP_POST(
+        'https://us-south.ml.cloud.ibm.com/ml/v1/text/generation?version=2023-05-29',
+        '{"Content-Type":"application/json",
+          "Authorization":"Bearer ' || :iamToken || '"}',
+        '{"model_id":"ibm/granite-13b-instruct-v2",
+          "input":"Summarise this order in one sentence: Order ' || ORDNUM ||
+          ' for customer ' || CUSTNAME || ' totalling $' || CHAR(ORDAMT) || '.",
+          "parameters":{"max_new_tokens":60}}'
+    ) AS VARCHAR(2000)
+) AS SUMMARY
+FROM ORDLIB.ORDHDR H
+JOIN ORDLIB.CUSTOMER C ON C.CUSTNUM = H.CUSTNUM
+WHERE H.ORDNUM = :ordNum;</pre>
+
+<strong>watsonx.data</strong> — a data lakehouse that can federate queries across IBM i DB2 for i (via the IBM i connector), cloud object storage, and other data sources. Useful for organisations that want to run analytics across IBM i transactional data and cloud data without extracting and loading the data first.
+
+<h2>Using AI as a development tool for IBM i</h2>
+
+This is where most IBM i developers will see the most immediate value in 2026. AI coding assistants have become genuinely useful for RPG and CL work — not because they know IBM i as well as a specialist, but because they can handle the tedious parts of the work that specialists do not want to do.
+
+<strong>What AI assistants are good at for IBM i work:</strong>
+
+<ul>
+<li><strong>Explaining legacy fixed-format RPG</strong> — paste a 200-line OPM RPG program and ask for a plain-English explanation of what it does. AI assistants handle this well because the logic is usually straightforward; the barrier is the syntax.</li>
+<li><strong>Converting fixed-format RPG to free-format</strong> — mechanical conversion of F-specs, D-specs, and C-specs to their free-format equivalents. AI does this reliably for straightforward programs. Always review the output.</li>
+<li><strong>Writing SQL equivalents of OPNQRYF logic</strong> — OPNQRYF (Open Query File) is a CL command used to apply selection and ordering to RPG file reads. It is widely used in legacy code and difficult to read. AI can translate OPNQRYF parameters to equivalent SQL SELECT statements accurately.</li>
+<li><strong>Generating DB2 for i DDL from DDS source</strong> — paste a DDS physical or logical file definition and ask for the equivalent CREATE TABLE or CREATE INDEX statement. This is mechanical work that AI handles well.</li>
+<li><strong>Writing boilerplate SQLRPGLE</strong> — cursors, single-row fetches, error handling scaffolding. Describe what the program should do and AI generates a solid starting structure.</li>
+<li><strong>Writing documentation for undocumented programs</strong> — paste the source and ask for a description of inputs, outputs, side effects, and assumptions. Accurate for programs with readable logic; less reliable for programs with unusual control flow.</li>
+</ul>
+
+<strong>What AI assistants are not reliable for:</strong>
+
+<ul>
+<li>IBM i-specific commands and parameters — AI models sometimes confuse parameter names, invent non-existent parameters, or use syntax from older OS versions. Always verify CL command output against IBM documentation.</li>
+<li>Complex legacy RPG with extensive use of indicators, PRTF output, and WORKSTN files — the semantic complexity exceeds what AI handles confidently.</li>
+<li>Performance-sensitive SQL — AI can write correct SQL but does not know your data distribution, index landscape, or the specific behaviour of the DB2 for i query optimiser. Always run Visual Explain.</li>
+<li>Security-sensitive changes — authority changes, profile management, adopted authority design. These require IBM i expertise, not AI output.</li>
+</ul>
+
+<h2>Practical pattern: AI-assisted batch complaint classification</h2>
+
+A realistic example that combines IBM i strengths with AI: classify unprocessed customer complaints using an AI API, then update the database records with the classification.
+
+<pre>**FREE
+ctl-opt dftactgrp(*no) actgrp('AIGRP') option(*srcstmt);
+
+dcl-ds complaint qualified;
+  compId    int(10);
+  compText  varchar(2000);
+end-ds;
+
+dcl-s apiKey       varchar(100);
+dcl-s requestBody  varchar(4000);
+dcl-s responseJson sqltype(clob: 32000);
+dcl-s category     varchar(20);
+dcl-s processedCnt int(10) inz(0);
+dcl-s errorCnt     int(10) inz(0);
+
+// Load API key
+exec sql
+  select PARMVAL into :apiKey
+  from   ORDLIB.APICREDS
+  where  PARMKEY = 'OPENAI_KEY';
+
+// Process unclassified complaints
+exec sql declare compCsr cursor for
+  select COMPID, COMPTEXT
+  from   ORDLIB.COMPLAINTS
+  where  COMPCAT  = ' '
+    and  COMPSTAT = 'NEW'
+  order  by COMPDATE
+  fetch first 100 rows only;
+
+exec sql open compCsr;
+
+dow sqlcode = 0;
+  exec sql fetch compCsr into :complaint;
+  if sqlcode = 100;
+    leave;
+  elseif sqlcode <> 0;
+    leave;
+  endif;
+
+  // Build prompt — keep it minimal for low token cost
+  requestBody = '{"model":"gpt-4o-mini","messages":[{"role":"user",' ||
+                '"content":"Reply with exactly one word: BILLING, DELIVERY, PRODUCT, or OTHER.' ||
+                ' Complaint: ' || %trim(complaint.compText) || '"}],"max_tokens":5}';
+
+  monitor;
+    exec sql
+      values(QSYS2.HTTP_POST(
+        'https://api.openai.com/v1/chat/completions',
+        '{"Content-Type":"application/json","Authorization":"Bearer ' || :apiKey || '"}',
+        :requestBody
+      )) into :responseJson;
+
+    exec sql
+      values(TRIM(JSON_VALUE(:responseJson,
+        'lax $.choices[0].message.content')))
+      into :category;
+
+    // Validate response is one of the expected categories
+    if category <> 'BILLING'  and category <> 'DELIVERY' and
+       category <> 'PRODUCT'  and category <> 'OTHER';
+      category = 'OTHER';
+    endif;
+
+    exec sql
+      update ORDLIB.COMPLAINTS
+      set    COMPCAT  = :category,
+             COMPSTAT = 'CLASSIFIED',
+             CLSDATE  = CURRENT_DATE
+      where  COMPID   = :complaint.compId;
+
+    processedCnt += 1;
+
+  on-error;
+    errorCnt += 1;
+  endmon;
+
+enddo;
+
+exec sql close compCsr;
+
+sndpgmmsg msg('AI classification complete. Processed: ' +
+              %char(processedCnt) + ' Errors: ' + %char(errorCnt))
+          tomsgq(qsysopr);
+
+*inlr = *on;</pre>
+
+<h2>Token cost and rate limiting</h2>
+
+When calling AI APIs from batch programs that process many records, cost and rate limits are real operational concerns:
+
+<ul>
+<li><strong>Use the smallest capable model</strong> — <code>gpt-4o-mini</code> or <code>granite-3b</code> for classification and extraction tasks; reserve larger models for generation tasks that need quality</li>
+<li><strong>Minimise prompt tokens</strong> — strip whitespace and unnecessary context from input text before sending</li>
+<li><strong>Batch where the API supports it</strong> — OpenAI's Batch API allows sending up to 50,000 requests in a single file and returns results within 24 hours at 50% cost reduction; ideal for overnight IBM i batch classification jobs</li>
+<li><strong>Log all API calls</strong> — write request size, response size, model used, and latency to a DB2 for i table; this is the only way to track cost and diagnose issues</li>
+<li><strong>Cache repeated prompts</strong> — if the same or similar text is classified repeatedly, store the result in a DB2 table keyed by a hash of the input and return the cached classification without an API call</li>
+</ul>
+
+<h2>IBM Merlin for RPG modernisation</h2>
+
+IBM Merlin (IBM Developer for IBM i) is IBM's modernisation tool for IBM i, which includes AI-assisted code suggestions within a VS Code-based IDE. It provides:
+
+<ul>
+<li>AI code completion for RPG and CL source in the IFS</li>
+<li>Automated conversion suggestions from fixed-format to free-format RPG</li>
+<li>Integration with RDi and the IFS-based development workflow</li>
+</ul>
+
+Merlin requires a subscription and connects to IBM's cloud services. It is the most tightly integrated AI tooling for IBM i development, but the same practical caveats apply — treat AI suggestions as a starting point that requires review, not as a finished product.
+
+AI is a tool, not a strategy. For IBM i specifically, the highest-ROI uses in 2026 are documentation generation for undocumented legacy programs, mechanical code conversion (fixed-format to free-format RPG, DDS to SQL DDL), and calling external AI APIs for classification and generation tasks within existing business processes. The foundation is the same HTTP client and JSON parsing capability that IBM i has had since 7.4 — no new infrastructure required.
+
+<em>Next post: IBM i and Node.js — running Node.js natively in PASE, the idb-connector and itoolkit packages, building REST APIs that expose IBM i data, and the patterns IBM i shops use to add a modern API layer without rewriting the backend.</em>

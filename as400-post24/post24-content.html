@@ -1,0 +1,279 @@
+The previous post covered IBM i security — the object-authority model that protects everything on the system. This post covers the IBM i Integrated File System: what it is, how it relates to the traditional library system, and why it matters for modern IBM i development.
+
+Most IBM i developers have encountered the IFS indirectly — when cloning a Git repository onto the system, when running a Node.js or Python script, or when a CL program uses RUNSQLSTM with a SRCSTMF path. The IFS is the stream-file layer that makes IBM i look like a UNIX system to PASE programs and to tools that expect a hierarchical file system. Understanding it properly removes a significant source of confusion about how modern IBM i tooling actually works.
+
+<h2>What the IFS is</h2>
+
+The Integrated File System was introduced with OS/400 V3R1. It provides a single hierarchical namespace — a root <code>/</code> with directories and stream files — that unifies several different storage systems under one path structure.
+
+<strong>The IFS is not a replacement for the library system</strong>. Libraries, programs, files, and data areas are still stored as IBM i objects managed by the OS object model. The IFS provides an additional storage model — stream files — alongside the object model, plus a unified path namespace that includes both.
+
+<strong>Stream files</strong> differ from database files (physical files, source members) in important ways:
+<ul>
+<li>Stream files are byte sequences with no fixed record structure — identical to files on Linux or Windows</li>
+<li>They support UNIX-style permissions (owner/group/other read/write/execute bits) in addition to IBM i object authority</li>
+<li>They can be read and written by both IBM i programs (via integrated file system APIs) and PASE programs (via standard POSIX file I/O)</li>
+<li>They are not journalled by default, though journalling can be enabled per directory</li>
+</ul>
+
+<h2>IFS directory structure</h2>
+
+<pre>/                          Root
+├── QOpenSys/              PASE environment (UNIX-like; case-sensitive)
+│   └── pkgs/              Open-source packages (yum-managed: Node.js, Python, Git...)
+├── QSYS.LIB/              Bridge to the library system
+│   └── ORDLIB.LIB/        → corresponds to library ORDLIB
+│       └── ORDHDR.FILE/   → corresponds to file ORDHDR
+│           └── ORDHDR.MBR → corresponds to member ORDHDR
+├── QIBM/                  IBM product and service files
+├── home/                  User home directories
+│   └── build/             → /home/build for user BUILD
+├── tmp/                   Temporary files
+└── (your application directories)</pre>
+
+<strong>The QSYS.LIB bridge</strong> is important: every IBM i library object is accessible as an IFS path. You can read a source member at <code>/QSYS.LIB/ORDLIB.LIB/QRPGLESRC.FILE/CRTORD.MBR</code>. This is how IFS-aware tools like Git, RDi, and VS Code extensions read source members — they use the QSYS.LIB path.
+
+<strong>QOpenSys</strong> is a case-sensitive UNIX-like filesystem where all open-source packages managed by yum live. Node.js, Python, Git, curl, bash, and dozens of other tools are installed under <code>/QOpenSys/pkgs/</code>. This filesystem uses POSIX semantics, so <code>README.md</code> and <code>readme.md</code> are different files.
+
+<h2>Working with the IFS from CL</h2>
+
+<strong>Creating directories:</strong>
+
+<pre>/* Create application directory structure */
+CRTDIR DIR('/home/build/project-repo')
+CRTDIR DIR('/home/build/project-repo/src/rpgle')
+CRTDIR DIR('/home/build/project-repo/src/clle')
+CRTDIR DIR('/home/build/project-repo/src/sqlrpgle')</pre>
+
+<strong>Copying between IFS and library system:</strong>
+
+<pre>/* Copy a source member to an IFS stream file */
+CPYTOSTMF FROMMBR('/QSYS.LIB/ORDLIB.LIB/QRPGLESRC.FILE/CRTORD.MBR') +
+           TOSTMF('/home/build/project-repo/src/rpgle/CRTORD.rpgle') +
+           STMFOPT(*REPLACE) +
+           STMFCCSID(1208)  /* UTF-8 */
+
+/* Copy an IFS stream file back to a source member */
+CPYFRMSTMF FROMSTMF('/home/build/project-repo/src/rpgle/CRTORD.rpgle') +
+            TOMBR('/QSYS.LIB/ORDLIB.LIB/QRPGLESRC.FILE/CRTORD.MBR') +
+            MBROPT(*REPLACE) +
+            STMFCCSID(1208)</pre>
+
+<code>STMFCCSID(1208)</code> specifies UTF-8 encoding for the stream file. This is important when copying source from the library system (which uses EBCDIC) to the IFS for Git — the copy converts the encoding. Always use 1208 for source files that will be edited with modern tools.
+
+<strong>Listing IFS contents:</strong>
+
+<pre>WRKLNK OBJ('/home/build/project-repo/*')   /* interactive */
+
+/* Or via SQL */
+SELECT PATH_NAME, OBJECT_TYPE, FILE_SIZE,
+       CREATE_TIMESTAMP, MODIFY_TIMESTAMP
+FROM   TABLE(QSYS2.IFS_OBJECT_STATISTICS(
+             START_PATH_NAME => '/home/build/project-repo',
+             SUBTREE_DIRECTORIES => 'YES'))
+WHERE  OBJECT_TYPE = 'STMF'
+ORDER  BY PATH_NAME;</pre>
+
+<strong>Running a stream file script from CL:</strong>
+
+<pre>/* Run a shell script in PASE */
+STRQSH CMD('sh /home/build/scripts/deploy.sh ORDLIB TEST')
+
+/* Run a specific command in PASE */
+QSH CMD('cd /home/build/project-repo && git pull origin main')</pre>
+
+<h2>Reading and writing IFS stream files from RPG</h2>
+
+RPG can read and write IFS stream files using either the integrated file system C runtime APIs (via prototyped calls) or by using an IFS-bound file declaration.
+
+<strong>Reading a stream file using open/read/close APIs:</strong>
+
+<pre>**FREE
+ctl-opt dftactgrp(*no) actgrp(*new);
+
+// IFS open flags and modes
+dcl-c O_RDONLY  1;
+dcl-c O_WRONLY  2;
+dcl-c O_CREAT   8;
+dcl-c O_TRUNC   64;
+dcl-c S_IRWXU   448;  // owner rwx
+
+// Prototype for IFS open
+dcl-pr ifsOpen int(10) extproc('_C_IFS_open');
+  path    pointer value options(*string);
+  flags   int(10) value;
+  mode    uns(10) value options(*omit);
+end-pr;
+
+dcl-pr ifsRead int(10) extproc('_C_IFS_read');
+  fd      int(10) value;
+  buf     pointer value;
+  nbytes  uns(10) value;
+end-pr;
+
+dcl-pr ifsClose int(10) extproc('_C_IFS_close');
+  fd int(10) value;
+end-pr;
+
+dcl-s fd       int(10);
+dcl-s buffer   char(4096);
+dcl-s bytesRead int(10);
+dcl-s filePath varchar(512);
+
+filePath = '/home/build/config/app.conf';
+
+fd = ifsOpen(%addr(filePath) : O_RDONLY : *omit);
+if fd < 0;
+  dsply 'Failed to open config file';
+  *inlr = *on;
+  return;
+endif;
+
+bytesRead = ifsRead(fd : %addr(buffer) : %size(buffer));
+
+ifsClose(fd);
+
+*inlr = *on;</pre>
+
+<strong>Simpler approach — writing a stream file via SQL:</strong>
+
+<pre>-- Write content to an IFS stream file using SQL
+VALUES(QSYS2.IFS_WRITE(
+    PATH_NAME   => '/home/build/logs/batch-result.txt',
+    LINE        => 'Batch completed: ' || CHAR(CURRENT_TIMESTAMP),
+    OVERWRITE   => 'APPEND',
+    END_OF_LINE => 'LF'
+));
+
+-- Read a stream file content via SQL
+SELECT LINE_NUMBER, LINE
+FROM   TABLE(QSYS2.IFS_READ(
+             PATH_NAME => '/home/build/config/app.conf'))
+ORDER  BY LINE_NUMBER;</pre>
+
+The QSYS2 IFS_READ and IFS_WRITE table functions are the cleanest way to interact with IFS text files from SQL or embedded SQL in RPG — no API prototypes needed.
+
+<h2>IFS permissions</h2>
+
+IFS stream files and directories have two layers of access control:
+
+<strong>POSIX permission bits</strong> — the standard UNIX owner/group/other read/write/execute model. Visible with <code>WRKLNK</code> → option 8, or via <code>ls -la</code> in a PASE shell.
+
+<strong>IBM i object authority</strong> — the standard *USE/*CHANGE/*ALL model that applies to all IBM i objects.
+
+Both must permit access for a user to read or write an IFS file. This is the most common cause of IFS permission errors: the IBM i object authority allows access, but the POSIX bits do not (or vice versa).
+
+<strong>Setting POSIX permissions from CL:</strong>
+
+<pre>/* Set owner read/write, group read, public none */
+CHGAUT OBJ('/home/build/project-repo') +
+        USER(*PUBLIC) DTAAUT(*EXCLUDE)
+
+CHGAUT OBJ('/home/build/project-repo') +
+        USER(BUILDGRP) DTAAUT(*RWX)
+
+/* Recursive permission change */
+CHGAUT OBJ('/home/build/project-repo/*') +
+        USER(*PUBLIC) DTAAUT(*EXCLUDE) +
+        SUBTREE(*ALL)</pre>
+
+<strong>Setting permissions from PASE shell:</strong>
+
+<pre>chmod 750 /home/build/project-repo
+chmod -R 640 /home/build/project-repo/src
+chown -R build:buildgrp /home/build/project-repo</pre>
+
+<h2>Git in the IFS</h2>
+
+Git runs in the IFS under PASE, installed via yum as part of the IBM i open-source package ecosystem. This is the foundation of modern IBM i source management — source lives in the IFS under Git control, and build tools (Bob, GNU Make) compile from IFS paths.
+
+<strong>Installing Git:</strong>
+
+<pre>/* From a PASE shell or QSH */
+yum install git</pre>
+
+<strong>Basic Git workflow on IBM i:</strong>
+
+<pre>/* Clone a repository */
+QSH CMD('git clone https://github.com/myorg/ibmi-project.git /home/build/ibmi-project')
+
+/* Check status */
+QSH CMD('cd /home/build/ibmi-project && git status')
+
+/* Pull latest changes */
+QSH CMD('cd /home/build/ibmi-project && git pull origin main')
+
+/* Commit from build pipeline */
+QSH CMD('cd /home/build/ibmi-project && +
+         git add src/rpgle/CRTORD.rpgle && +
+         git commit -m "Update order creation program" && +
+         git push origin main')</pre>
+
+<strong>SSH key authentication for Git (no passwords in scripts):</strong>
+
+<pre>/* Generate SSH key pair in PASE */
+QSH CMD('ssh-keygen -t ed25519 -C "build@mysystem" -f /home/build/.ssh/id_ed25519 -N ""')
+
+/* The public key /home/build/.ssh/id_ed25519.pub goes into GitHub/GitLab deploy keys */
+
+/* Test connection */
+QSH CMD('ssh -T git@github.com')</pre>
+
+<h2>IFS and the build pipeline</h2>
+
+As covered in earlier posts in this series, a modern IBM i build pipeline keeps all source in the IFS under Git and uses Bob or GNU Make to compile from IFS paths. The key CL command for each compilation type uses SRCSTMF to point directly at the IFS file:
+
+<pre>/* Compile RPG from IFS */
+CRTBNDRPG PGM(ORDLIB/CRTORD) +
+           SRCSTMF('/home/build/ibmi-project/src/rpgle/CRTORD.rpgle') +
+           DBGVIEW(*SOURCE)
+
+/* Compile CL from IFS */
+CRTBNDCL PGM(ORDLIB/JOBSETUP) +
+           SRCSTMF('/home/build/ibmi-project/src/clle/JOBSETUP.clle') +
+           DBGVIEW(*SOURCE)
+
+/* Compile SQL RPG from IFS */
+CRTSQLRPGI OBJ(ORDLIB/ORDSUMRY) +
+            SRCSTMF('/home/build/ibmi-project/src/sqlrpgle/ORDSUMRY.sqlrpgle') +
+            COMMIT(*NONE) +
+            OBJTYPE(*PGM)</pre>
+
+<h2>Transferring files to and from the IFS</h2>
+
+<strong>ACS (IBM i Access Client Solutions)</strong> — the desktop tool for IBM i includes an IFS browser that supports drag-and-drop file transfer between a local workstation and the IFS. This is the primary tool for ad hoc file management.
+
+<strong>SFTP</strong> — IBM i ships with an SSH/SFTP server. Connect with any SFTP client using the system's hostname and a user profile's credentials. The root of the SFTP session is the user's home directory in the IFS.
+
+<strong>FTP to IFS</strong> — IBM i's built-in FTP server supports IFS paths. Prefix the path with a forward slash to specify an IFS path rather than a library path:
+
+<pre>/* FTP session — after connecting, switch to IFS mode */
+CD /home/build/uploads
+PUT localfile.csv</pre>
+
+<strong>Mounting IFS as a network drive</strong> — IBM i supports NetServer (SMB/CIFS), which allows Windows workstations to map the IFS as a network drive. Set up via WRKCFGSTS *NWS or through Navigator for i.
+
+<h2>Practical IFS patterns</h2>
+
+<strong>Using QTEMP in the IFS:</strong> QTEMP is a temporary library that exists only for the current job's duration. The IFS equivalent is <code>/tmp</code> for short-lived files, though <code>/tmp</code> is shared between all jobs — use a job-specific subdirectory for isolation:
+
+<pre>DCL VAR(&TMPDIR) TYPE(*CHAR) LEN(100)
+DCL VAR(&JOBNAME) TYPE(*CHAR) LEN(10)
+RTVJOBA JOB(&JOBNAME)
+CHGVAR VAR(&TMPDIR) VALUE('/tmp/job-' *CAT %TRIM(&JOBNAME))
+CRTDIR DIR(&TMPDIR)
+/* ... use &TMPDIR for job-specific IFS work ... */
+/* Clean up at end */
+RMVDIR DIR(&TMPDIR) SUBTREE(*ALL)</pre>
+
+<strong>Configuration files in the IFS:</strong> Storing application configuration as JSON or text files in the IFS (rather than data areas or database tables) allows the same config files to be managed under Git and read by both IBM i programs and PASE tools:
+
+<pre>-- Read a JSON config file from the IFS into a DB2 variable
+SELECT QSYS2.IFS_READ_UTF8(
+    PATH_NAME => '/home/app/config/settings.json'
+) INTO :configJson
+FROM SYSIBM.SYSDUMMY1;</pre>
+
+The IFS is not a separate system bolted onto IBM i — it is the foundation of how modern IBM i tooling works. Git, open-source packages, Node.js, Python, build pipelines, and cloud integration scripts all live in and operate through the IFS. Treating IFS familiarity as optional is what leads to IBM i teams being blocked when they try to adopt any modern development workflow.
+
+<em>Next post: AI for IBM i — calling AI APIs from RPG programs, integrating watsonx, using HTTP client functions from DB2 SQL, and what AI tools can realistically do for IBM i modernisation in 2026.</em>

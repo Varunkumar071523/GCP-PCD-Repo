@@ -1,0 +1,268 @@
+The previous post covered advanced DB2 for i SQL — the query optimiser, Index Advisor, and Materialized Query Tables. This post covers the operational CL commands that IBM i administrators and operators use every day: managing subsystems and jobs, controlling output and spooled files, working with data queues, and scheduling jobs.
+
+These commands are the operational layer of IBM i. Understanding them is the difference between being able to respond to a production incident and being dependent on someone else who knows what <code>WRKACTJOB</code> does. CL programming (writing compiled CL programs) was covered in Post 20. This post is about interactive operational commands — the ones you type at a 5250 command line or call from automation scripts.
+
+<h2>Subsystem management</h2>
+
+Subsystems are the job environments on IBM i. Every running job belongs to a subsystem. Subsystems control which job queues feed them, which memory pools they use, and what routing entries determine the program a submitted job runs.
+
+<strong>Common subsystems on a production IBM i:</strong>
+<ul>
+<li><code>QINTER</code> — interactive workstation sessions</li>
+<li><code>QBATCH</code> — batch jobs submitted with SBMJOB (default)</li>
+<li><code>QSYSWRK</code> — system jobs (TCP/IP, database monitors, etc.)</li>
+<li><code>QSERVER</code> — server jobs (ODBC, JDBC, FTP, DDM)</li>
+<li><code>QUSRWRK</code> — user-defined server jobs</li>
+<li>Custom subsystems — shops with high batch volume create dedicated subsystems with private memory pools</li>
+</ul>
+
+<strong>Key subsystem commands:</strong>
+
+<pre>WRKSBS                    /* Work with Active Subsystems — interactive overview */
+STRSBS SBSD(QBATCH)       /* Start a subsystem */
+ENDSBS SBS(QBATCH) OPTION(*IMMED)   /* End immediately — use carefully in production */
+ENDSBS SBS(QBATCH) OPTION(*CNTRLD) DELAY(300)  /* Controlled end — wait up to 300s for jobs to finish */
+DSPSBS SBS(QBATCH)        /* Display subsystem description */</pre>
+
+<strong>Working with subsystem descriptions (SBSD):</strong>
+
+<pre>/* Display job queue entries for a subsystem */
+DSPSBSD SBSD(QBATCH) OUTPUT(*PRINT)
+
+/* Add a job queue entry to a subsystem */
+ADDJOBQE SBSD(MYBATCH) JOBQ(MYBATCH/HIGHPRIQ) SEQNBR(10) MAXACT(5)
+
+/* Change the memory pool for a subsystem */
+CHGSBSD SBSD(MYBATCH) POOLS((1 *BASE) (2 *USERPOOL1))</pre>
+
+<h2>Job management</h2>
+
+<strong>Viewing and working with active jobs:</strong>
+
+<pre>WRKACTJOB SBS(QBATCH)           /* Show only batch jobs */
+WRKACTJOB SBS(*ALL) JOB(NGTBATCH)  /* Find a specific job by name */
+WRKUSRJOB USER(BATCHUSR)        /* All jobs running under a user profile */
+WRKJOB JOB(123456/BATCHUSR/NGTBATCH)  /* Work with a specific job by full job ID */</pre>
+
+<strong>Changing a running job's attributes:</strong>
+
+<pre>/* Raise job priority (1=highest, 9=lowest) */
+CHGJOB JOB(123456/BATCHUSR/NGTBATCH) JOBPTY(3)
+
+/* Increase job's logging level for debugging */
+CHGJOB JOB(123456/BATCHUSR/NGTBATCH) LOG(4 00 *SECLVL)
+
+/* Change time slice (CPU quantum, in milliseconds) */
+CHGJOB JOB(123456/BATCHUSR/NGTBATCH) TIMESLICE(3000)
+
+/* Move a job to a different output queue */
+CHGJOB JOB(123456/BATCHUSR/NGTBATCH) OUTQ(ORDLIB/BATCHOUT)</pre>
+
+<strong>Holding, releasing, and ending jobs:</strong>
+
+<pre>/* Hold a job (pause without ending) */
+HLDJOB JOB(123456/BATCHUSR/NGTBATCH) SPLFILE(*YES)
+
+/* Release a held job */
+RLSJOB JOB(123456/BATCHUSR/NGTBATCH)
+
+/* End a job — controlled (wait for current operation to complete) */
+ENDJOB JOB(123456/BATCHUSR/NGTBATCH) OPTION(*CNTRLD) DELAY(60)
+
+/* End a job — immediate (use only when controlled fails or process is hung) */
+ENDJOB JOB(123456/BATCHUSR/NGTBATCH) OPTION(*IMMED)</pre>
+
+<strong>Working with job queues:</strong>
+
+<pre>WRKJOBQ JOBQ(QBATCH)     /* Show jobs waiting in a specific queue */
+HLDJOBQ JOBQ(QBATCH)     /* Hold queue — prevent new jobs from starting */
+RLSJOBQ JOBQ(QBATCH)     /* Release queue */
+CLRJOBQ JOBQ(QBATCH)     /* Clear all held/released jobs from queue — irreversible */</pre>
+
+<strong>Viewing job logs for completed jobs:</strong>
+
+<pre>/* Display job log for a specific completed job */
+DSPJOBLOG JOB(123456/BATCHUSR/NGTBATCH)
+
+/* Or via SQL — find jobs that ended with an error today */
+SELECT JOB_NAME, JOB_STATUS, JOB_END_REASON,
+       JOB_DATE, JOB_ENTERED_SYSTEM_TIME, JOB_END_TIME
+FROM   QSYS2.JOB_INFO
+WHERE  JOB_STATUS      = '*OUTQ'
+  AND  JOB_END_REASON  <> 'JOB COMPLETED NORMALLY'
+  AND  JOB_DATE        = CURRENT_DATE
+ORDER  BY JOB_END_TIME DESC;</pre>
+
+<h2>Message queue management</h2>
+
+Every IBM i user profile, job, and many system objects have a message queue. The operator message queue (QSYSOPR) receives important system messages.
+
+<pre>DSPMSG MSGQ(QSYSOPR)     /* Display operator message queue */
+DSPMSG MSGQ(*WRKSTN)     /* Display current workstation message queue */
+
+/* Send a message to the operator queue */
+SNDMSG MSG('Nightly batch completed successfully') TOUSR(*SYSOPR)
+
+/* Send a message to a specific user */
+SNDMSG MSG('Your report is ready in output queue BATCHOUT') TOUSR(JSMITH)
+
+/* Clear old messages from a queue */
+CLRMSGQ MSGQ(QSYSOPR)</pre>
+
+<strong>Replying to a message waiting for operator response:</strong>
+
+<pre>/* In DSPMSG, press 2 next to the inquiry message, then type the reply */
+/* Or from command line: */
+SNDRPY MSGKEY(xxxxxxxx) MSGQ(QSYSOPR) RPY('I')  /* I = Ignore, C = Cancel, R = Retry */</pre>
+
+<strong>Monitoring message queues with MONMSG in batch:</strong>
+
+A CL program can be dedicated to monitoring a message queue and taking action on specific messages — a pattern used for automated operations (restart failed jobs, send alerts, trigger downstream processes):
+
+<pre>PGM
+TOP:
+    RCVMSG MSGQ(QSYSOPR) MSGID(&MSGID) MSG(&MSGDTA) WAIT(30)
+    MONMSG MSGID(CPF0000) /* Timeout or error — loop back */
+
+    SELECT
+    WHEN (&MSGID *EQ 'CPF1241') DO  /* Job ended abnormally */
+        CALL ALERTPRG PARM(&MSGDTA)
+    ENDDO
+    WHEN (&MSGID *EQ 'CPC2191') DO  /* Job completed normally */
+        CALL LOGCOMPLETE PARM(&MSGDTA)
+    ENDDO
+    ENDSELECT
+
+    GOTO CMDLBL(TOP)
+ENDPGM</pre>
+
+<h2>Output queues and spooled files</h2>
+
+Spooled files are the IBM i equivalent of print jobs. Programs write output to spooled files in output queues. Managing spooled files is a routine operational task.
+
+<pre>WRKSPLF SELECT(*ALL)                    /* All spooled files system-wide */
+WRKSPLF SELECT(*CURRENT)               /* Current user's spooled files */
+WRKSPLF SELECT(*ALL) OUTQ(ORDLIB/BATCHOUT)  /* Files in a specific output queue */
+
+/* Delete old spooled files (7 days or older) */
+DLTSPLF FILE(*SELECT) SPLNBR(*SELECT)  /* Interactive selection */
+
+/* Or via SQL */
+SELECT JOB_NAME, SPOOLED_FILE_NAME, PAGES, CREATE_TIMESTAMP
+FROM   QSYS2.OUTPUT_QUEUE_ENTRIES
+WHERE  OUTPUT_QUEUE_LIBRARY = 'ORDLIB'
+  AND  OUTPUT_QUEUE_NAME    = 'BATCHOUT'
+ORDER  BY CREATE_TIMESTAMP;</pre>
+
+<strong>Moving or copying spooled files:</strong>
+
+<pre>/* Move a spooled file to a different output queue */
+CHGSPLFA FILE(QPRINT) JOB(123456/BATCHUSR/NGTBATCH) SPLNBR(1) +
+          OUTQ(ORDLIB/ARCHIVEQ)
+
+/* Copy a spooled file to an IFS stream file (PDF, text) */
+CPYSPLF FILE(QPRINT) TOFILE(*TOSTMF) +
+         TOSTMF('/home/reports/nightly-batch.txt') +
+         STMFOPT(*REPLACE)</pre>
+
+<h2>Data queues for inter-job communication</h2>
+
+Data queues (*DTAQ) are IBM i objects designed for passing data between jobs — a producer-consumer pattern built into the OS. They are faster than database tables for this purpose because they use kernel-level locking and signalling.
+
+<strong>Creating a data queue:</strong>
+
+<pre>/* FIFO data queue, each entry up to 256 bytes */
+CRTDTAQ DTAQ(ORDLIB/ORDNOTIFY) MAXLEN(256) SEQ(*FIFO) TEXT('Order processing notification queue')
+
+/* Keyed data queue — entries retrieved by key rather than position */
+CRTDTAQ DTAQ(ORDLIB/STATUSQ) MAXLEN(512) SEQ(*KEYED) KEYLEN(10) TEXT('Status keyed queue')</pre>
+
+<strong>Sending and receiving from CL:</strong>
+
+<pre>/* Send a data queue entry (producer) */
+SNDDT DTAQ(ORDLIB/ORDNOTIFY) DTALEN(10) DATA('ORD00143  ')
+
+/* Receive from a data queue (consumer) — waits up to 60 seconds */
+RCVDTAQ DTAQ(ORDLIB/ORDNOTIFY) DTALEN(256) DATA(&DATA) WAIT(60)
+
+/* Non-blocking receive — returns immediately if queue is empty */
+RCVDTAQ DTAQ(ORDLIB/ORDNOTIFY) DTALEN(256) DATA(&DATA) WAIT(0)</pre>
+
+<strong>Data queues from SQL (IBM i 7.3+):</strong>
+
+<pre>-- Send to a data queue from SQL
+CALL QSYS2.SEND_DATA_QUEUE(
+    DATA_QUEUE_LIBRARY => 'ORDLIB',
+    DATA_QUEUE_NAME    => 'ORDNOTIFY',
+    MESSAGE_DATA       => 'ORD00143  '
+);
+
+-- Receive from a data queue from SQL
+SELECT MESSAGE_DATA, MESSAGE_LENGTH
+FROM   TABLE(QSYS2.RECEIVE_DATA_QUEUE(
+             DATA_QUEUE_LIBRARY => 'ORDLIB',
+             DATA_QUEUE_NAME    => 'ORDNOTIFY',
+             WAIT_TIME          => 0));</pre>
+
+<h2>Job scheduling with ADDJOBSCDE</h2>
+
+IBM i has a built-in job scheduler. ADDJOBSCDE (Add Job Schedule Entry) schedules a command to run at a specific time or on a recurring schedule without external scheduling tools.
+
+<pre>/* Run nightly batch every day at 22:00 */
+ADDJOBSCDE JOB(NGTBATCH) CMD(SBMJOB CMD(CALL PGM(ORDLIB/NIGHTBATCH)) +
+                              JOB(NGTBATCH) JOBD(BATCHJOBD) JOBQ(BATCHQ)) +
+            FRQ(*WEEKLY) SCDDAY(*ALL) SCDTIME(220000) +
+            USER(BATCHUSR) TEXT('Nightly order processing batch')
+
+/* Run month-end close on the last day of each month */
+ADDJOBSCDE JOB(MONTHEND) CMD(SBMJOB CMD(CALL PGM(ORDLIB/MTHEND)) +
+                              JOB(MONTHEND) JOBD(BATCHJOBD)) +
+            FRQ(*MONTHLY) SCDDATE(*MONTHEND) SCDTIME(010000) +
+            USER(BATCHUSR) TEXT('Month-end close processing')
+
+/* View all scheduled entries */
+WRKJOBSCDE
+
+/* Hold a scheduled entry (prevent it running while keeping the schedule) */
+HLDJOBSCDE JOB(NGTBATCH)
+
+/* Release */
+RLSJOBSCDE JOB(NGTBATCH)</pre>
+
+<strong>Checking job schedule via SQL:</strong>
+
+<pre>SELECT JOB_SCHEDULE_ENTRY, SCHEDULE_DATE, SCHEDULE_TIME,
+       NEXT_SUBMISSION_DATE, NEXT_SUBMISSION_TIME, STATUS
+FROM   QSYS2.SCHEDULED_JOB_INFO
+ORDER  BY NEXT_SUBMISSION_DATE, NEXT_SUBMISSION_TIME;</pre>
+
+<h2>System request and attention key handling</h2>
+
+In a 5250 session, pressing System Request (Sys Req) opens the System Request menu, which allows you to:
+<ul>
+<li>Transfer to another job or session</li>
+<li>End a runaway interactive job</li>
+<li>Send a message from an interactive session</li>
+</ul>
+
+<code>ATTN</code> key handling is controlled by the ATNPGM parameter on the user profile and can be customised to provide application-specific attention handling.
+
+<h2>Practical operational command reference</h2>
+
+<table>
+<tr><th>Need</th><th>Command</th></tr>
+<tr><td>See all active jobs</td><td>WRKACTJOB SBS(*ALL)</td></tr>
+<tr><td>Find a job by name</td><td>WRKACTJOB SBS(*ALL) JOB(name)</td></tr>
+<tr><td>Check job log of active job</td><td>WRKACTJOB → F10 on the job</td></tr>
+<tr><td>End a hung job</td><td>ENDJOB JOB(...) OPTION(*IMMED)</td></tr>
+<tr><td>Check operator messages</td><td>DSPMSG MSGQ(QSYSOPR)</td></tr>
+<tr><td>See jobs waiting in a queue</td><td>WRKJOBQ JOBQ(QBATCH)</td></tr>
+<tr><td>Clear a stuck print queue</td><td>WRKSPLF → option 4 to delete</td></tr>
+<tr><td>Check system resource status</td><td>WRKSYSSTS</td></tr>
+<tr><td>Check disk space</td><td>WRKSYSSTS → check %USED column</td></tr>
+<tr><td>Restart a subsystem</td><td>ENDSBS SBS(name) OPTION(*CNTRLD) then STRSBS</td></tr>
+</table>
+
+These commands are the hands-on operational vocabulary of IBM i. An administrator who can work confidently through WRKACTJOB, DSPMSG, WRKSPLF, and WRKJOBSCDE can diagnose and resolve the majority of production issues without escalating. Adding data queue patterns and scheduled job entries to that knowledge covers the automation layer that keeps scheduled batch processing running reliably.
+
+<em>Next post: IBM i IFS advanced — journalling stream files, sharing the IFS as a Windows network drive with NetServer, backing up IFS data, handling large files, and CCSID and encoding in the Integrated File System.</em>
