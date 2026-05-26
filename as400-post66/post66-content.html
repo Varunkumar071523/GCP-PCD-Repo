@@ -1,0 +1,328 @@
+<p>The previous post covered IBM i outbound email — configuring SMTP with CHGSMTPA, sending plain-text alerts via SNDDST and SNDSMTPEMM from CL, building a reusable CL email alert wrapper, generating HTML email from RPG using MIME formatting, sending notifications from PASE with Python smtplib including attachments, and email troubleshooting on IBM i. This post covers IBM i memory pools and pool sizing: the *BASE, *INTERACT, and *SPOOL shared pool architecture, private pools and subsystem pool configurations, setting pool sizes and activity levels with WRKSHRPOOL and CHGSHRPOOL, diagnosing paging faults using Collection Services and WRKMEMPOOL, configuring automatic performance adjustment (APA), and sizing guidelines for interactive, batch, and PASE workloads on IBM i in 2026.</p>
+
+<h2>IBM i Memory Architecture</h2>
+
+<p>IBM i divides physical memory into <strong>memory pools</strong> — isolated regions of main storage allocated to groups of jobs. A pool is not a virtual memory segment; it is a real memory allocation. Jobs running in a pool can only use the memory allocated to that pool. When the pool's memory is exhausted, IBM i uses paging (reading and writing pages to DASD) to accommodate additional memory needs — an operation that is orders of magnitude slower than main storage access.</p>
+
+<p>There are two categories of pools:</p>
+<ul>
+  <li><strong>Shared pools</strong> — named system pools (*BASE, *INTERACT, *SPOOL, *SHRPOOL1 through *SHRPOOL10) that multiple subsystems and jobs can use simultaneously. Sized system-wide with CHGSHRPOOL or WRKSHRPOOL.</li>
+  <li><strong>Private pools</strong> — pools defined within a subsystem description that are dedicated exclusively to that subsystem. Sized in the subsystem description with CHGSBSD or defined with ADDPOOLJE.</li>
+</ul>
+
+<h2>The System Shared Pool Structure</h2>
+
+<table>
+  <thead>
+    <tr><th>Pool Name</th><th>Default Use</th><th>Typical Workload</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>*BASE (Pool 2)</td><td>All jobs not explicitly assigned to another pool</td><td>Batch jobs, PASE processes, background tasks</td></tr>
+    <tr><td>*INTERACT (Pool 3)</td><td>Interactive 5250 sessions (QINTER subsystem)</td><td>Interactive RPG, WRKACTJOB, WRKJOB, SQL scripts</td></tr>
+    <tr><td>*SPOOL (Pool 4)</td><td>Spooling operations (QSPL subsystem)</td><td>Print writers, spooled file creation</td></tr>
+    <tr><td>*SHRPOOL1–10</td><td>User-defined; assigned to specific subsystems</td><td>Named workloads: batch, communication, application-specific</td></tr>
+    <tr><td>Machine pool (Pool 1)</td><td>IBM i microcode and system functions</td><td>Not user-configurable; managed by the OS</td></tr>
+  </tbody>
+</table>
+
+<pre>
+/* Display current shared pool sizes and usage */
+WRKSHRPOOL
+
+/* Typical WRKSHRPOOL output columns:
+   Pool  Size(M)  Reserved(M)  MaxActLvl  ActLvl  DBFaults  NDBFaults
+   *BASE    4096          256       *CALC      45         0          2
+   *INTER   2048            0          50      32         0          0
+   *SPOOL    512            0          10       3         0          0
+*/
+
+/* Display real-time pool activity including paging statistics */
+WRKSHRPOOL ASTLVL(*BASIC)    /* Brief view */
+WRKSHRPOOL ASTLVL(*ADVANCED) /* Detailed view with fault rates */
+</pre>
+
+<h2>CHGSHRPOOL — Changing Shared Pool Sizes</h2>
+
+<p><code>CHGSHRPOOL</code> (Change Shared Storage Pool) changes the size and activity level of a named shared pool. Changes take effect immediately without an IPL. Reducing a pool size below its current usage causes IBM i to increase paging to free pages — this temporarily impacts performance, so pool size reductions should be done gradually.</p>
+
+<pre>
+/* Increase the *INTERACT pool from 2 GB to 3 GB for peak interactive hours */
+CHGSHRPOOL POOL(*INTERACT) SIZE(3072)
+
+/* Increase *BASE for a large batch run */
+CHGSHRPOOL POOL(*BASE) SIZE(6144)
+
+/* After the batch run, restore *BASE */
+CHGSHRPOOL POOL(*BASE) SIZE(4096)
+
+/* Set the activity level for *INTERACT */
+/* Activity level = maximum number of threads that can be active simultaneously */
+/* without paging; reducing it forces paging even if memory is available */
+CHGSHRPOOL POOL(*INTERACT) ACTLVL(60)
+
+/* Create and configure a named pool for a specific application */
+/* First, define the pool in the subsystem description */
+ADDPOOLJE SBSD(APPLIB/APPSBS) POOLS((1 *BASE)(2 *SHRPOOL5))
+CHGSHRPOOL POOL(*SHRPOOL5) SIZE(2048) ACTLVL(20)
+/* Assign jobs to pool 2 (SHRPOOL5) in the routing entries */
+ADDRTGE SBSD(APPLIB/APPSBS) SEQNBR(10) CMPVAL('ORDAPP') PGM(QCMD) +
+        CLS(APPLIB/ORDCLS) POOLID(2)
+</pre>
+
+<h2>Activity Levels and Their Impact on Throughput</h2>
+
+<p>The <strong>activity level</strong> of a pool is the maximum number of threads that can hold real memory pages simultaneously. A thread above the activity level is said to be <em>ineligible</em> — it is forced to give up its pages (written to paging space) and wait for another thread to become ineligible before it can run.</p>
+
+<p>Activity level versus pool size:</p>
+<ul>
+  <li><strong>Pool too small, activity level correct</strong> — the pool pages frequently because there is not enough memory for the active threads. Symptom: high DB and NDB fault rates in WRKSHRPOOL.</li>
+  <li><strong>Pool large, activity level too low</strong> — memory is available but threads are artificially forced to page because the activity limit is too restrictive. Symptom: low fault rates but slow response times, CPU underutilised.</li>
+  <li><strong>Pool large, activity level appropriate</strong> — the ideal state: memory is sufficient for all active threads at the configured activity level, fault rates are near zero, and response times are fast.</li>
+</ul>
+
+<pre>
+/* Check the relationship between pool size, activity level, and fault rates */
+/* Run this query after enabling Collection Services */
+SELECT
+    POOL_NAME,
+    POOL_SIZE          AS size_mb,
+    MAXIMUM_ACTIVE_THREADS AS max_active,
+    DATABASE_FAULTS    AS db_faults_per_sec,
+    NONDATABASE_FAULTS AS ndb_faults_per_sec,
+    ACTIVE_THREADS     AS currently_active
+FROM QSYS2.MEMORY_POOL_INFO
+ORDER BY POOL_NAME;
+
+/* A fault rate above 1-2 per second on *INTERACT indicates the pool is too small */
+/* or the activity level is set too low for the workload */
+</pre>
+
+<h2>Diagnosing Paging Faults with Collection Services</h2>
+
+<p>Paging faults are the primary memory performance symptom on IBM i. There are two types:</p>
+<ul>
+  <li><strong>DB faults (database faults)</strong> — a page from a database file (physical file or SQL table) was needed but not in memory. High DB fault rates indicate that frequently accessed database tables are being paged out, often because the pool is undersized for the working set of the application's data.</li>
+  <li><strong>NDB faults (non-database faults)</strong> — a program page, stack frame, or system data page was not in memory. High NDB fault rates indicate that program pages are being swapped in and out, often because the activity level is too low or there are too many concurrent jobs in the pool.</li>
+</ul>
+
+<pre>
+/* Start Collection Services to capture detailed pool performance data */
+STRPFRCOL INTERVAL(30)   /* Collect every 30 seconds */
+
+/* After collecting for 30-60 minutes of representative workload: */
+/* Analyse the data in ACS Performance Data Investigator */
+/* or query the Collection Services database directly */
+
+/* Query pool fault rates from a Collection Services collection */
+SELECT
+    TIMESTAMP_COLLECTED,
+    POOL_NAME,
+    DB_FAULT_RATE,
+    NDB_FAULT_RATE,
+    POOL_SIZE_MB,
+    ACTIVITY_LEVEL
+FROM QSYS2.SYSTEM_STATUS_INFO_BASIC
+WHERE TIMESTAMP_COLLECTED BETWEEN
+      TIMESTAMP('2026-07-09 08:00:00') AND
+      TIMESTAMP('2026-07-09 12:00:00')
+AND   POOL_NAME IN ('*INTERACT', '*BASE')
+ORDER BY TIMESTAMP_COLLECTED, POOL_NAME;
+
+/* End collection when done */
+ENDPFRCOL
+</pre>
+
+<p>Fault rate thresholds as a general guide:</p>
+<ul>
+  <li><strong>0–1 per second</strong> — excellent; pool is well-sized</li>
+  <li><strong>1–5 per second</strong> — acceptable; monitor during peak periods</li>
+  <li><strong>5–20 per second</strong> — concerning; increase pool size or reduce activity level</li>
+  <li><strong>20+ per second</strong> — severe thrashing; immediate action needed — add memory or offload workload</li>
+</ul>
+
+<h2>Automatic Performance Adjustment (APA)</h2>
+
+<p>IBM i's <strong>Automatic Performance Adjustment (APA)</strong> feature allows the OS to dynamically adjust shared pool sizes based on observed fault rates, without manual intervention. APA shifts memory from pools with low fault rates to pools with high fault rates, keeping the system tuned during workload fluctuations across the day.</p>
+
+<pre>
+/* Enable APA for all shared pools */
+/* QPFRADJ system value controls automatic adjustment */
+CHGSYSVAL SYSVAL(QPFRADJ) VALUE('2')
+/* Values:
+   0 = No adjustment (manual only)
+   1 = Adjustment at IPL only
+   2 = Periodic adjustment (every few minutes) — recommended for most systems
+   3 = Adjustment at IPL and periodically
+*/
+
+/* Verify APA is active */
+DSPSYSVAL SYSVAL(QPFRADJ)
+
+/* APA works best when initial pool sizes are reasonably close to correct */
+/* If pools are wildly misallocated, APA takes a long time to converge */
+/* Set reasonable starting sizes manually, then let APA fine-tune */
+
+/* Set minimum pool sizes to prevent APA from making a pool too small */
+/* Not directly controllable — set ACTLVL floor by class definition */
+/* Use WRKCLSJE to check and set minimum class sizes per subsystem */
+</pre>
+
+<p>APA limitations to understand:</p>
+<ul>
+  <li>APA can only redistribute memory that is already allocated to shared pools; it cannot grow the total memory installed in the system</li>
+  <li>APA does not adjust activity levels — only pool sizes</li>
+  <li>Private pools (subsystem-defined) are not managed by APA; only *BASE, *INTERACT, *SPOOL, and *SHRPOOL1-10 participate</li>
+  <li>APA adjustments are logged in the QHST history log; use DSPLOG to review adjustment history</li>
+</ul>
+
+<h2>Private Pools and Subsystem Pool Configurations</h2>
+
+<p>Subsystems can define their own pool assignments in the subsystem description, allowing specific job types to run in dedicated memory pools rather than sharing *BASE. This is the mechanism used to give a critical batch subsystem its own isolated memory so that a spike in interactive sessions cannot starve it of pages.</p>
+
+<pre>
+/* Define a private pool for the order processing subsystem */
+/* Pool ID 2 maps to *SHRPOOL5, sized at 2 GB with activity level 20 */
+
+/* First: change the subsystem to declare its pool usage */
+/* APPLIB/APPSBS currently only uses pool 1 (*BASE) */
+/* Add a second pool entry pointing to *SHRPOOL5 */
+ADDPOOLJE SBSD(APPLIB/APPSBS) POOLS((1 *BASE)(2 *SHRPOOL5))
+
+/* Size the shared pool that will be used */
+CHGSHRPOOL POOL(*SHRPOOL5) SIZE(2048) ACTLVL(20)
+
+/* Update the routing entry for order batch jobs to use pool 2 */
+/* SEQNBR 10 matches jobs with CMPVAL of 'ORDAPP' in their routing data */
+CHGRTGE SBSD(APPLIB/APPSBS) SEQNBR(10) POOLID(2)
+
+/* Verify the subsystem pool configuration */
+DSPSBSD SBSD(APPLIB/APPSBS) OUTPUT(*PRINT)
+/* Look for the 'Storage pool information' section */
+
+/* Display pool activity broken down by subsystem */
+/* Use WRKACTJOB to see which pool each active job is using */
+WRKACTJOB SBS(APPSBS)
+/* The 'Pool' column shows the pool ID (1=*BASE, 2=*SHRPOOL5) for each job */
+
+/* SQL: check pool usage per subsystem */
+SELECT
+    SUBSYSTEM_NAME,
+    POOL_ID,
+    JOBS_IN_POOL,
+    POOL_NAME
+FROM QSYS2.ACTIVE_JOB_INFO
+WHERE SUBSYSTEM_NAME = 'APPSBS'
+GROUP BY SUBSYSTEM_NAME, POOL_ID, POOL_NAME
+ORDER BY POOL_ID;
+</pre>
+
+<p>Use private pool assignments when:</p>
+<ul>
+  <li>A batch subsystem runs large sequential file scans that would flood the database page buffer shared with interactive jobs</li>
+  <li>A PASE-based application (Node.js, Python) has unpredictable memory usage that spikes during high traffic</li>
+  <li>A communications subsystem (QCMN, QSYSWRK) needs guaranteed memory to handle inbound connections without competing with application jobs</li>
+  <li>You need to enforce a memory ceiling on a specific workload to prevent it from consuming all available physical storage</li>
+</ul>
+
+<h2>Practical Pool Monitoring CL Script</h2>
+
+<p>This CL script queries pool fault rates and sends an alert email if any pool exceeds a fault rate threshold. Schedule it every 30 minutes during business hours using ADDJOBSCDE:</p>
+
+<pre>
+/* APPLIB/POOLMONPRC — Memory pool fault rate monitor */
+/* Alerts operations if any shared pool exceeds 10 faults/sec */
+
+PGM
+
+DCL VAR(&FAULTCHK) TYPE(*CHAR) LEN(1)  VALUE('0')
+DCL VAR(&POOLNAME) TYPE(*CHAR) LEN(10)
+DCL VAR(&FAULTRT)  TYPE(*DEC)  LEN(7 2)
+DCL VAR(&ALERTMSG) TYPE(*CHAR) LEN(200)
+DCL VAR(&SUBJECT)  TYPE(*CHAR) LEN(100)
+
+/* Run the SQL check — write results to QTEMP work file */
+RUNSQL SQL('CREATE TABLE QTEMP.POOLCHK AS +
+    (SELECT POOL_NAME, DATABASE_FAULTS AS DB_FAULTS, +
+            NONDATABASE_FAULTS AS NDB_FAULTS +
+     FROM QSYS2.MEMORY_POOL_INFO +
+     WHERE (DATABASE_FAULTS + NONDATABASE_FAULTS) > 10) +
+    WITH DATA') COMMIT(*NONE)
+
+MONMSG MSGID(SQL0100)  /* No rows = no fault threshold exceeded */
+
+/* Check if any rows were written */
+RTVMBRD FILE(QTEMP/POOLCHK) NBRCURRCD(&FAULTCHK)
+MONMSG MSGID(CPF3060) EXEC(GOTO CMDLBL(NOFAULTS))
+
+IF COND(&FAULTCHK *GT '0') THEN(DO)
+  CHGVAR VAR(&SUBJECT) VALUE('WARNING: IBM i Memory Pool Fault Alert')
+  CHGVAR VAR(&ALERTMSG) VALUE('One or more IBM i memory pools +
+    exceeded 10 faults/sec. Check WRKSHRPOOL immediately. +
+    System: PROD-IBMI.')
+  CALL PGM(APPLIB/SNDEMLALRT) PARM(&SUBJECT &ALERTMSG)
+  SNDPGMMSG MSGID(CPF9898) MSGF(QCPFMSG) +
+       MSGDTA('POOLMON: Memory pool fault alert sent') +
+       TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+ENDDO
+
+NOFAULTS:
+  DLTF FILE(QTEMP/POOLCHK)
+  MONMSG MSGID(CPF2105)
+
+ENDPGM
+</pre>
+
+<h2>Memory Pool Sizing Guidelines by Workload Type</h2>
+
+<table>
+  <thead>
+    <tr><th>Workload Type</th><th>Recommended Pool</th><th>Sizing Guideline</th><th>Activity Level</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Interactive 5250</td><td>*INTERACT</td><td>3–6 MB per concurrent interactive user</td><td>1.5× peak concurrent users</td></tr>
+    <tr><td>Batch RPG / CL</td><td>*BASE</td><td>Enough to hold the working set of frequently accessed files</td><td>Number of concurrent batch jobs × 2</td></tr>
+    <tr><td>DB2 SQL (ODBC/JDBC)</td><td>*BASE or *SHRPOOL1</td><td>Working set of frequently queried tables + SQE optimizer memory</td><td>Number of concurrent SQL connections</td></tr>
+    <tr><td>PASE (Node.js, Python)</td><td>*BASE or *SHRPOOL2</td><td>Sum of heap sizes of all PASE processes + OS overhead</td><td>Number of PASE processes × 2</td></tr>
+    <tr><td>Print / spool</td><td>*SPOOL</td><td>256–512 MB for most shops; increase if spooled files are large</td><td>Number of print writers + 5</td></tr>
+  </tbody>
+</table>
+
+<pre>
+/* Quick sizing reference: total memory on system minus machine pool */
+/* Available for shared and private pools */
+SELECT
+    TOTAL_MEMORY_MB,
+    MACHINE_POOL_MB,
+    TOTAL_MEMORY_MB - MACHINE_POOL_MB AS available_for_pools_mb
+FROM (
+    SELECT
+        TOTAL_MAIN_STORAGE_SIZE / 1024  AS total_memory_mb,
+        (SELECT POOL_SIZE FROM QSYS2.MEMORY_POOL_INFO
+         WHERE  POOL_NAME = '*MACHINE') AS machine_pool_mb
+    FROM SYSIBM.SYSDUMMY1
+) X;
+
+/* Current pool allocation summary */
+SELECT
+    POOL_NAME,
+    POOL_SIZE          AS allocated_mb,
+    ACTIVE_THREADS,
+    DATABASE_FAULTS    AS db_faults,
+    NONDATABASE_FAULTS AS ndb_faults
+FROM QSYS2.MEMORY_POOL_INFO
+ORDER BY ALLOCATED_MB DESC;
+</pre>
+
+<h2>Memory Pool Tuning Best Practices for 2026</h2>
+
+<ul>
+  <li><strong>Enable APA (QPFRADJ=2) on all production systems</strong> — it is nearly always beneficial; the only exception is systems with extremely predictable, unchanging workloads where manual tuning is more precise</li>
+  <li><strong>Set initial pool sizes manually before enabling APA</strong> — APA converges faster when starting from reasonable values; a system where *INTERACT has only 256 MB and *BASE has 32 GB will waste time redistributing from the extreme imbalance</li>
+  <li><strong>Target near-zero DB fault rates on *INTERACT</strong> — interactive users are the most sensitive to paging delays; even 5 DB faults per second causes noticeable response time degradation on a 5250 screen</li>
+  <li><strong>Use QSYS2.MEMORY_POOL_INFO for automated monitoring</strong> — schedule a SQL query via ADDJOBSCDE that checks fault rates every hour during business hours and sends an email alert if any pool exceeds 10 faults per second</li>
+  <li><strong>Separate PASE workloads into *SHRPOOL2 or *SHRPOOL3</strong> — Node.js and Python processes have different memory usage patterns than batch RPG; putting them in a separate pool prevents PASE memory spikes from starving interactive jobs in *BASE</li>
+  <li><strong>Review pool sizes after major application changes</strong> — adding a new batch run, increasing concurrent users, or deploying a new PASE service changes the memory working set; re-baseline the pool sizes after each significant change</li>
+  <li><strong>Never reduce *INTERACT below 512 MB on an active production system without a maintenance window</strong> — the immediate paging effect can make interactive sessions appear frozen</li>
+</ul>
+
+<em>Next post: IBM watsonx on Power for IBM i — the architecture of watsonx.ai co-located with IBM i DB2 data on IBM Power, deploying Granite foundation models, calling the watsonx inference REST API from RPG using HTTPAPI, Python-based AI inference pipelines in PASE, practical use cases (document classification, anomaly detection on IBM i logs), and governing production AI workloads with watsonx.governance in 2026.</em>

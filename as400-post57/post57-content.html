@@ -1,0 +1,216 @@
+<p>The previous post covered CL error handling and exception management — IBM i message types, MONMSG command patterns for program-level and command-level monitoring, program message queues, SNDPGMMSG and RCVMSG, condition handlers in free-format CL procedures, DMPJOB diagnostic dumps, and a complete production CL error-handling template. This post covers DB2 for i query optimization: the SQE and CQE query engines, Visual Explain in IBM i Access Client Solutions, index design strategies, encoded vector indexes, STRDBMON, and reading the SQL plan cache using QSYS2 catalog views to diagnose and resolve slow queries on IBM i in 2026.</p>
+
+<h2>SQE vs CQE — Two Query Engines</h2>
+
+<p>DB2 for i has two query engines that have coexisted since IBM i V5R2:</p>
+
+<ul>
+  <li><strong>SQE (SQL Query Engine)</strong> — the modern engine introduced in V5R2. SQE processes SQL queries, uses a cost-based optimizer, maintains a plan cache, and leverages statistics for better plan selection. All new queries should be processed by SQE.</li>
+  <li><strong>CQE (Classic Query Engine)</strong> — the original query engine, predating modern SQL on IBM i. CQE processes queries over physical files using OPNQRYF-style access, DDS logical files, and some legacy SQL patterns. CQE does not maintain a plan cache and does not use statistics the same way SQE does.</li>
+</ul>
+
+<p>A query falls back to CQE when it uses constructs that SQE cannot process: certain old-style OPNQRYF-like syntax, some DDS join logical files, or when the SQE optimizer encounters a CQE-only feature. IBM has steadily expanded SQE coverage with each OS release. On IBM i 7.5 in 2026, almost all SQL queries run through SQE unless they involve very old DDS constructs.</p>
+
+<p>To check which engine processed a query, use the plan cache or Visual Explain — the query engine is shown in the plan details. You can also check the QQQOPTIMIZE system value and the QAQQINI query options file to influence engine selection, though this is rarely needed on modern IBM i releases.</p>
+
+<h2>Visual Explain in ACS</h2>
+
+<p>IBM i Access Client Solutions (ACS) includes a <strong>Visual Explain</strong> tool that graphically displays the query access plan chosen by the DB2 optimizer. It shows every step the optimizer took: which indexes were used, how tables were joined, whether a hash join or nested loop was used, the estimated and actual row counts, and where the optimizer spent the most time.</p>
+
+<p>To use Visual Explain in ACS:</p>
+<ol>
+  <li>Open ACS → Run SQL Scripts</li>
+  <li>Type or paste the SQL statement</li>
+  <li>Click <strong>Visual Explain</strong> (the toolbar icon showing a magnifying glass over a query plan, or use View → Run with Visual Explain)</li>
+  <li>The explain runs the query and displays the plan graphically</li>
+</ol>
+
+<p>Key elements in a Visual Explain output to examine:</p>
+<ul>
+  <li><strong>Index scan vs table scan</strong> — a table scan on a large table is almost always the first thing to address. Look for nodes labelled "Table Scan" with high row estimates.</li>
+  <li><strong>Index selection</strong> — which index was selected, and was it the best available? Look for "Index Scan" nodes and note the index name and estimated rows.</li>
+  <li><strong>Join method</strong> — Hash Join is generally efficient for large equi-joins; Nested Loop Join is efficient when the inner table access is by key. Merge Scan Join (sort-merge) indicates that both sides are sorted first.</li>
+  <li><strong>Temporary result</strong> — a "Temp Table" node indicates the optimizer created a temporary copy of data for sorting, grouping, or joining. This is expensive on large tables.</li>
+  <li><strong>Estimated vs actual rows</strong> — a large discrepancy (e.g., optimizer estimated 100 rows but found 1,000,000) indicates stale statistics.</li>
+</ul>
+
+<h2>Index Design Principles for DB2 for i</h2>
+
+<p>The DB2 for i optimizer selects access paths from available indexes (keyed logical files, SQL CREATE INDEX indexes, and system-maintained access paths). Effective index design for IBM i follows these principles:</p>
+
+<p><strong>Radix (binary tree) indexes</strong> are created with CREATE INDEX or via keyed DDS logical files. They are best for equality and range predicates on high-cardinality columns (columns with many distinct values):</p>
+
+<pre>
+-- Create an index on CUSTMST for customer status + account balance (compound)
+CREATE INDEX APPLIB.IX_CUST_STS_BAL
+  ON APPLIB.CUSTMST (CUSSTS ASC, ACCTBAL DESC);
+
+-- Create an index supporting a common WHERE + ORDER BY pattern
+CREATE INDEX APPLIB.IX_ORD_CUSTDT
+  ON APPLIB.ORDMST (CUSNO ASC, ORDDAT DESC)
+  INCLUDE (ORDAMT, ORDSTS);
+-- INCLUDE columns satisfy SELECT without accessing the base table (covering index)
+</pre>
+
+<p><strong>Index guidelines:</strong></p>
+<ul>
+  <li>Put the most selective column (fewest duplicate values) first in a compound index for equality predicates</li>
+  <li>Put the range or ORDER BY column last in a compound index</li>
+  <li>Use INCLUDE to create covering indexes that avoid base table reads for common SELECT patterns</li>
+  <li>Do not index low-cardinality columns (e.g., a status column with only 3 values) with a radix index — use an EVI instead</li>
+  <li>Every foreign key should have a supporting index to avoid full table scans on join</li>
+</ul>
+
+<h2>Encoded Vector Indexes (EVI)</h2>
+
+<p>An <strong>Encoded Vector Index (EVI)</strong> is a bitmap-style index designed for low-cardinality columns — columns where the number of distinct values is small relative to the total row count (e.g., status codes, region codes, boolean flags). EVIs are extremely efficient for queries that filter on multiple low-cardinality columns simultaneously (AND/OR combinations), and for aggregation queries (GROUP BY, COUNT, SUM).</p>
+
+<pre>
+-- Create an EVI on a low-cardinality status column
+CREATE ENCODED VECTOR INDEX APPLIB.EVI_CUST_STS
+  ON APPLIB.CUSTMST (CUSSTS);
+
+-- Create an EVI on order status (5 possible values)
+CREATE ENCODED VECTOR INDEX APPLIB.EVI_ORD_STS
+  ON APPLIB.ORDMST (ORDSTS);
+
+-- Create an EVI on region code
+CREATE ENCODED VECTOR INDEX APPLIB.EVI_ORD_RGN
+  ON APPLIB.ORDMST (REGION);
+
+-- A query filtering on both STATUS and REGION will use both EVIs
+-- and combine them via bitmap AND — extremely fast for large tables
+SELECT COUNT(*), SUM(ORDAMT)
+FROM   APPLIB.ORDMST
+WHERE  ORDSTS = 'SH'        -- EVI_ORD_STS used
+AND    REGION = 'MIDWEST';  -- EVI_ORD_RGN used, then AND-combined
+</pre>
+
+<p>When to use EVI vs radix index:</p>
+<ul>
+  <li>Use <strong>EVI</strong> for columns with fewer than ~100 distinct values (status, type, region, boolean flags)</li>
+  <li>Use <strong>radix index</strong> for high-cardinality columns (customer number, order number, date, name)</li>
+  <li>Both can coexist on the same table — the optimizer picks based on the query predicates</li>
+</ul>
+
+<h2>STRDBMON — Database Monitor</h2>
+
+<p><code>STRDBMON</code> (Start Database Monitor) captures detailed optimizer information for queries that run while monitoring is active. The data is written to a DB2 for i table that you specify. This is the most powerful tool for identifying slow queries in a running application.</p>
+
+<pre>
+/* Start monitoring — capture query plans for the next 30 minutes */
+STRDBMON OUTFILE(QTEMP/DBMON) JOB(*ALL) COMMENT('Performance investigation')
+
+/* ... run the application workload ... */
+
+/* End monitoring */
+ENDDBMON JOB(*ALL)
+
+/* Analyze the results using ACS Visual Explain on the monitor output */
+/* Or query the monitor table directly */
+</pre>
+
+<p>Query the STRDBMON output table to find the slowest queries:</p>
+
+<pre>
+-- Find the top 20 slowest queries from a STRDBMON capture
+SELECT
+    QQJFLD  AS job_number,
+    QQUCNT  AS execution_count,
+    QQETIM  AS elapsed_time_ms,
+    QQPTIM  AS parse_time_ms,
+    QQROWS  AS rows_fetched,
+    LEFT(QQSTMT, 200) AS sql_statement
+FROM QTEMP.DBMON
+WHERE QQRID = 3000           -- RID 3000 = SQL statement open
+ORDER BY QQETIM DESC
+FETCH FIRST 20 ROWS ONLY;
+</pre>
+
+<h2>Reading the SQL Plan Cache</h2>
+
+<p>DB2 for i SQE maintains a <strong>plan cache</strong> — a shared memory area that stores compiled query plans. When the same query runs again, SQE can reuse the cached plan rather than re-optimizing. The plan cache is exposed through QSYS2 catalog views:</p>
+
+<pre>
+-- View the current plan cache — most frequently executed statements
+SELECT
+    STATEMENT_TEXT,
+    NUMBER_USES          AS executions,
+    AVERAGE_TIME_MS      AS avg_elapsed_ms,
+    TOTAL_TIME_MS        AS total_elapsed_ms,
+    AVERAGE_ROWS_FETCHED AS avg_rows,
+    QUERY_COST           AS optimizer_cost
+FROM QSYS2.SQL_PLAN_CACHE
+ORDER BY TOTAL_TIME_MS DESC
+FETCH FIRST 25 ROWS ONLY;
+
+-- Find statements with very high average execution time
+SELECT
+    STATEMENT_TEXT,
+    NUMBER_USES,
+    AVERAGE_TIME_MS,
+    WORST_TIME_MS,
+    QUERY_HASH
+FROM QSYS2.SQL_PLAN_CACHE
+WHERE AVERAGE_TIME_MS > 5000    -- Queries averaging over 5 seconds
+ORDER BY AVERAGE_TIME_MS DESC;
+
+-- Find statements doing table scans (no index used)
+SELECT
+    STATEMENT_TEXT,
+    PLAN_CACHE_PLAN_TEXT  -- XML plan — look for TableScan nodes
+FROM QSYS2.SQL_PLAN_CACHE_STMT
+WHERE PLAN_CACHE_PLAN_TEXT LIKE '%TableScan%'
+ORDER BY NUMBER_USES DESC;
+</pre>
+
+<h2>Optimizer Goals and OPTIMIZE FOR</h2>
+
+<p>DB2 for i's optimizer defaults to minimizing total elapsed time for the full result set. For interactive queries that display only the first few rows, it can be more efficient to optimize for first-row retrieval:</p>
+
+<pre>
+-- Default: optimize for fetching all rows (best for batch)
+SELECT CUSNO, CUSNM, ACCTBAL
+FROM   APPLIB.CUSTMST
+WHERE  CUSSTS = 'A'
+ORDER BY ACCTBAL DESC;
+
+-- OPTIMIZE FOR first 10 rows (best for interactive paging)
+SELECT CUSNO, CUSNM, ACCTBAL
+FROM   APPLIB.CUSTMST
+WHERE  CUSSTS = 'A'
+ORDER BY ACCTBAL DESC
+OPTIMIZE FOR 10 ROWS;
+
+-- Force specific join order with OPTIMIZE FOR CURRENT OF CURSOR hint
+-- (rarely needed; let the optimizer work unless you have a specific problem)
+</pre>
+
+<h2>Collecting and Refreshing Statistics</h2>
+
+<p>The SQE optimizer uses column statistics (histograms of value distribution) to estimate row counts and choose optimal plans. If statistics are stale or missing, the optimizer makes poor decisions — the most common cause of suddenly slow queries after a large data load.</p>
+
+<pre>
+-- Manually collect statistics on a table
+CALL SYSPROC.SYSSTATISTICS('UPDATE', 'APPLIB', 'CUSTMST', NULL);
+
+-- Collect statistics on specific columns
+CALL SYSPROC.SYSSTATISTICS('UPDATE', 'APPLIB', 'ORDMST', 'ORDSTS, REGION, ORDDAT');
+
+-- Check when statistics were last collected
+SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME,
+       LAST_STATISTICS_COLLECTION_TIMESTAMP,
+       NUMBER_DISTINCT_VALUES
+FROM   QSYS2.SYSCOLUMNSTAT
+WHERE  TABLE_SCHEMA = 'APPLIB'
+AND    TABLE_NAME   = 'CUSTMST'
+ORDER BY TABLE_NAME, COLUMN_NAME;
+
+-- Auto-update statistics (enabled by default in IBM i 7.4+)
+-- Set at the system level:
+CALL QSYS2.CHANGE_QUERY_ATTRIBUTES(AUTO_STATISTICS_UPDATE => 'YES');
+</pre>
+
+<p>For tables that receive large periodic loads (nightly batch inserts or replacements), schedule a statistics update after the load completes and before the next day's interactive workload begins. A CLLE scheduled job using SBMJOB with CALL SYSPROC.SYSSTATISTICS is the standard approach.</p>
+
+<em>Next post: OAuth 2.0 and JWT Authentication from IBM i — implementing the client credentials flow from ILE RPG, managing Bearer tokens in DB2 for i, calling OAuth-protected REST APIs, JWT structure, and managing SSL certificates in the IBM i digital certificate store.</em>

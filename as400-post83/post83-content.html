@@ -1,0 +1,237 @@
+<p>The previous post covered IBM i commitment control and transaction management — starting and ending commitment definitions with STRCMTCTL and ENDCMTCTL, controlling DB2 transaction scope with COMMIT and ROLLBACK in CL and RPG, journal-based commitment control with STRJRNPF, savepoints with SAVEPOINT and ROLLBACK TO SAVEPOINT in embedded SQL, handling commitment control errors, and designing reliable multi-file update patterns on IBM i. This post covers DB2 for i triggers: creating BEFORE and AFTER triggers with CREATE TRIGGER, choosing between FOR EACH ROW and FOR EACH STATEMENT granularity, accessing OLD and NEW transition variables for changed data, building audit logging triggers, enforcing cascading business rules across tables, creating INSTEAD OF triggers on views, and applying trigger best practices on IBM i in 2026.</p>
+
+<h2>What Are DB2 for i Triggers?</h2>
+
+<p>A DB2 for i <strong>trigger</strong> is a named SQL object that executes automatically in response to an INSERT, UPDATE, or DELETE operation on a specific table. Triggers enforce business rules, maintain audit trails, and cascade changes to related tables — all transparently to the application performing the DML. IBM i supports two trigger types:</p>
+<ul>
+  <li><strong>SQL triggers</strong> — defined entirely in SQL with CREATE TRIGGER; portable, stored in the database catalogue, and the recommended approach for new development on IBM i 7.2+</li>
+  <li><strong>External triggers</strong> — call an ILE program (RPG, CL, C) when the trigger fires; used for legacy integration or when the triggered action requires non-SQL operations</li>
+</ul>
+<p>This post covers SQL triggers. External triggers are created with <code>ADDPFTRG</code> and are the older mechanism.</p>
+
+<h2>CREATE TRIGGER Syntax</h2>
+
+<pre>
+-- Trigger anatomy
+CREATE OR REPLACE TRIGGER schema.trigger_name
+  {BEFORE | AFTER | INSTEAD OF}          -- when the trigger fires
+  {INSERT | UPDATE [OF col,...] | DELETE} -- which DML event
+  ON schema.table_name
+  REFERENCING                             -- transition variable aliases
+    {OLD [ROW] [AS] old_alias}
+    {NEW [ROW] [AS] new_alias}
+    {OLD TABLE AS old_table_alias}        -- transition table (AFTER only)
+    {NEW TABLE AS new_table_alias}
+  FOR EACH {ROW | STATEMENT}             -- granularity
+  MODE DB2ROW                            -- required on IBM i
+  [WHEN (condition)]                     -- optional filter
+  BEGIN
+    -- trigger body: SQL statements
+  END
+</pre>
+
+<h2>AFTER INSERT Trigger: Audit Logging</h2>
+
+<p>The most common trigger use case on IBM i is <strong>audit logging</strong> — recording every change to a sensitive table (orders, payments, user profiles) in a separate audit table. An AFTER trigger fires after the DML statement succeeds, so the audit record is only written when the change commits.</p>
+
+<pre>
+-- Audit table for order changes
+CREATE TABLE APPLIB.ORD_AUDIT_LOG (
+  AUDIT_TS      TIMESTAMP    NOT NULL DEFAULT CURRENT TIMESTAMP,
+  AUDIT_ACTION  CHAR(1)      NOT NULL,  -- 'I' insert, 'U' update, 'D' delete
+  AUDIT_USER    VARCHAR(18)  NOT NULL DEFAULT CURRENT USER,
+  ORD_NO        CHAR(10)     NOT NULL,
+  CUST_NO       CHAR(8),
+  STATUS_OLD    CHAR(1),
+  STATUS_NEW    CHAR(1),
+  AMOUNT_OLD    DECIMAL(11,2),
+  AMOUNT_NEW    DECIMAL(11,2)
+);
+
+-- AFTER INSERT trigger: log every new order
+CREATE OR REPLACE TRIGGER ORDLIB.TRIG_ORDMST_INS
+  AFTER INSERT ON ORDLIB.ORDMST
+  REFERENCING NEW ROW AS newrow
+  FOR EACH ROW
+  MODE DB2ROW
+BEGIN
+    INSERT INTO APPLIB.ORD_AUDIT_LOG
+      (AUDIT_ACTION, ORD_NO, CUST_NO, STATUS_NEW, AMOUNT_NEW)
+    VALUES
+      ('I', newrow.ORD_NO, newrow.CUST_NO, newrow.STATUS, newrow.ORD_AMOUNT);
+END;
+
+-- AFTER UPDATE trigger: log status and amount changes
+CREATE OR REPLACE TRIGGER ORDLIB.TRIG_ORDMST_UPD
+  AFTER UPDATE OF STATUS, ORD_AMOUNT ON ORDLIB.ORDMST
+  REFERENCING OLD ROW AS oldrow NEW ROW AS newrow
+  FOR EACH ROW
+  MODE DB2ROW
+BEGIN
+    INSERT INTO APPLIB.ORD_AUDIT_LOG
+      (AUDIT_ACTION, ORD_NO, CUST_NO, STATUS_OLD, STATUS_NEW, AMOUNT_OLD, AMOUNT_NEW)
+    VALUES
+      ('U', newrow.ORD_NO, newrow.CUST_NO,
+       oldrow.STATUS, newrow.STATUS,
+       oldrow.ORD_AMOUNT, newrow.ORD_AMOUNT);
+END;
+
+-- AFTER DELETE trigger: log deleted orders with full snapshot
+CREATE OR REPLACE TRIGGER ORDLIB.TRIG_ORDMST_DEL
+  AFTER DELETE ON ORDLIB.ORDMST
+  REFERENCING OLD ROW AS oldrow
+  FOR EACH ROW
+  MODE DB2ROW
+BEGIN
+    INSERT INTO APPLIB.ORD_AUDIT_LOG
+      (AUDIT_ACTION, ORD_NO, CUST_NO, STATUS_OLD, AMOUNT_OLD)
+    VALUES
+      ('D', oldrow.ORD_NO, oldrow.CUST_NO, oldrow.STATUS, oldrow.ORD_AMOUNT);
+END;
+</pre>
+
+<h2>BEFORE Trigger: Validation and Defaulting</h2>
+
+<p>A BEFORE trigger fires before the DML statement modifies the table. It can modify the NEW transition variable to alter the values being inserted or updated — this is the correct mechanism for computed columns, enforced defaults, or input normalisation that cannot be expressed as a column default or check constraint.</p>
+
+<pre>
+-- BEFORE INSERT trigger: normalise and validate a new order
+CREATE OR REPLACE TRIGGER ORDLIB.TRIG_ORDMST_BFINS
+  BEFORE INSERT ON ORDLIB.ORDMST
+  REFERENCING NEW ROW AS newrow
+  FOR EACH ROW
+  MODE DB2ROW
+BEGIN
+    -- Force the creation timestamp to the current time (override any application value)
+    SET newrow.CREATED_TS = CURRENT TIMESTAMP;
+
+    -- Normalise status to uppercase
+    SET newrow.STATUS = UPPER(TRIM(newrow.STATUS));
+
+    -- Default status to 'O' (Open) if not supplied
+    IF newrow.STATUS IS NULL OR newrow.STATUS = '' THEN
+        SET newrow.STATUS = 'O';
+    END IF;
+
+    -- Validate customer exists before inserting the order
+    IF NOT EXISTS (
+        SELECT 1 FROM SALESLIB.CUSTMST WHERE CUST_NO = newrow.CUST_NO
+    ) THEN
+        -- SIGNAL raises an SQL error that aborts the INSERT
+        SIGNAL SQLSTATE '75001'
+            SET MESSAGE_TEXT = 'Customer does not exist: ' || TRIM(newrow.CUST_NO);
+    END IF;
+END;
+
+-- BEFORE UPDATE trigger: prevent status regression
+-- (an order cannot move from 'S' Shipped back to 'O' Open)
+CREATE OR REPLACE TRIGGER ORDLIB.TRIG_ORDMST_BFUPD
+  BEFORE UPDATE OF STATUS ON ORDLIB.ORDMST
+  REFERENCING OLD ROW AS oldrow NEW ROW AS newrow
+  FOR EACH ROW
+  MODE DB2ROW
+  WHEN (oldrow.STATUS = 'S' AND newrow.STATUS = 'O')
+BEGIN
+    SIGNAL SQLSTATE '75002'
+        SET MESSAGE_TEXT = 'Cannot reopen a shipped order: ' || TRIM(newrow.ORD_NO);
+END;
+</pre>
+
+<h2>FOR EACH STATEMENT Triggers and Transition Tables</h2>
+
+<p>A <code>FOR EACH ROW</code> trigger fires once for every row affected by the DML statement. A <code>FOR EACH STATEMENT</code> trigger fires once for the entire statement, regardless of how many rows were affected. Statement-level triggers are more efficient for bulk operations; they use <strong>transition tables</strong> (<code>OLD TABLE</code> and <code>NEW TABLE</code>) to access the complete set of changed rows.</p>
+
+<pre>
+-- FOR EACH STATEMENT trigger: log a summary of a bulk status update
+-- Rather than one audit row per order (potentially thousands), log one summary row
+CREATE TABLE APPLIB.BULK_OP_LOG (
+  LOG_TS       TIMESTAMP   NOT NULL DEFAULT CURRENT TIMESTAMP,
+  OPERATION    CHAR(1)     NOT NULL,
+  TABLE_NAME   VARCHAR(30) NOT NULL,
+  ROWS_CHANGED INT         NOT NULL,
+  CHANGED_BY   VARCHAR(18) NOT NULL DEFAULT CURRENT USER
+);
+
+CREATE OR REPLACE TRIGGER ORDLIB.TRIG_ORDMST_BULK_UPD
+  AFTER UPDATE ON ORDLIB.ORDMST
+  REFERENCING NEW TABLE AS newtable
+  FOR EACH STATEMENT
+  MODE DB2ROW
+BEGIN
+    INSERT INTO APPLIB.BULK_OP_LOG (OPERATION, TABLE_NAME, ROWS_CHANGED)
+    SELECT 'U', 'ORDLIB.ORDMST', COUNT(*)
+    FROM newtable;
+END;
+</pre>
+
+<h2>INSTEAD OF Triggers on Views</h2>
+
+<p>An <code>INSTEAD OF</code> trigger fires in place of an INSERT, UPDATE, or DELETE on a view that would otherwise be non-updatable. This is the standard pattern for exposing a business-layer view to applications while routing writes through validation logic.</p>
+
+<pre>
+-- Non-updatable view joining orders and customers
+CREATE OR REPLACE VIEW APPLIB.V_ORDER_SUMMARY AS
+    SELECT o.ORD_NO, o.CUST_NO, c.CUST_NAME,
+           o.STATUS, o.ORD_AMOUNT, o.ORD_DATE
+    FROM ORDLIB.ORDMST o
+    JOIN SALESLIB.CUSTMST c ON c.CUST_NO = o.CUST_NO;
+
+-- INSTEAD OF INSERT: route inserts to ORDMST, ignore the CUST_NAME column
+CREATE OR REPLACE TRIGGER APPLIB.TRIG_V_ORDER_SUMMARY_INS
+  INSTEAD OF INSERT ON APPLIB.V_ORDER_SUMMARY
+  REFERENCING NEW ROW AS newrow
+  FOR EACH ROW
+  MODE DB2ROW
+BEGIN
+    INSERT INTO ORDLIB.ORDMST (ORD_NO, CUST_NO, STATUS, ORD_AMOUNT, ORD_DATE)
+    VALUES (newrow.ORD_NO, newrow.CUST_NO, newrow.STATUS,
+            newrow.ORD_AMOUNT, newrow.ORD_DATE);
+END;
+</pre>
+
+<h2>Managing Triggers: DROP, ALTER, and Display</h2>
+
+<pre>
+-- List all triggers on a table
+SELECT TRIGGER_NAME, EVENT_MANIPULATION, ACTION_TIMING,
+       ACTION_ORIENTATION, ENABLED
+FROM QSYS2.SYSTRIGGERS
+WHERE EVENT_OBJECT_TABLE = 'ORDMST'
+  AND EVENT_OBJECT_SCHEMA = 'ORDLIB'
+ORDER BY ACTION_TIMING, EVENT_MANIPULATION;
+
+-- Display trigger source (SQL text)
+SELECT TRIGGER_TEXT
+FROM QSYS2.SYSTRIGGERS
+WHERE TRIGGER_SCHEMA = 'ORDLIB'
+  AND TRIGGER_NAME = 'TRIG_ORDMST_UPD';
+
+-- Drop a trigger
+DROP TRIGGER ORDLIB.TRIG_ORDMST_UPD;
+
+-- Disable a trigger without dropping it (IBM i 7.4+)
+ALTER TRIGGER ORDLIB.TRIG_ORDMST_UPD DISABLE;
+
+-- Re-enable a disabled trigger
+ALTER TRIGGER ORDLIB.TRIG_ORDMST_UPD ENABLE;
+
+-- Drop all triggers on a table (useful during bulk data loads)
+-- Drop them by name — there is no DROP ALL TRIGGERS shorthand
+DROP TRIGGER ORDLIB.TRIG_ORDMST_INS;
+DROP TRIGGER ORDLIB.TRIG_ORDMST_UPD;
+DROP TRIGGER ORDLIB.TRIG_ORDMST_DEL;
+DROP TRIGGER ORDLIB.TRIG_ORDMST_BFINS;
+DROP TRIGGER ORDLIB.TRIG_ORDMST_BFUPD;
+</pre>
+
+<h2>Trigger Best Practices on IBM i</h2>
+
+<ul>
+  <li><strong>Keep trigger bodies short</strong> — triggers fire on every affected row; a trigger body that runs a complex multi-table query can severely impact INSERT/UPDATE/DELETE performance under load. Benchmark with realistic data volumes before deploying.</li>
+  <li><strong>Never issue COMMIT or ROLLBACK inside a trigger</strong> — the trigger executes within the calling statement's UOW. A COMMIT inside a trigger commits changes the caller did not intend to commit. Use SIGNAL to abort the DML instead.</li>
+  <li><strong>Disable triggers during bulk data loads</strong> — use ALTER TRIGGER ... DISABLE before loading large volumes of historical data, then re-enable and manually populate the audit table. This avoids millions of trigger firings for a one-time load.</li>
+  <li><strong>Use SIGNAL with application SQLSTATE values (75000–75999)</strong> — SQLSTATE values in the 75xxx range are reserved for application use. Returning a clear SQLSTATE and message text from a BEFORE trigger makes it easy for applications to identify and handle the specific validation failure.</li>
+  <li><strong>Test triggers under commitment control</strong> — trigger-generated audit rows participate in the calling statement's UOW. If the UOW rolls back, the audit rows roll back too. If you need unconditional audit logging, use an autonomous transaction approach (write to a data queue and process separately).</li>
+</ul>
+
+<em>Next post: IBM i save and restore operations — saving and restoring individual objects with SAVOBJ and RSTOBJ, saving entire libraries with SAVLIB and RSTLIB, performing full system saves with SAVSYS, running incremental saves with SAVCHGOBJ, creating and using save files with CRTSAVF, saving the IFS with SAVSAVFDTA, and designing a robust IBM i backup strategy using GO SAVE and BRMS in 2026.</em>

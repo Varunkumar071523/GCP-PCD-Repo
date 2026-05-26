@@ -1,0 +1,471 @@
+<p>The previous post covered IBM i memory pools and pool sizing — the *BASE, *INTERACT, and *SPOOL shared pool architecture, setting pool sizes and activity levels with WRKSHRPOOL and CHGSHRPOOL, diagnosing paging faults using Collection Services and QSYS2.MEMORY_POOL_INFO, configuring automatic performance adjustment (APA), and workload-specific sizing guidelines for interactive, batch, and PASE jobs on IBM i. This post covers IBM watsonx on Power for IBM i: the architecture of watsonx.ai co-located with IBM i DB2 data on IBM Power servers, the Granite foundation model family, deploying a watsonx.ai instance, calling the inference REST API from RPG using HTTPAPI, building Python-based AI inference pipelines in PASE, practical use cases including document classification and IBM i log anomaly detection, and governing production AI workloads with watsonx.governance in 2026.</p>
+
+<h2>What Is IBM watsonx on Power?</h2>
+
+<p>IBM watsonx is IBM's enterprise AI platform, consisting of three components:</p>
+<ul>
+  <li><strong>watsonx.ai</strong> — the AI studio for building, training, and deploying foundation models and machine learning pipelines. It provides a REST API for inference: send a prompt or structured input, receive a model-generated response.</li>
+  <li><strong>watsonx.data</strong> — a lakehouse data platform built on Apache Iceberg and Presto, designed to query data across object storage, databases, and data warehouses from a unified SQL interface.</li>
+  <li><strong>watsonx.governance</strong> — an AI lifecycle governance layer for monitoring model drift, bias detection, explainability, and regulatory compliance for AI models in production.</li>
+</ul>
+
+<p><strong>watsonx on Power</strong> refers specifically to the deployment of watsonx.ai (and optionally watsonx.governance) on IBM Power servers — the same hardware that runs IBM i. This co-location matters for IBM i shops because:</p>
+<ul>
+  <li>AI inference on data that lives in DB2 for i can happen without moving data across network boundaries to a cloud inference endpoint</li>
+  <li>Latency between the IBM i application and the watsonx inference endpoint is a sub-millisecond inter-process call rather than a WAN API call</li>
+  <li>Data sovereignty requirements (regulated industries, government) are satisfied — customer data never leaves the on-premises Power system</li>
+  <li>IBM Power processors include Matrix Math Accelerator (MMA) units that accelerate AI matrix operations, providing competitive inference throughput compared to GPU-accelerated cloud endpoints for many workloads</li>
+</ul>
+
+<h2>The IBM Granite Model Family</h2>
+
+<p>IBM Granite is IBM's family of open-source foundation models, available on watsonx.ai and on Hugging Face. They are designed for enterprise workloads — code, language, time-series, and geospatial — with transparent training data documentation and commercially safe licensing (Apache 2.0 for most models).</p>
+
+<table>
+  <thead>
+    <tr><th>Model</th><th>Parameters</th><th>Best Use Case for IBM i</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>granite-3.3-8b-instruct</td><td>8B</td><td>Document classification, summarisation, Q&amp;A over IBM i operational data</td></tr>
+    <tr><td>granite-3.3-2b-instruct</td><td>2B</td><td>Low-latency classification tasks, embedded in PASE pipelines</td></tr>
+    <tr><td>granite-code-8b-instruct</td><td>8B</td><td>RPG code explanation, SQL generation, legacy code documentation</td></tr>
+    <tr><td>granite-timeseries-ttm-r2</td><td>~50M</td><td>Forecasting IBM i batch runtimes, I/O patterns, capacity planning</td></tr>
+    <tr><td>granite-embedding-30m-english</td><td>30M</td><td>Semantic search over IBM i knowledge bases, RAG pipelines</td></tr>
+  </tbody>
+</table>
+
+<p>For most IBM i operational AI use cases in 2026 — classifying support tickets, summarising job logs, detecting anomalies — the 2B or 8B instruct models provide an excellent accuracy-to-latency trade-off when running on IBM Power with MMA acceleration.</p>
+
+<h2>watsonx.ai Deployment Architecture on IBM Power</h2>
+
+<p>watsonx.ai on IBM Power runs as a containerised workload. The standard deployment uses either OpenShift Container Platform (OCP) on a Power server or IBM Cloud Pak for Data on Power. The IBM i partition and the watsonx container workload run on the same physical Power system, separated by IBM PowerVM LPAR boundaries.</p>
+
+<pre>
+/* Architecture overview:
+   ┌─────────────────────────────────────────────────────────┐
+   │                IBM Power E1080 (or S1022)               │
+   │                                                         │
+   │  ┌──────────────────┐     ┌──────────────────────────┐  │
+   │  │  IBM i LPAR       │     │  Linux LPAR (RHEL/OCP)   │  │
+   │  │  - DB2 for i      │◄───►│  - watsonx.ai containers │  │
+   │  │  - RPG/CL apps    │     │  - Granite 8B model      │  │
+   │  │  - PASE Python    │     │  - watsonx.governance    │  │
+   │  │                   │     │                          │  │
+   │  │  REST API call     │────►│  /ml/v1/text/generation  │  │
+   │  └──────────────────┘     └──────────────────────────┘  │
+   │                                                         │
+   └─────────────────────────────────────────────────────────┘
+
+   Network: IBM i LPAR connects to watsonx LPAR via virtual Ethernet
+   (VLAN configured in HMC / PowerVM) — sub-millisecond latency
+*/
+
+/* Verify network connectivity from IBM i PASE to watsonx endpoint */
+/* Run in a PASE SSH session */
+curl -sk https://watsonx.internal.company.com:443/ml/v1/foundation_model_specs \
+     -H "Authorization: Bearer $WX_TOKEN" | python3 -m json.tool | head -30
+</pre>
+
+<h2>Obtaining a watsonx Access Token</h2>
+
+<p>watsonx.ai uses IAM (Identity and Access Management) token-based authentication. Before calling the inference API, the application must obtain a bearer token by exchanging an API key for a short-lived JWT. On IBM Cloud deployments this goes to cloud.ibm.com; on on-premises IBM Software Hub, it calls the local IAM service.</p>
+
+<pre>
+# Python: obtain a watsonx bearer token
+# /opt/appscripts/wx_token.py
+
+import requests
+import os
+
+IAM_URL     = os.environ.get('WX_IAM_URL',  'https://iam.internal.company.com/identity/token')
+API_KEY     = os.environ.get('WX_API_KEY',  '')   # Never hardcode API keys
+WX_BASE_URL = os.environ.get('WX_BASE_URL', 'https://watsonx.internal.company.com')
+PROJECT_ID  = os.environ.get('WX_PROJECT',  'a1b2c3d4-e5f6-7890-abcd-ef1234567890')
+
+def get_token():
+    resp = requests.post(
+        IAM_URL,
+        data={
+            'grant_type': 'urn:ibm:params:oauth:grant-type:apikey',
+            'apikey': API_KEY
+        },
+        headers={'Content-Type': 'application/x-www-form-urlencoded'},
+        verify=False   # Set to CA bundle path in production
+    )
+    resp.raise_for_status()
+    return resp.json()['access_token']
+
+if __name__ == '__main__':
+    print(get_token())
+</pre>
+
+<h2>Calling watsonx Inference from Python in PASE</h2>
+
+<p>With a valid token, the watsonx.ai text generation API is a straightforward REST POST. The following example classifies IBM i support tickets stored in DB2 for i using the Granite 8B instruct model:</p>
+
+<pre>
+# /opt/appscripts/classify_tickets.py
+# Reads open support tickets from DB2, classifies them with Granite,
+# writes the classification back to the ticket table.
+
+import os, sys, json, pyodbc, requests
+from wx_token import get_token, WX_BASE_URL, PROJECT_ID
+
+ODBC_DSN    = 'IBMI_PROD'          # ODBC DSN configured for DB2 for i
+MODEL_ID    = 'ibm/granite-3-3-8b-instruct'
+MAX_TOKENS  = 50
+TEMPERATURE = 0.0   # Deterministic output for classification
+
+CATEGORIES = ['Hardware', 'Network', 'Application', 'Database', 'Security', 'Other']
+
+CLASSIFY_PROMPT = """You are a support ticket classifier for an IBM i system.
+Classify the following support ticket into exactly one of these categories:
+{categories}
+
+Ticket: {ticket_text}
+
+Respond with only the category name, nothing else."""
+
+def classify_ticket(token, ticket_text):
+    prompt = CLASSIFY_PROMPT.format(
+        categories=', '.join(CATEGORIES),
+        ticket_text=ticket_text[:500]   # Truncate very long tickets
+    )
+    payload = {
+        'model_id':   MODEL_ID,
+        'project_id': PROJECT_ID,
+        'input':      prompt,
+        'parameters': {
+            'decoding_method': 'greedy',
+            'max_new_tokens':  MAX_TOKENS,
+            'temperature':     TEMPERATURE,
+            'stop_sequences':  ['\n']
+        }
+    }
+    resp = requests.post(
+        f'{WX_BASE_URL}/ml/v1/text/generation?version=2024-05-01',
+        headers={
+            'Authorization': f'Bearer {token}',
+            'Content-Type':  'application/json'
+        },
+        json=payload,
+        verify=False
+    )
+    resp.raise_for_status()
+    generated = resp.json()['results'][0]['generated_text'].strip()
+    # Validate that the model returned a known category
+    for cat in CATEGORIES:
+        if cat.lower() in generated.lower():
+            return cat
+    return 'Other'
+
+def main():
+    token = get_token()
+    conn  = pyodbc.connect(f'DSN={ODBC_DSN}')
+    cur   = conn.cursor()
+
+    # Fetch unclassified tickets
+    cur.execute("""
+        SELECT TICKNO, TICKDESC
+        FROM   APPLIB.SUPPTICKET
+        WHERE  AICAT IS NULL
+        AND    TICKSTS = 'O'
+        FETCH FIRST 50 ROWS ONLY
+    """)
+    tickets = cur.fetchall()
+
+    print(f'Classifying {len(tickets)} tickets...')
+    for tickno, desc in tickets:
+        category = classify_ticket(token, desc or '')
+        cur.execute("""
+            UPDATE APPLIB.SUPPTICKET
+            SET    AICAT    = ?,
+                   AICATDAT = CURRENT DATE
+            WHERE  TICKNO   = ?
+        """, category, tickno)
+        print(f'  Ticket {tickno}: {category}')
+
+    conn.commit()
+    conn.close()
+    print('Classification complete.')
+
+if __name__ == '__main__':
+    main()
+</pre>
+
+<p>Schedule this script as a recurring PASE job using ADDJOBSCDE to classify new tickets every hour during business hours:</p>
+
+<pre>
+/* Schedule the Python classifier to run every hour on weekdays */
+ADDJOBSCDE JOB(WXCLSIFY) +
+           CMD(SBMJOB JOB(WXCLSIFY) JOBQ(APPLIB/APPJOBQ) +
+               CMD(QSH CMD('export WX_API_KEY=''myapikey'' && +
+                   /QOpenSys/pkgs/bin/python3 /opt/appscripts/classify_tickets.py +
+                   >> /opt/appscripts/logs/classify.log 2>&1'))) +
+           FRQCYC(*WEEKLY) +
+           SCDDAY(*MON *TUE *WED *THU *FRI) +
+           SCDTIME('080000') +
+           TEXT('watsonx ticket classification - hourly')
+/* Note: for hourly repeat, use ADDJOBSCDE with FRQCYC(*ONCE) inside a CL loop */
+/* or use the Advanced Job Scheduler with repeat interval support */
+</pre>
+
+<h2>Calling watsonx from RPG Using HTTPAPI</h2>
+
+<p>RPG programs can call the watsonx.ai REST API directly using the open-source HTTPAPI library (installed in APPLIB). This allows IBM i batch programs and interactive programs to invoke AI inference without leaving the ILE environment — no PASE shell invocation required.</p>
+
+<pre>
+**FREE
+// APPLIB/QRPGLESRC  Member: WXINFER  Type: SQLRPGLE
+// Calls watsonx.ai to summarise a customer complaint from the APPLIB.CRMMEMO table
+// Requires: HTTPAPI library on library list, watsonx token in data area WXTOKEN
+
+ctl-opt dftactgrp(*no) actgrp('APPGRP') option(*nodebugio);
+
+// HTTPAPI prototypes (simplified — full prototypes in HTTPAPI/QRPGLESRC,HAPI_IFS)
+dcl-pr http_post extproc('http_post');
+  url      varchar(1000) const;
+  headers  varchar(4000) const;
+  body     varchar(32000) const;
+  response varchar(32000);
+  status   int(10);
+end-pr;
+
+dcl-s wToken   varchar(2000);
+dcl-s wUrl     varchar(500);
+dcl-s wHeaders varchar(1000);
+dcl-s wBody    varchar(32000);
+dcl-s wResp    varchar(32000);
+dcl-s wStatus  int(10);
+dcl-s wSummary varchar(1000);
+dcl-s wMemoTxt varchar(4000);
+dcl-s wMemoNo  packed(9:0);
+
+// Load bearer token from data area (refreshed by a scheduled CL job)
+in *lock WXTOKEN;    // Data area in APPLIB containing the current bearer token
+wToken = %trim(WXTOKEN);
+
+wUrl = 'https://watsonx.internal.company.com/ml/v1/text/generation?version=2024-05-01';
+
+// Fetch one unprocessed customer memo from DB2
+exec sql
+  SELECT MEMONO, MEMOTEXT
+  INTO   :wMemoNo, :wMemoTxt
+  FROM   APPLIB.CRMMEMO
+  WHERE  AISUM IS NULL
+  AND    MEMOSTS = 'O'
+  FETCH FIRST 1 ROW ONLY;
+
+if sqlcode <> 0;
+  *inlr = *on;
+  return;
+endif;
+
+// Build the JSON request body for Granite summarisation
+wBody = '{"model_id":"ibm/granite-3-3-8b-instruct",'
+      + '"project_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890",'
+      + '"input":"Summarise this customer complaint in one sentence: '
+      + %scanrpl('"':'''': %trim(wMemoTxt))   // Escape quotes
+      + '",'
+      + '"parameters":{"decoding_method":"greedy","max_new_tokens":80}}';
+
+wHeaders = 'Authorization: Bearer ' + %trim(wToken) + CRLF
+         + 'Content-Type: application/json';
+
+http_post(wUrl: wHeaders: wBody: wResp: wStatus);
+
+if wStatus = 200;
+  // Parse the generated_text field from the JSON response
+  // Simple extraction — use a JSON parsing service program for production
+  dcl-s wStart int(10);
+  dcl-s wEnd   int(10);
+  wStart = %scan('"generated_text":"': wResp) + 18;
+  wEnd   = %scan('"': wResp: wStart) - 1;
+  if wStart > 18 and wEnd > wStart;
+    wSummary = %subst(wResp: wStart: wEnd - wStart + 1);
+  endif;
+
+  // Write the AI summary back to DB2
+  exec sql
+    UPDATE APPLIB.CRMMEMO
+    SET    AISUM    = :wSummary,
+           AISUMDAT = CURRENT DATE
+    WHERE  MEMONO   = :wMemoNo;
+endif;
+
+*inlr = *on;
+</pre>
+
+<h2>Use Case: IBM i Job Log Anomaly Detection</h2>
+
+<p>IBM i job logs contain structured diagnostic messages — CPF, MCH, RPG, and SQL error codes — that are often repetitive and predictable during normal operations. When an anomaly occurs, the pattern of messages changes: new error codes appear, existing errors spike in frequency, or messages appear in unexpected sequences. Using Granite's time-series or text classification capabilities to detect these anomalies automates a task that currently requires an operator to manually review QHST and job logs.</p>
+
+<pre>
+# /opt/appscripts/log_anomaly.py
+# Reads recent QSYS2.JOBLOG_INFO entries, extracts error patterns,
+# and uses Granite to assess whether the pattern is anomalous.
+
+import pyodbc, requests, json, os
+from datetime import datetime, timedelta
+from wx_token import get_token, WX_BASE_URL, PROJECT_ID
+
+ODBC_DSN = 'IBMI_PROD'
+MODEL_ID  = 'ibm/granite-3-3-8b-instruct'
+
+ANOMALY_PROMPT = """You are an IBM i system monitoring expert.
+Below are the top error messages from the IBM i job log in the last hour.
+Assess whether this pattern is normal or anomalous.
+Respond with: STATUS: NORMAL or STATUS: ANOMALY, followed by a one-sentence reason.
+
+Error message summary:
+{error_summary}"""
+
+def get_recent_errors(conn):
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT MESSAGE_ID,
+               COUNT(*)       AS msg_count,
+               MAX(MESSAGE_TEXT) AS sample_text
+        FROM   QSYS2.JOBLOG_INFO
+        WHERE  MESSAGE_TIMESTAMP >= CURRENT_TIMESTAMP - 1 HOURS
+        AND    MESSAGE_TYPE IN ('20', '21', '22', '40')   -- Diagnostic, informational, inquiry, escape
+        AND    MESSAGE_ID NOT LIKE 'CPI%'                 -- Exclude informational CPI messages
+        GROUP BY MESSAGE_ID
+        ORDER BY msg_count DESC
+        FETCH FIRST 20 ROWS ONLY
+    """)
+    return cur.fetchall()
+
+def assess_anomaly(token, errors):
+    summary_lines = [
+        f"  {row[0]}: {row[1]} occurrences — {(row[2] or '')[:80]}"
+        for row in errors
+    ]
+    prompt = ANOMALY_PROMPT.format(error_summary='\n'.join(summary_lines))
+
+    resp = requests.post(
+        f'{WX_BASE_URL}/ml/v1/text/generation?version=2024-05-01',
+        headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+        json={
+            'model_id':   MODEL_ID,
+            'project_id': PROJECT_ID,
+            'input':      prompt,
+            'parameters': {'decoding_method': 'greedy', 'max_new_tokens': 100}
+        },
+        verify=False
+    )
+    resp.raise_for_status()
+    return resp.json()['results'][0]['generated_text'].strip()
+
+def main():
+    token  = get_token()
+    conn   = pyodbc.connect(f'DSN={ODBC_DSN}')
+    errors = get_recent_errors(conn)
+
+    if not errors:
+        print('No errors in the last hour.')
+        return
+
+    assessment = assess_anomaly(token, errors)
+    timestamp  = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    print(f'[{timestamp}] Log anomaly assessment:')
+    print(assessment)
+
+    # If anomaly detected, write to the operations alert table
+    if 'STATUS: ANOMALY' in assessment:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO APPLIB.AIOPSALERT
+            (ALERTTS, ALERTSRC, ALERTMSG, ALERTTYP)
+            VALUES (CURRENT_TIMESTAMP, 'LOGANOMALY', ?, 'W')
+        """, assessment[:500])
+        conn.commit()
+        print('Anomaly recorded in APPLIB.AIOPSALERT.')
+
+    conn.close()
+
+if __name__ == '__main__':
+    main()
+</pre>
+
+<h2>watsonx.governance for Production AI on IBM i</h2>
+
+<p>Deploying AI models in production on IBM i without governance creates operational and regulatory risk: models can drift over time as data patterns change, biased outputs can affect business decisions, and there is no audit trail of AI-assisted actions. watsonx.governance addresses this for IBM i deployments by providing:</p>
+<ul>
+  <li><strong>Model monitoring</strong> — tracks the distribution of model inputs and outputs over time; alerts when the distribution shifts significantly from the baseline (model drift or data drift)</li>
+  <li><strong>Bias detection</strong> — tests whether the model's output differs systematically across demographic groups in the input data; required for AI models used in HR, lending, or customer segmentation contexts</li>
+  <li><strong>Explainability</strong> — for each AI decision, provides a SHAP-based explanation of which input features most influenced the output; stored alongside the decision in the audit log</li>
+  <li><strong>Fact sheets</strong> — auto-generated documentation of each model's training data, performance metrics, and deployment history; required for regulatory submissions in financial services and healthcare</li>
+</ul>
+
+<pre>
+# Register a model with watsonx.governance for monitoring
+# This is a one-time setup step after the model is deployed
+
+import requests, os
+from wx_token import get_token, WX_BASE_URL
+
+def register_model_for_monitoring(token, model_name, deployment_id, training_data_ref):
+    payload = {
+        'name':          model_name,
+        'deployment_id': deployment_id,
+        'subscription': {
+            'data_mart_id':    os.environ['WX_DATAMART_ID'],
+            'service_provider': 'watsonx',
+            'asset': {
+                'asset_id':   deployment_id,
+                'asset_type': 'model'
+            },
+            'training_data_reference': training_data_ref,
+            'monitors': {
+                'quality':      {'enabled': True, 'parameters': {'min_feedback_data_size': 50}},
+                'drift':        {'enabled': True},
+                'fairness':     {'enabled': False},   # Enable if model uses demographic data
+                'explainability': {'enabled': True}
+            }
+        }
+    }
+    resp = requests.post(
+        f'{WX_BASE_URL}/openscale/v2/subscriptions',
+        headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+        json=payload,
+        verify=False
+    )
+    resp.raise_for_status()
+    return resp.json()['metadata']['id']
+
+# After registering: send feedback data as IBM i classifies tickets
+# so governance can evaluate model quality against human-verified labels
+def send_feedback(token, subscription_id, predictions):
+    # predictions: list of {ticket_no, ai_category, human_verified_category}
+    feedback_records = [
+        {
+            'fields':  ['TICKNO', 'AICAT', 'VERIFIED_CAT'],
+            'values':  [[p['ticket_no'], p['ai_category'], p['human_category']]]
+        }
+        for p in predictions
+    ]
+    resp = requests.post(
+        f'{WX_BASE_URL}/openscale/v2/data_sets/{subscription_id}/feedback',
+        headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+        json={'fields': feedback_records[0]['fields'],
+              'values': [r['values'][0] for r in feedback_records]},
+        verify=False
+    )
+    resp.raise_for_status()
+</pre>
+
+<h2>Best Practices for watsonx on IBM i in 2026</h2>
+
+<ul>
+  <li><strong>Co-locate watsonx on the same Power system as IBM i</strong> — network round-trip latency to a cloud inference endpoint is 20–200 ms; on-box LPAR-to-LPAR latency is under 1 ms; for high-frequency IBM i transaction enrichment, the difference is significant</li>
+  <li><strong>Cache bearer tokens in a data area</strong> — tokens have a 1-hour TTL; a scheduled CL job should refresh the token every 50 minutes and store it in a *DTAARA; individual programs read the token from the data area rather than calling IAM on every request</li>
+  <li><strong>Use greedy decoding (temperature=0.0) for classification tasks</strong> — deterministic output is essential for tasks like ticket classification or anomaly detection where the same input must always produce the same output; sampling-based decoding introduces unnecessary variance</li>
+  <li><strong>Limit prompt length to match the model's context window</strong> — Granite 8B has a 128K context window, but longer prompts increase latency and cost; truncate input text to the minimum needed for the task</li>
+  <li><strong>Never send PII or confidential data to an external watsonx cloud endpoint</strong> — use the on-premises Power deployment for any prompts that include customer names, account numbers, or financial data</li>
+  <li><strong>Register every production AI model with watsonx.governance</strong> — models without governance monitoring will drift silently; the ticket classifier trained on 2024 data may be significantly less accurate by late 2026 as support patterns change</li>
+  <li><strong>Start with a human-in-the-loop design</strong> — for the first 90 days of any AI-assisted IBM i workflow, display the AI's output alongside the original data and let a human confirm it; collect feedback labels and use them to evaluate model accuracy before moving to fully automated operation</li>
+</ul>
+
+<em>Next post: IBM i Disk Management and Auxiliary Storage Pools — understanding the ASP structure (system ASP, user ASPs, and independent ASPs), configuring IASPs for application isolation and high availability, managing ASP overflow, BRMS save and restore strategy with IASPs, and monitoring ASP storage thresholds with QSYS2.ASP_INFO on IBM i in 2026.</em>

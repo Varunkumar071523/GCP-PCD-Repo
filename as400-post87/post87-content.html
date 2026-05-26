@@ -1,0 +1,294 @@
+<p>The previous post covered IBM i HTTP client from RPG — calling external REST APIs with QSYS2.HTTP_GET and QSYS2.HTTP_POST SQL table functions, parsing JSON responses with JSON_VALUE and JSON_QUERY, consuming REST APIs from RPG embedded SQL, OAuth token authentication, configuring the IBM i SSL trust store for HTTPS connections, and integrating external web services with DB2 for i data on IBM i. This post covers DB2 for i stored procedures: creating SQL procedures with CREATE PROCEDURE, defining IN, OUT, and INOUT parameters, using local variables and cursors, returning result sets to callers, handling errors with DECLARE HANDLER and SQLSTATE, calling procedures from RPG embedded SQL and CL with RUNSQL, and building reusable encapsulated database logic on IBM i in 2026.</p>
+
+<h2>Why Stored Procedures on IBM i?</h2>
+
+<p>A DB2 for i stored procedure encapsulates SQL logic inside the database. The calling application issues a single <code>CALL</code> statement; the database executes the procedure body server-side. This reduces network round-trips for multi-step operations, enforces consistent business logic regardless of the calling language (RPG, Java, Node.js, Python), and keeps complex SQL out of application source code.</p>
+
+<ul>
+  <li><strong>SQL procedures</strong> — body written entirely in SQL with procedural extensions (IF, LOOP, CURSOR). Stored in the DB2 catalogue. Recommended for new development.</li>
+  <li><strong>External procedures</strong> — call an ILE program (RPG, C, CL) as a procedure. The procedure is defined with CREATE PROCEDURE but the logic is in the ILE object. Used to expose existing RPG programs as callable procedures.</li>
+</ul>
+
+<h2>CREATE PROCEDURE: Basic Syntax</h2>
+
+<pre>
+-- Simple procedure with no parameters
+CREATE OR REPLACE PROCEDURE APPLIB.PURGE_OLD_AUDIT_LOG ()
+LANGUAGE SQL
+BEGIN
+    DELETE FROM APPLIB.ORD_AUDIT_LOG
+    WHERE AUDIT_TS < CURRENT TIMESTAMP - 90 DAYS;
+END;
+
+-- Call it
+CALL APPLIB.PURGE_OLD_AUDIT_LOG();
+
+-- Drop a procedure
+DROP PROCEDURE APPLIB.PURGE_OLD_AUDIT_LOG;
+
+-- List all procedures in a schema
+SELECT ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_DEFINITION
+FROM QSYS2.SYSROUTINES
+WHERE ROUTINE_SCHEMA = 'APPLIB'
+  AND ROUTINE_TYPE = 'PROCEDURE'
+ORDER BY ROUTINE_NAME;
+</pre>
+
+<h2>IN, OUT, and INOUT Parameters</h2>
+
+<pre>
+-- Procedure with IN parameter: look up customer credit status
+CREATE OR REPLACE PROCEDURE APPLIB.GET_CUST_CREDIT_STATUS (
+    IN  p_cust_no    CHAR(8),
+    OUT p_cust_name  VARCHAR(50),
+    OUT p_credit_lmt DECIMAL(11,2),
+    OUT p_ytd_spend  DECIMAL(11,2),
+    OUT p_status     CHAR(1)        -- 'G' good, 'W' warning, 'X' exceeded
+)
+LANGUAGE SQL
+BEGIN
+    -- Retrieve customer and YTD spend
+    SELECT c.CUST_NAME, c.CREDIT_LIMIT,
+           COALESCE(SUM(o.ORD_AMOUNT), 0)
+    INTO p_cust_name, p_credit_lmt, p_ytd_spend
+    FROM SALESLIB.CUSTMST c
+    LEFT JOIN ORDLIB.ORDMST o
+           ON o.CUST_NO = c.CUST_NO
+          AND YEAR(o.ORD_DATE) = YEAR(CURRENT_DATE)
+    WHERE c.CUST_NO = p_cust_no
+    GROUP BY c.CUST_NAME, c.CREDIT_LIMIT;
+
+    -- Determine credit status
+    IF p_ytd_spend >= p_credit_lmt THEN
+        SET p_status = 'X';
+    ELSEIF p_ytd_spend >= p_credit_lmt * 0.80 THEN
+        SET p_status = 'W';
+    ELSE
+        SET p_status = 'G';
+    END IF;
+END;
+
+-- Call with host variables from RUNSQL
+CALL APPLIB.GET_CUST_CREDIT_STATUS(
+    'C0001234',
+    ?,   -- OUT: customer name
+    ?,   -- OUT: credit limit
+    ?,   -- OUT: YTD spend
+    ?    -- OUT: status code
+);
+
+-- INOUT example: apply a discount and return the discounted price
+CREATE OR REPLACE PROCEDURE APPLIB.APPLY_DISCOUNT (
+    IN    p_prod_no    CHAR(15),
+    INOUT p_price      DECIMAL(9,2),   -- passed in, modified, returned
+    IN    p_cust_class CHAR(1)
+)
+LANGUAGE SQL
+BEGIN
+    DECLARE v_discount DECIMAL(5,4) DEFAULT 0;
+
+    SELECT CASE p_cust_class
+               WHEN 'A' THEN 0.15   -- 15% discount for A-class customers
+               WHEN 'B' THEN 0.10
+               ELSE 0.05
+           END
+    INTO v_discount
+    FROM SYSIBM.SYSDUMMY1;
+
+    SET p_price = p_price * (1 - v_discount);
+END;
+</pre>
+
+<h2>Local Variables, Cursors, and Loops</h2>
+
+<pre>
+-- Procedure using a cursor to process rows one at a time
+CREATE OR REPLACE PROCEDURE APPLIB.ALLOCATE_BATCH_STOCK (
+    IN  p_batch_no  CHAR(10),
+    OUT p_allocated INT,
+    OUT p_short     INT
+)
+LANGUAGE SQL
+BEGIN
+    -- Local variable declarations must come first
+    DECLARE v_ord_no     CHAR(10);
+    DECLARE v_prod_no    CHAR(15);
+    DECLARE v_qty        DECIMAL(7,0);
+    DECLARE v_on_hand    DECIMAL(7,0);
+    DECLARE v_allocated  INT DEFAULT 0;
+    DECLARE v_short      INT DEFAULT 0;
+    DECLARE done         INT DEFAULT 0;
+
+    -- Cursor over all open order lines in the batch
+    DECLARE c_lines CURSOR FOR
+        SELECT l.ORD_NO, l.PROD_NO, l.QTY
+        FROM ORDLIB.ORDLIN l
+        JOIN ORDLIB.ORDMST o ON o.ORD_NO = l.ORD_NO
+        WHERE o.BATCH_NO = p_batch_no
+          AND o.STATUS = 'O'
+          AND l.ALLOC_STATUS = 'N'
+        ORDER BY o.ORD_DATE, l.ORD_NO, l.LINE_NO;
+
+    -- Handler: set 'done' flag when cursor is exhausted (SQLSTATE '02000' = no data)
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+
+    OPEN c_lines;
+
+    fetch_loop: LOOP
+        FETCH c_lines INTO v_ord_no, v_prod_no, v_qty;
+
+        IF done = 1 THEN
+            LEAVE fetch_loop;
+        END IF;
+
+        -- Check available inventory
+        SELECT QTY_ON_HAND INTO v_on_hand
+        FROM INVLIB.INVMST
+        WHERE PROD_NO = v_prod_no;
+
+        IF v_on_hand >= v_qty THEN
+            -- Allocate the stock
+            UPDATE INVLIB.INVMST
+            SET QTY_ON_HAND    = QTY_ON_HAND - v_qty,
+                QTY_ALLOCATED  = QTY_ALLOCATED + v_qty
+            WHERE PROD_NO = v_prod_no;
+
+            UPDATE ORDLIB.ORDLIN
+            SET ALLOC_STATUS = 'A'
+            WHERE ORD_NO = v_ord_no AND PROD_NO = v_prod_no;
+
+            SET v_allocated = v_allocated + 1;
+        ELSE
+            SET v_short = v_short + 1;
+        END IF;
+    END LOOP fetch_loop;
+
+    CLOSE c_lines;
+
+    SET p_allocated = v_allocated;
+    SET p_short     = v_short;
+END;
+</pre>
+
+<h2>DECLARE HANDLER: Error Handling in Procedures</h2>
+
+<pre>
+-- CONTINUE handler: log the error and continue processing
+-- EXIT handler: roll back and exit the procedure on any SQL error
+CREATE OR REPLACE PROCEDURE APPLIB.SAFE_ORDER_INSERT (
+    IN  p_ord_no    CHAR(10),
+    IN  p_cust_no   CHAR(8),
+    IN  p_amount    DECIMAL(11,2),
+    OUT p_result    CHAR(1),    -- 'S' success, 'E' error
+    OUT p_message   VARCHAR(200)
+)
+LANGUAGE SQL
+BEGIN
+    -- EXIT handler fires on any SQL exception and rolls back changes
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        DECLARE v_state   CHAR(5);
+        DECLARE v_text    VARCHAR(200);
+        GET DIAGNOSTICS EXCEPTION 1
+            v_state = RETURNED_SQLSTATE,
+            v_text  = MESSAGE_TEXT;
+        SET p_result  = 'E';
+        SET p_message = 'SQLSTATE=' || v_state || ': ' || v_text;
+        ROLLBACK;
+    END;
+
+    -- Validate the customer exists first
+    IF NOT EXISTS (
+        SELECT 1 FROM SALESLIB.CUSTMST WHERE CUST_NO = p_cust_no
+    ) THEN
+        SIGNAL SQLSTATE '75010'
+            SET MESSAGE_TEXT = 'Customer not found: ' || TRIM(p_cust_no);
+    END IF;
+
+    -- Insert the order
+    INSERT INTO ORDLIB.ORDMST (ORD_NO, CUST_NO, ORD_AMOUNT, ORD_DATE, STATUS)
+    VALUES (p_ord_no, p_cust_no, p_amount, CURRENT_DATE, 'O');
+
+    COMMIT;
+    SET p_result  = 'S';
+    SET p_message = 'Order inserted successfully';
+END;
+</pre>
+
+<h2>Calling Stored Procedures from RPG Embedded SQL</h2>
+
+<pre>
+**FREE
+Ctl-Opt DftActGrp(*No) ActGrp('PROCGRP');
+
+Exec SQL SET OPTION COMMIT = *CHG;
+
+Dcl-S  CustNo    Char(8)        Inz('C0001234');
+Dcl-S  CustName  Varchar(50);
+Dcl-S  CreditLmt Packed(11:2);
+Dcl-S  YtdSpend  Packed(11:2);
+Dcl-S  CreditSts Char(1);
+
+// Call the stored procedure — OUT parameters returned into RPG host variables
+Exec SQL
+    CALL APPLIB.GET_CUST_CREDIT_STATUS(
+        :CustNo,
+        :CustName,
+        :CreditLmt,
+        :YtdSpend,
+        :CreditSts
+    );
+
+If SQLCODE = 0;
+    Select;
+    When CreditSts = 'X';
+        Dsply ('CREDIT EXCEEDED: ' + %TrimR(CustName));
+    When CreditSts = 'W';
+        Dsply ('Credit warning: ' + %TrimR(CustName));
+    Other;
+        Dsply ('Credit OK: ' + %TrimR(CustName));
+    EndSl;
+Else;
+    Dsply ('Procedure call failed, SQLCODE=' + %Char(SQLCODE));
+EndIf;
+
+*InLR = *On;
+</pre>
+
+<h2>Calling Stored Procedures from CL with RUNSQL</h2>
+
+<pre>
+/* Call a no-parameter procedure from CL */
+RUNSQL SQL('CALL APPLIB.PURGE_OLD_AUDIT_LOG()') +
+       COMMIT(*NONE)
+
+/* Call a procedure with IN parameters */
+RUNSQL SQL('CALL APPLIB.ALLOCATE_BATCH_STOCK(''BATCH001'', ?, ?)') +
+       COMMIT(*CHG)
+
+/* For procedures with OUT parameters, use a CL program with RUNSQLSTM
+   or call the procedure from an RPG program that can receive the OUT values */
+
+/* Execute a stored procedure from an SQL script file */
+RUNSQLSTM SRCFILE(APPLIB/QSQLSRC) SRCMBR(RUNPROCS) +
+          COMMIT(*NONE) NAMING(*SYS)
+</pre>
+
+<h2>External Procedures: Wrapping ILE Programs</h2>
+
+<pre>
+-- Expose an existing RPG program as a stored procedure callable from SQL
+-- The RPG program ORDLIB/PRCINVOICE takes order number and returns invoice total
+CREATE OR REPLACE PROCEDURE APPLIB.PROCESS_INVOICE (
+    IN  p_ord_no       CHAR(10),
+    OUT p_invoice_total DECIMAL(11,2)
+)
+LANGUAGE RPGLE
+EXTERNAL NAME 'ORDLIB/PRCINVOICE'   -- The ILE program to call
+PARAMETER STYLE GENERAL;            -- Pass parameters directly (no null indicators)
+
+-- Now call it from SQL just like any SQL procedure
+CALL APPLIB.PROCESS_INVOICE('ORD0012345', ?);
+</pre>
+
+<em>Next post: IBM i message queues and CL error handling — creating message files with CRTMSGF and ADDMSGD, sending informational and escape messages with SNDPGMMSG, handling exceptions with MONMSG in CL programs, receiving messages with RCVMSG, sending interactive prompts with SNDUSRMSG, monitoring QSYSOPR with SNDBRKMSG, building structured CL error routines, and managing message queue housekeeping on IBM i in 2026.</em>

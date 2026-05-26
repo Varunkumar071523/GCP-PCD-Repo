@@ -1,0 +1,264 @@
+<p>The previous post covered IBM MQ messaging from IBM i — creating queue managers, defining local and remote queues, setting up sender and receiver channels, sending and receiving persistent messages with MQPUT and MQGET from ILE RPG programs, configuring MQ Triggering to start IBM i jobs on message arrival, dead letter queue handling, and monitoring MQ activity with AMQSPUT and AMQSGET on IBM i. This post covers IFS permissions and security on IBM i: how IBM i IFS authority differs from the library-based authority model, managing stream file and directory authorities with CHGAUT and WRKOBJAUT, changing object ownership with CHGOWN, applying extended access control lists (ACLs) with SETFACL and GETFACL in PASE, configuring PASE umask defaults, auditing IFS object access through QAUDJRN, and stream file security best practices on IBM i in 2026.</p>
+
+<h2>IFS Authority Model vs. Library-Based Authority</h2>
+
+<p>The IBM i library system uses a discrete set of object authorities (<code>*USE</code>, <code>*CHANGE</code>, <code>*ALL</code>, <code>*EXCLUDE</code>, <code>*AUTL</code>) managed with <code>GRTOBJAUT</code> and <code>RVKOBJAUT</code>. The IFS uses a POSIX-style permission model layered on top of the IBM i object authority system — both models apply to IFS objects simultaneously.</p>
+
+<table>
+  <tr>
+    <th>Concept</th>
+    <th>Library Objects (*LIB)</th>
+    <th>IFS Stream Files</th>
+  </tr>
+  <tr>
+    <td>Permission granularity</td>
+    <td>*USE, *CHANGE, *ALL, *EXCLUDE</td>
+    <td>Read (r), Write (w), Execute (x) per owner/group/public</td>
+  </tr>
+  <tr>
+    <td>Primary command</td>
+    <td>GRTOBJAUT / RVKOBJAUT</td>
+    <td>CHGAUT (IBM i style) or chmod (PASE)</td>
+  </tr>
+  <tr>
+    <td>Ownership</td>
+    <td>Object owner profile</td>
+    <td>CHGOWN (IBM i) or chown (PASE)</td>
+  </tr>
+  <tr>
+    <td>Extended permissions</td>
+    <td>Authorization lists (*AUTL)</td>
+    <td>POSIX ACLs via SETFACL/GETFACL</td>
+  </tr>
+  <tr>
+    <td>Default new-object authority</td>
+    <td>CRTAUT on the library</td>
+    <td>umask in PASE; DTAAUT on parent directory</td>
+  </tr>
+</table>
+
+<p>When an IFS object is accessed, IBM i evaluates <strong>both</strong> the IBM i data authority (<code>*R *W *X</code> mapped to <code>*USE</code>/<code>*CHANGE</code>) and any POSIX ACL entries. The most restrictive applicable rule wins.</p>
+
+<h2>Displaying IFS Authorities: WRKOBJAUT and DSPOBJAUT</h2>
+
+<pre>
+/* Display the authorities on an IFS stream file */
+WRKOBJAUT OBJ('/home/batch/exports/custlist_20260722.csv') OBJTYPE(*STMF)
+
+/* Display authorities on an IFS directory */
+WRKOBJAUT OBJ('/home/batch/exports') OBJTYPE(*DIR)
+
+/* From QShell — ls -la shows POSIX permission bits */
+QSH CMD('ls -la /home/batch/exports/')
+/* Output example:
+   -rw-r----- 1 BATCHUSR BATCHGRP 45321 Jul 22 08:15 custlist_20260722.csv
+   drwxr-x--- 2 BATCHUSR BATCHGRP  4096 Jul 22 08:00 .
+   Permission breakdown: rw-r----- = owner:rw group:r others:none
+*/
+
+/* Display full IBM i authority detail including data authorities */
+DSPOBJAUT OBJ('/home/batch/exports') OBJTYPE(*DIR)
+</pre>
+
+<h2>Changing IFS Authorities: CHGAUT</h2>
+
+<p><code>CHGAUT</code> is the IBM i command equivalent of the POSIX <code>chmod</code> command. It sets the data authorities (<code>*R</code>, <code>*W</code>, <code>*X</code>, <code>*RWX</code>, <code>*NONE</code>) for specific user profiles on an IFS object. You can apply changes recursively to a directory tree with <code>SUBTREE(*ALL)</code>.</p>
+
+<pre>
+/* Grant read-only access to a specific user profile on a stream file */
+CHGAUT OBJ('/home/batch/exports/custlist_20260722.csv') +
+       OBJTYPE(*STMF) +
+       USER(RPTVIEWER) +
+       DTAAUT(*R)
+
+/* Grant read-write access to a group profile on a directory */
+CHGAUT OBJ('/home/batch/exports') +
+       OBJTYPE(*DIR) +
+       USER(BATCHGRP) +
+       DTAAUT(*RWX)
+
+/* Remove all access for *PUBLIC — lock down a sensitive directory */
+CHGAUT OBJ('/home/batch/exports') +
+       OBJTYPE(*DIR) +
+       USER(*PUBLIC) +
+       DTAAUT(*NONE)
+
+/* Apply authority change recursively to all files and subdirectories */
+CHGAUT OBJ('/home/nodeapps/ordapi') +
+       OBJTYPE(*DIR) +
+       USER(*PUBLIC) +
+       DTAAUT(*NONE) +
+       SUBTREE(*ALL)   /* Recursively update all objects under this path */
+
+/* Grant execute permission on a shell script */
+CHGAUT OBJ('/home/batch/scripts/run_daily_export.sh') +
+       OBJTYPE(*STMF) +
+       USER(BATCHUSR) +
+       DTAAUT(*RWX)
+
+/* Equivalent PASE chmod command */
+QSH CMD('chmod 750 /home/batch/scripts/run_daily_export.sh')
+/* 750 = owner:rwx group:r-x others:--- */
+
+/* Verify the change */
+QSH CMD('ls -l /home/batch/scripts/run_daily_export.sh')
+</pre>
+
+<h2>Changing IFS Ownership: CHGOWN</h2>
+
+<p>Every IFS object has an <strong>owner</strong> (a user profile) and an associated <strong>group</strong>. The owner has full control by default. <code>CHGOWN</code> transfers ownership; <code>CHGPGP</code> changes the primary group. In PASE, the equivalent commands are <code>chown</code> and <code>chgrp</code>.</p>
+
+<pre>
+/* Change the owner of a stream file */
+CHGOWN OBJ('/home/batch/exports/custlist_20260722.csv') +
+       NEWOWN(BATCHUSR)
+
+/* Change owner and primary group together */
+CHGOWN OBJ('/home/nodeapps/ordapi') +
+       NEWOWN(NODEUSER) +
+       OWNGRP(NODEDEV)
+
+/* Change ownership recursively on a directory tree */
+/* IBM i CHGOWN does not have a recursive option — use PASE chown -R */
+QSH CMD('chown -R NODEUSER:NODEDEV /home/nodeapps/ordapi')
+
+/* Change primary group of an IFS directory */
+CHGPGP OBJ('/home/batch') OBJTYPE(*DIR) NEWPGP(BATCHGRP)
+
+/* Verify owner and group */
+QSH CMD('ls -la /home/batch/exports/ | head -5')
+/* Columns: permissions link-count owner group size date name */
+</pre>
+
+<h2>POSIX ACLs: SETFACL and GETFACL</h2>
+
+<p>Standard POSIX permissions allow three permission sets: owner, group, and others. When you need finer control — granting a specific user read access to a file that is owned by a different user, without granting access to all users in the group — you need an <strong>access control list (ACL)</strong>. IBM i supports POSIX ACLs in PASE via <code>setfacl</code> and <code>getfacl</code>.</p>
+
+<pre>
+/* View existing ACL entries on a file */
+QSH CMD('getfacl /home/batch/exports/custlist_20260722.csv')
+/* Output:
+   # file: home/batch/exports/custlist_20260722.csv
+   # owner: BATCHUSR
+   # group: BATCHGRP
+   user::rw-
+   group::r--
+   other::---
+   mask::r--
+*/
+
+/* Add ACL entry: grant RPTVIEWER read access without changing group permissions */
+QSH CMD('setfacl -m u:RPTVIEWER:r-- /home/batch/exports/custlist_20260722.csv')
+
+/* Add ACL entry: grant NODEUSER read-write on the exports directory */
+QSH CMD('setfacl -m u:NODEUSER:rwx /home/batch/exports')
+
+/* Set default ACL on a directory: new files inherit this ACL */
+QSH CMD('setfacl -m d:u:RPTVIEWER:r-- /home/batch/exports')
+
+/* Remove a specific ACL entry */
+QSH CMD('setfacl -x u:RPTVIEWER /home/batch/exports/custlist_20260722.csv')
+
+/* Remove all extended ACL entries (revert to standard POSIX permissions) */
+QSH CMD('setfacl -b /home/batch/exports/custlist_20260722.csv')
+
+/* Apply ACL recursively to a directory and all contents */
+QSH CMD('find /home/batch/exports -type f | xargs setfacl -m u:RPTVIEWER:r--')
+QSH CMD('find /home/batch/exports -type d | xargs setfacl -m u:RPTVIEWER:r-x')
+
+/* Verify the ACL was applied */
+QSH CMD('getfacl /home/batch/exports/custlist_20260722.csv')
+/* Updated output shows the extra user:: entry with effective mask */
+</pre>
+
+<h2>PASE umask: Controlling Default File Creation Permissions</h2>
+
+<p>The <strong>umask</strong> (user file creation mask) in PASE determines the default permissions assigned to newly created IFS files and directories. It is a bitmask that <em>removes</em> permission bits from the maximum (<code>666</code> for files, <code>777</code> for directories). Understanding umask prevents unintentionally world-readable files created by Node.js, Python, or shell scripts running in PASE.</p>
+
+<pre>
+/* Check current umask in a PASE/QShell session */
+QSH CMD('umask')
+/* Common default on IBM i PASE: 022
+   022 means: remove write from group, remove write from others
+   File result:  666 - 022 = 644 (rw-r--r--)
+   Dir result:   777 - 022 = 755 (rwxr-xr-x)
+*/
+
+/* Set a more restrictive umask: only owner gets read-write */
+QSH CMD('umask 077')
+/* File result:  666 - 077 = 600 (rw-------)
+   Dir result:   777 - 077 = 700 (rwx------)
+*/
+
+/* Set umask for the batch user's PASE session in .profile */
+/* Edit /home/BATCHUSR/.profile */
+QSH CMD('echo "umask 027" >> /home/BATCHUSR/.profile')
+/* 027: owner=rwx, group=r-x, others=none for directories
+         owner=rw-, group=r--, others=none for files */
+
+/* Set umask for Node.js server process in the startup script */
+/* In /home/nodeapps/ordapi/start.sh: */
+/* #!/bin/sh
+   umask 027
+   exec node /home/nodeapps/ordapi/server.js
+*/
+
+/* IBM i CHGPRF can also set the initial PASE umask for a user profile */
+CHGPRF USRPRF(BATCHUSR) UMASK(027)
+</pre>
+
+<h2>Auditing IFS Access with QAUDJRN</h2>
+
+<p>The IBM i security audit journal <code>QAUDJRN</code> records IFS object access events when auditing is enabled on the object or the user profile. The audit journal entry types most relevant to IFS security are <code>AF</code> (authority failure), <code>DO</code> (directory operations), and <code>ZR</code> (object read).</p>
+
+<pre>
+/* Enable authority failure auditing on a sensitive IFS directory */
+CHGAUT OBJ('/home/batch/exports') OBJTYPE(*DIR) +
+       USER(*PUBLIC) DTAAUT(*NONE) +
+       OBJAUD(*CHANGE)   /* Audit any attempt to change this object */
+
+/* Enable read auditing on a specific file (captures every read) */
+CHGAUT OBJ('/home/batch/exports/custlist_20260722.csv') OBJTYPE(*STMF) +
+       USER(*PUBLIC) DTAAUT(*NONE) +
+       OBJAUD(*ALL)   /* Audit both read and change attempts */
+
+/* Query QAUDJRN for authority failure events on IFS objects */
+/* Use the DISPLAY_JOURNAL SQL table function for easy querying */
+SELECT ENTRY_TIMESTAMP, JOURNAL_ENTRY_TYPE,
+       OBJECT_LIBRARY, OBJECT_NAME, USER_NAME,
+       OBJECT_TYPE
+FROM TABLE(QSYS2.DISPLAY_JOURNAL(
+    JOURNAL_LIBRARY => 'QSYS',
+    JOURNAL_NAME    => 'QAUDJRN',
+    JOURNAL_ENTRY_TYPES => 'AF'
+)) A
+WHERE OBJECT_NAME LIKE '%exports%'
+  AND ENTRY_TIMESTAMP > CURRENT_TIMESTAMP - 1 DAYS
+ORDER BY ENTRY_TIMESTAMP DESC;
+
+/* Audit IFS directory operations (DO entries) */
+SELECT ENTRY_TIMESTAMP, JOURNAL_ENTRY_TYPE, USER_NAME,
+       QUALIFIED_OBJECT_NAME
+FROM TABLE(QSYS2.DISPLAY_JOURNAL(
+    JOURNAL_LIBRARY => 'QSYS',
+    JOURNAL_NAME    => 'QAUDJRN',
+    JOURNAL_ENTRY_TYPES => 'DO'
+)) A
+WHERE ENTRY_TIMESTAMP > CURRENT_TIMESTAMP - 7 DAYS
+ORDER BY ENTRY_TIMESTAMP DESC
+FETCH FIRST 100 ROWS ONLY;
+</pre>
+
+<h2>IFS Security Best Practices</h2>
+
+<ul>
+  <li><strong>Never use <code>/tmp</code> for sensitive data</strong> — <code>/tmp</code> is world-writable and cleared on IPL. Use application-specific directories under <code>/home</code> or <code>/app</code> with controlled ownership and <code>*PUBLIC(*NONE)</code> authority.</li>
+  <li><strong>Set <code>*PUBLIC(*NONE)</code> on application directories at creation time</strong> — use <code>CHGAUT OBJ('/app/ordapi') USER(*PUBLIC) DTAAUT(*NONE)</code> immediately after <code>mkdir</code>. It is much harder to lock down a directory that has already had files created with open permissions.</li>
+  <li><strong>Use group profiles for batch job access</strong> — create a group profile (e.g., <code>BATCHGRP</code>) and grant the directory to the group rather than individual users. Add batch user profiles as members of the group. This makes access control changes a single operation.</li>
+  <li><strong>Validate IFS paths before opening files</strong> — if any part of the path comes from external input (data area, database field, HTTP request), check for path traversal sequences (<code>..</code> components, <code>//</code>, null bytes) before passing to Qp0lOpen.</li>
+  <li><strong>Set umask 027 for all PASE batch jobs</strong> — ensures files created by Node.js, Python, or shell scripts default to owner-read-write, group-read, others-none. Set it in <code>.profile</code> and in startup scripts for persistent services.</li>
+  <li><strong>Audit sensitive export directories</strong> — enable <code>OBJAUD(*ALL)</code> on directories containing PII or financial data. Review the QAUDJRN AF entries weekly via the SQL query shown above.</li>
+  <li><strong>Rotate and archive IFS export files</strong> — implement a retention policy using a scheduled CL job (ADDJOBSCDE) that deletes files older than the retention window. Do not allow exports to accumulate indefinitely in a world-accessible location.</li>
+</ul>
+
+<em>Next post: AI-driven anomaly detection on IBM i operational data — querying QSYS2 system views for job and performance metrics, establishing DB2 statistical baselines with SQL window functions, installing Python and scikit-learn in PASE, training an Isolation Forest model on historical IBM i data, detecting anomalies in real time, and triggering automated alerts via email or data queue when anomalies are found on IBM i in 2026.</em>

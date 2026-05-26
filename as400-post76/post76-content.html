@@ -1,0 +1,301 @@
+<p>The previous post covered ILE RPG string handling in depth — %SCAN, %SUBST, %REPLACE, %TRIM, %TRIMR, %TRIML, VARCHAR vs. CHAR fields, string concatenation patterns, building and parsing delimited output strings, CCSID-safe string operations, and converting between character and numeric types with %CHAR, %INT, and %DEC in free-format RPG programs on IBM i. This post covers DB2 for i common table expressions (CTEs) and recursive SQL: the WITH clause for non-recursive CTEs, chaining multiple CTEs for readable multi-step queries, recursive CTEs with anchor and recursive members, traversing bill-of-materials (BOM) hierarchies, building organisational tree queries, cycle detection, and practical usage in RPG embedded SQL on IBM i in 2026.</p>
+
+<h2>What Are Common Table Expressions?</h2>
+
+<p>A <strong>Common Table Expression (CTE)</strong> is a named temporary result set defined within a single SQL statement using the <code>WITH</code> clause. It exists only for the duration of that query. CTEs serve three purposes:</p>
+<ul>
+  <li><strong>Readability</strong> — name an intermediate result so the main query is not buried in nested subqueries</li>
+  <li><strong>Reuse within a query</strong> — reference the same CTE multiple times without repeating the subquery</li>
+  <li><strong>Recursion</strong> — with the <code>RECURSIVE</code> keyword, a CTE can reference itself to traverse hierarchical data</li>
+</ul>
+
+<pre>
+-- Basic CTE syntax
+WITH cte_name (col1, col2, ...) AS (
+  SELECT ...
+)
+SELECT ... FROM cte_name WHERE ...;
+
+-- Multiple CTEs: separate with commas, reference earlier CTEs in later ones
+WITH
+  cte_first AS ( SELECT ... ),
+  cte_second AS ( SELECT ... FROM cte_first WHERE ... ),
+  cte_third  AS ( SELECT ... FROM cte_second JOIN other_table ... )
+SELECT ... FROM cte_third;
+</pre>
+
+<h2>Non-Recursive CTEs: Replacing Nested Subqueries</h2>
+
+<p>The most common use of CTEs is making complex queries readable. Compare a nested-subquery approach with a CTE-based approach for the same business question: "Find customers whose year-to-date purchases exceed their credit limit, along with their top-spending product category."</p>
+
+<pre>
+-- Without CTE: deeply nested, hard to maintain
+SELECT c.CUST_NO, c.CUST_NAME, c.CREDIT_LIMIT,
+       ytd.YTD_TOTAL, cat.TOP_CATEGORY
+FROM SALESLIB.CUSTMST c
+JOIN (
+  SELECT CUST_NO, SUM(ORDER_AMOUNT) AS YTD_TOTAL
+  FROM ORDLIB.ORDMST
+  WHERE FISCAL_YEAR = YEAR(CURRENT_DATE)
+  GROUP BY CUST_NO
+) ytd ON ytd.CUST_NO = c.CUST_NO
+JOIN (
+  SELECT ol.CUST_NO,
+         FIRST_VALUE(p.CATEGORY) OVER (
+             PARTITION BY ol.CUST_NO
+             ORDER BY SUM(ol.LINE_AMOUNT) DESC
+             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+         ) AS TOP_CATEGORY
+  FROM ORDLIB.ORDLIN ol
+  JOIN ORDLIB.PRODMST p ON p.PRODUCT_NO = ol.PRODUCT_NO
+  WHERE FISCAL_YEAR = YEAR(CURRENT_DATE)
+  GROUP BY ol.CUST_NO, p.CATEGORY
+) cat ON cat.CUST_NO = c.CUST_NO
+WHERE ytd.YTD_TOTAL > c.CREDIT_LIMIT
+ORDER BY ytd.YTD_TOTAL DESC;
+
+-- With CTEs: each step named, query reads top-to-bottom
+WITH
+  YTD_SPEND AS (
+    SELECT CUST_NO,
+           SUM(ORDER_AMOUNT) AS YTD_TOTAL
+    FROM ORDLIB.ORDMST
+    WHERE FISCAL_YEAR = YEAR(CURRENT_DATE)
+    GROUP BY CUST_NO
+  ),
+  CATEGORY_SPEND AS (
+    SELECT ol.CUST_NO, p.CATEGORY,
+           SUM(ol.LINE_AMOUNT) AS CAT_TOTAL,
+           RANK() OVER (PARTITION BY ol.CUST_NO
+                        ORDER BY SUM(ol.LINE_AMOUNT) DESC) AS CAT_RANK
+    FROM ORDLIB.ORDLIN ol
+    JOIN ORDLIB.PRODMST p ON p.PRODUCT_NO = ol.PRODUCT_NO
+    WHERE FISCAL_YEAR = YEAR(CURRENT_DATE)
+    GROUP BY ol.CUST_NO, p.CATEGORY
+  ),
+  TOP_CATEGORY AS (
+    SELECT CUST_NO, CATEGORY AS TOP_CATEGORY
+    FROM CATEGORY_SPEND
+    WHERE CAT_RANK = 1
+  ),
+  OVER_LIMIT AS (
+    SELECT c.CUST_NO, c.CUST_NAME, c.CREDIT_LIMIT,
+           y.YTD_TOTAL,
+           y.YTD_TOTAL - c.CREDIT_LIMIT AS EXCESS_AMOUNT
+    FROM SALESLIB.CUSTMST c
+    JOIN YTD_SPEND y ON y.CUST_NO = c.CUST_NO
+    WHERE y.YTD_TOTAL > c.CREDIT_LIMIT
+  )
+SELECT o.CUST_NO, o.CUST_NAME, o.CREDIT_LIMIT,
+       o.YTD_TOTAL, o.EXCESS_AMOUNT,
+       t.TOP_CATEGORY
+FROM OVER_LIMIT o
+LEFT JOIN TOP_CATEGORY t ON t.CUST_NO = o.CUST_NO
+ORDER BY o.EXCESS_AMOUNT DESC;
+</pre>
+
+<h2>Recursive CTEs: Anatomy of the WITH RECURSIVE Clause</h2>
+
+<p>A recursive CTE consists of two parts united by <code>UNION ALL</code>:</p>
+<ol>
+  <li><strong>Anchor member</strong> — a non-recursive SELECT that returns the starting rows of the hierarchy (e.g., the root nodes)</li>
+  <li><strong>Recursive member</strong> — a SELECT that joins the CTE to itself, advancing one level at a time</li>
+</ol>
+<p>DB2 for i executes the anchor member once, then executes the recursive member repeatedly using the previous iteration's result set, until no new rows are produced.</p>
+
+<pre>
+-- Template for a recursive CTE
+WITH RECURSIVE hierarchy (col1, col2, level, path) AS (
+  -- Anchor member: the starting point (root nodes, level = 0)
+  SELECT col1, col2, 0 AS level, CAST(col1 AS VARCHAR(500)) AS path
+  FROM source_table
+  WHERE parent_id IS NULL       -- root nodes have no parent
+
+  UNION ALL
+
+  -- Recursive member: join child rows to the CTE
+  SELECT s.col1, s.col2, h.level + 1, h.path || ' > ' || s.col1
+  FROM source_table s
+  JOIN hierarchy h ON h.col1 = s.parent_id  -- join child to its parent row
+  WHERE h.level < 20             -- safety limit: stop at depth 20
+)
+SELECT * FROM hierarchy ORDER BY path;
+</pre>
+
+<h2>Bill of Materials (BOM) Traversal</h2>
+
+<p>The classic recursive CTE use case on IBM i is the <strong>bill of materials</strong>: a table where each component row has a parent component. To find all sub-components of a finished product — at any depth — requires recursive SQL.</p>
+
+<pre>
+-- BOM table: ORDLIB.BOMTBL
+-- Columns: COMPONENT_NO (char 15), PARENT_NO (char 15 null = top level),
+--          DESCRIPTION (varchar 100), QTY_PER (packed 7:3), UNIT_COST (packed 9:2)
+
+-- Find all components under finished product 'FG-MOTOR-001', at all depths
+WITH RECURSIVE BOM_EXPLOSION (
+  COMPONENT_NO, DESCRIPTION, PARENT_NO,
+  QTY_PER, UNIT_COST, LEVEL, FULL_PATH, EXTENDED_COST
+) AS (
+  -- Anchor: the top-level finished good
+  SELECT COMPONENT_NO, DESCRIPTION, PARENT_NO,
+         DECIMAL(1.000, 7, 3)   AS QTY_PER,
+         UNIT_COST,
+         0                      AS LEVEL,
+         VARCHAR(TRIM(COMPONENT_NO), 500) AS FULL_PATH,
+         UNIT_COST              AS EXTENDED_COST
+  FROM ORDLIB.BOMTBL
+  WHERE COMPONENT_NO = 'FG-MOTOR-001'
+
+  UNION ALL
+
+  -- Recursive: find children of the current level
+  SELECT c.COMPONENT_NO, c.DESCRIPTION, c.PARENT_NO,
+         c.QTY_PER,
+         c.UNIT_COST,
+         b.LEVEL + 1,
+         b.FULL_PATH || ' > ' || TRIM(c.COMPONENT_NO),
+         b.EXTENDED_COST * c.QTY_PER  -- propagated extended cost
+  FROM ORDLIB.BOMTBL c
+  JOIN BOM_EXPLOSION b ON TRIM(b.COMPONENT_NO) = TRIM(c.PARENT_NO)
+  WHERE b.LEVEL < 15    -- guard against infinite loops from bad data
+)
+SELECT
+  LEVEL,
+  REPEAT('  ', LEVEL) || TRIM(COMPONENT_NO) AS INDENTED_COMPONENT,
+  DESCRIPTION,
+  QTY_PER,
+  UNIT_COST,
+  EXTENDED_COST,
+  FULL_PATH
+FROM BOM_EXPLOSION
+ORDER BY FULL_PATH;
+</pre>
+
+<h2>Organisational Hierarchy Queries</h2>
+
+<p>An organisational chart stored as a self-referencing table (employee → manager) is the second canonical recursive CTE pattern. This query finds every employee in a manager's full reporting tree.</p>
+
+<pre>
+-- Employee table: APPLIB.EMPTBL
+-- Columns: EMP_NO (char 8), EMP_NAME (varchar 50),
+--          MGR_NO (char 8, null for CEO), DEPT (char 5), SALARY (packed 9:2)
+
+-- Find all employees in the reporting chain under manager 'E0001234'
+WITH RECURSIVE ORG_TREE (
+  EMP_NO, EMP_NAME, MGR_NO, DEPT, SALARY, LEVEL, REPORTING_PATH
+) AS (
+  -- Anchor: the manager themselves (level 0)
+  SELECT EMP_NO, EMP_NAME, MGR_NO, DEPT, SALARY,
+         0 AS LEVEL,
+         VARCHAR(TRIM(EMP_NO), 500) AS REPORTING_PATH
+  FROM APPLIB.EMPTBL
+  WHERE EMP_NO = 'E0001234'
+
+  UNION ALL
+
+  -- Recursive: direct and indirect reports
+  SELECT e.EMP_NO, e.EMP_NAME, e.MGR_NO, e.DEPT, e.SALARY,
+         t.LEVEL + 1,
+         t.REPORTING_PATH || ' -> ' || TRIM(e.EMP_NO)
+  FROM APPLIB.EMPTBL e
+  JOIN ORG_TREE t ON TRIM(t.EMP_NO) = TRIM(e.MGR_NO)
+  WHERE t.LEVEL < 10
+)
+SELECT LEVEL,
+       REPEAT('    ', LEVEL) || TRIM(EMP_NAME) AS INDENTED_NAME,
+       DEPT,
+       SALARY,
+       REPORTING_PATH
+FROM ORG_TREE
+ORDER BY REPORTING_PATH;
+
+-- Aggregate: total salary cost of the entire reporting chain
+WITH RECURSIVE ORG_TREE (...) AS (
+  -- same recursive CTE as above
+)
+SELECT COUNT(*) AS HEADCOUNT,
+       SUM(SALARY) AS TOTAL_SALARY_COST,
+       AVG(SALARY) AS AVG_SALARY
+FROM ORG_TREE
+WHERE LEVEL > 0;  -- exclude the manager themselves from the total
+</pre>
+
+<h2>Cycle Detection</h2>
+
+<p>Bad data in hierarchical tables (e.g., employee A reports to B, B reports to A) causes a recursive CTE to loop forever. IBM i DB2 raises SQL error <code>-724</code> (recursion limit exceeded) after the maximum iterations, but it is better to detect cycles explicitly.</p>
+
+<pre>
+-- Cycle detection: track visited nodes in the path string
+-- If the current node already appears in the path, it is a cycle
+WITH RECURSIVE SAFE_ORG (
+  EMP_NO, EMP_NAME, MGR_NO, LEVEL, PATH, IS_CYCLE
+) AS (
+  -- Anchor
+  SELECT EMP_NO, EMP_NAME, MGR_NO,
+         0, VARCHAR(TRIM(EMP_NO), 5000),
+         CAST('N' AS CHAR(1))
+  FROM APPLIB.EMPTBL WHERE EMP_NO = 'E0001234'
+
+  UNION ALL
+
+  SELECT e.EMP_NO, e.EMP_NAME, e.MGR_NO,
+         t.LEVEL + 1,
+         t.PATH || ' -> ' || TRIM(e.EMP_NO),
+         CASE WHEN LOCATE(TRIM(e.EMP_NO), t.PATH) > 0 THEN 'Y' ELSE 'N' END
+  FROM APPLIB.EMPTBL e
+  JOIN SAFE_ORG t ON TRIM(t.EMP_NO) = TRIM(e.MGR_NO)
+  WHERE t.IS_CYCLE = 'N'   -- stop recursion when a cycle is detected
+    AND t.LEVEL < 50
+)
+-- Report cycles found
+SELECT EMP_NO, EMP_NAME, PATH AS CYCLE_PATH
+FROM SAFE_ORG WHERE IS_CYCLE = 'Y';
+</pre>
+
+<h2>CTEs in RPG Embedded SQL Cursors</h2>
+
+<p>CTEs work identically inside RPG embedded SQL. Declare a cursor with a WITH clause and fetch rows as usual. The DB2 query engine handles the CTE execution transparently.</p>
+
+<pre>
+**FREE
+Ctl-Opt DftActGrp(*No) ActGrp('BOMGRP');
+
+Dcl-S  CompNo    Char(15);
+Dcl-S  CompDesc  Varchar(100);
+Dcl-S  Level     Int(10);
+Dcl-S  ExtCost   Packed(13:2);
+Dcl-S  SqlCode   Int(10);
+
+Exec SQL
+  DECLARE C_BOM CURSOR FOR
+    WITH RECURSIVE BOM_EXP (COMPONENT_NO, DESCRIPTION, LEVEL, EXTENDED_COST) AS (
+      SELECT COMPONENT_NO, DESCRIPTION, 0, UNIT_COST
+      FROM ORDLIB.BOMTBL WHERE COMPONENT_NO = 'FG-MOTOR-001'
+      UNION ALL
+      SELECT c.COMPONENT_NO, c.DESCRIPTION, b.LEVEL + 1, b.EXTENDED_COST * c.QTY_PER
+      FROM ORDLIB.BOMTBL c
+      JOIN BOM_EXP b ON TRIM(b.COMPONENT_NO) = TRIM(c.PARENT_NO)
+      WHERE b.LEVEL < 15
+    )
+    SELECT COMPONENT_NO, DESCRIPTION, LEVEL, EXTENDED_COST
+    FROM BOM_EXP
+    ORDER BY LEVEL, COMPONENT_NO;
+
+Exec SQL OPEN C_BOM;
+
+DoU SqlCode = 100;
+  Exec SQL
+    FETCH NEXT FROM C_BOM
+    INTO :CompNo, :CompDesc, :Level, :ExtCost;
+  SqlCode = SQLCODE;
+
+  If SqlCode = 0;
+    // Process BOM component — write to report or accumulate totals
+  EndIf;
+EndDo;
+
+Exec SQL CLOSE C_BOM;
+*InLR = *On;
+</pre>
+
+<em>Next post: IBM i output queue and print management — creating and configuring output queues with CRTOUTQ and CHGOUTQ, working with spooled files using WRKOUTQ and WRKSPLF, moving and copying spooled files with CPYSPLF, converting spooled files to PDF with IBM i Transform Services, sending spooled files via SNDNETSPLF, and managing printer writers with STRPRTWTR and ENDWTR on IBM i in 2026.</em>

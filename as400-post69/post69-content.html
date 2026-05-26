@@ -1,0 +1,351 @@
+<p>The previous post covered ILE RPG date, time, and timestamp handling — declaring date/time/timestamp fields, converting between format codes with %DATE and %CHAR, performing date arithmetic with %DIFF and %ADDUR, fiscal period calculations, CEE date APIs (CEEDAYS, CEEJULDY, CEEDATE) for Lilian day arithmetic, and embedded SQL date functions in RPG programs on IBM i. This post covers DB2 for i window functions: the OVER clause with PARTITION BY and ORDER BY, ranking functions (ROW_NUMBER, RANK, DENSE_RANK, NTILE), value functions (LAG, LEAD, FIRST_VALUE, LAST_VALUE), aggregate window functions, frame clauses, running totals, moving averages, and the top-N-per-group pattern in real IBM i SQL analytics queries.</p>
+
+<h2>What Are Window Functions and Why Do They Matter?</h2>
+
+<p>A <strong>window function</strong> performs a calculation across a set of rows that are related to the current row — without collapsing those rows into a single output row the way GROUP BY does. The "window" is the set of rows the function can see for each output row, defined by the OVER clause.</p>
+
+<p>Before window functions, answering questions like "what is each order's value as a percentage of the total for that customer?" or "what was last month's revenue for comparison?" required correlated subqueries or self-joins that are expensive, unreadable, and error-prone. Window functions replace those patterns with a single, readable expression that DB2 for i can optimise efficiently.</p>
+
+<ul>
+  <li><strong>Ranking functions</strong> — assign a position number to each row within a partition: <code>ROW_NUMBER</code>, <code>RANK</code>, <code>DENSE_RANK</code>, <code>NTILE</code></li>
+  <li><strong>Value (offset) functions</strong> — access the value of a column in a nearby row: <code>LAG</code>, <code>LEAD</code>, <code>FIRST_VALUE</code>, <code>LAST_VALUE</code>, <code>NTH_VALUE</code></li>
+  <li><strong>Aggregate window functions</strong> — apply aggregate functions (SUM, COUNT, AVG, MIN, MAX) with OVER to compute running or group-scoped totals without GROUP BY</li>
+</ul>
+
+<h2>The OVER Clause: PARTITION BY and ORDER BY</h2>
+
+<p>The <code>OVER</code> clause defines the window for a function. It has three optional components: <code>PARTITION BY</code> divides rows into independent groups (like a GROUP BY that does not collapse rows), <code>ORDER BY</code> determines the order within each partition for ranking and cumulative functions, and the <strong>frame clause</strong> narrows the window further.</p>
+
+<pre>
+-- Basic OVER clause structure
+function_name(expression)
+  OVER (
+    PARTITION BY partition_columns   -- optional: divides into groups
+    ORDER BY     order_columns       -- required for ranking/offset functions
+    ROWS BETWEEN ...                 -- optional: frame specification
+  )
+
+-- Example: number every row in the entire result set
+SELECT ORDER_NO, CUST_NO, ORDER_AMOUNT,
+       ROW_NUMBER() OVER (ORDER BY ORDER_DATE) AS GLOBAL_SEQ
+FROM ORDLIB/ORDMST
+WHERE STATUS = 'OP';
+
+-- Example: number rows within each customer
+SELECT ORDER_NO, CUST_NO, ORDER_AMOUNT,
+       ROW_NUMBER() OVER (PARTITION BY CUST_NO ORDER BY ORDER_DATE) AS CUST_SEQ
+FROM ORDLIB/ORDMST
+WHERE STATUS = 'OP';
+
+-- Example: total amount per customer alongside each order row
+SELECT ORDER_NO, CUST_NO, ORDER_AMOUNT,
+       SUM(ORDER_AMOUNT) OVER (PARTITION BY CUST_NO) AS CUST_TOTAL,
+       ORDER_AMOUNT / SUM(ORDER_AMOUNT) OVER (PARTITION BY CUST_NO) * 100
+           AS PCT_OF_CUST_TOTAL
+FROM ORDLIB/ORDMST
+WHERE STATUS = 'OP';
+</pre>
+
+<h2>Ranking Functions: ROW_NUMBER, RANK, DENSE_RANK, NTILE</h2>
+
+<p>The four ranking functions differ in how they handle ties. Choosing the right one depends on whether you want gaps in the ranking sequence, dense ranking without gaps, or a completely unique row number regardless of ties.</p>
+
+<table>
+  <tr>
+    <th>Function</th>
+    <th>Ties handled as</th>
+    <th>Example output for tied values 100, 100, 200</th>
+  </tr>
+  <tr>
+    <td>ROW_NUMBER()</td>
+    <td>Unique arbitrary number</td>
+    <td>1, 2, 3</td>
+  </tr>
+  <tr>
+    <td>RANK()</td>
+    <td>Same rank, next rank skips</td>
+    <td>1, 1, 3</td>
+  </tr>
+  <tr>
+    <td>DENSE_RANK()</td>
+    <td>Same rank, next rank does not skip</td>
+    <td>1, 1, 2</td>
+  </tr>
+  <tr>
+    <td>NTILE(n)</td>
+    <td>Divides rows into n equal buckets</td>
+    <td>1, 1, 2 (for NTILE(2))</td>
+  </tr>
+</table>
+
+<pre>
+-- Rank salespeople by total sales within their region
+SELECT SALES_REP, REGION, TOTAL_SALES,
+       ROW_NUMBER()  OVER (PARTITION BY REGION ORDER BY TOTAL_SALES DESC) AS ROW_NUM,
+       RANK()        OVER (PARTITION BY REGION ORDER BY TOTAL_SALES DESC) AS SALES_RANK,
+       DENSE_RANK()  OVER (PARTITION BY REGION ORDER BY TOTAL_SALES DESC) AS DENSE_RNK,
+       NTILE(4)      OVER (PARTITION BY REGION ORDER BY TOTAL_SALES DESC) AS QUARTILE
+FROM SALESLIB/SALESREP
+WHERE FISCAL_YEAR = 2026;
+
+-- Identify the top sales rep per region (RANK = 1)
+SELECT SALES_REP, REGION, TOTAL_SALES
+FROM (
+  SELECT SALES_REP, REGION, TOTAL_SALES,
+         RANK() OVER (PARTITION BY REGION ORDER BY TOTAL_SALES DESC) AS RNK
+  FROM SALESLIB/SALESREP
+  WHERE FISCAL_YEAR = 2026
+) RANKED
+WHERE RNK = 1;
+
+-- NTILE: assign performance tier (1=top quartile, 4=bottom quartile)
+SELECT CUST_NO, CUST_NAME, YTD_PURCHASES,
+       NTILE(4) OVER (ORDER BY YTD_PURCHASES DESC) AS TIER
+FROM SALESLIB/CUSTMST
+WHERE ACTIVE_FLAG = 'Y';
+-- Tier 1 = top 25% customers by purchases
+</pre>
+
+<h2>Value Functions: LAG, LEAD, FIRST_VALUE, LAST_VALUE</h2>
+
+<p><code>LAG</code> and <code>LEAD</code> access the value from a row that is N rows behind or ahead of the current row in the ordered window. They are the cleanest way to compute period-over-period comparisons — month-over-month, week-over-week — without a self-join.</p>
+
+<pre>
+-- Month-over-month revenue comparison using LAG
+SELECT FISCAL_YEAR, FISCAL_MONTH, TOTAL_REVENUE,
+       LAG(TOTAL_REVENUE, 1, 0) OVER (
+           PARTITION BY FISCAL_YEAR
+           ORDER BY FISCAL_MONTH
+       ) AS PRIOR_MONTH_REVENUE,
+       TOTAL_REVENUE - LAG(TOTAL_REVENUE, 1, 0) OVER (
+           PARTITION BY FISCAL_YEAR
+           ORDER BY FISCAL_MONTH
+       ) AS MONTH_CHANGE
+FROM SALESLIB/MONTHLYSALES
+ORDER BY FISCAL_YEAR, FISCAL_MONTH;
+-- LAG(col, N, default): look back N rows; return default if no prior row
+
+-- LEAD: look ahead — show each order alongside the next order date for that customer
+SELECT ORDER_NO, CUST_NO, ORDER_DATE, ORDER_AMOUNT,
+       LEAD(ORDER_DATE, 1) OVER (
+           PARTITION BY CUST_NO
+           ORDER BY ORDER_DATE
+       ) AS NEXT_ORDER_DATE,
+       DAYS_BETWEEN(
+           LEAD(ORDER_DATE, 1) OVER (PARTITION BY CUST_NO ORDER BY ORDER_DATE),
+           ORDER_DATE
+       ) AS DAYS_TO_NEXT_ORDER
+FROM ORDLIB/ORDMST
+ORDER BY CUST_NO, ORDER_DATE;
+
+-- FIRST_VALUE and LAST_VALUE: best and worst price in a product category
+SELECT PRODUCT_NO, CATEGORY, UNIT_PRICE,
+       FIRST_VALUE(UNIT_PRICE) OVER (
+           PARTITION BY CATEGORY
+           ORDER BY UNIT_PRICE DESC
+           ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+       ) AS MAX_PRICE_IN_CATEGORY,
+       LAST_VALUE(UNIT_PRICE) OVER (
+           PARTITION BY CATEGORY
+           ORDER BY UNIT_PRICE DESC
+           ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+       ) AS MIN_PRICE_IN_CATEGORY
+FROM ORDLIB/PRODMST;
+-- NOTE: LAST_VALUE needs ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+-- to see the full partition; the default frame stops at the current row
+</pre>
+
+<p>The default frame for <code>LAST_VALUE</code> is <code>ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code> — which means it only looks back, not forward. Without the explicit frame clause, <code>LAST_VALUE</code> returns the current row's value rather than the partition's last value. This is the most common window function gotcha in DB2 for i queries.</p>
+
+<h2>Frame Clauses: ROWS BETWEEN and RANGE BETWEEN</h2>
+
+<p>The frame clause narrows the window to a sliding subset of rows within the partition. Two flavours exist: <code>ROWS BETWEEN</code> uses physical row offsets, while <code>RANGE BETWEEN</code> uses logical value offsets (all rows within a value distance of the current row's ORDER BY value).</p>
+
+<pre>
+-- ROWS frame: 3-month moving average of monthly sales
+SELECT FISCAL_MONTH, TOTAL_SALES,
+       AVG(TOTAL_SALES) OVER (
+           ORDER BY FISCAL_MONTH
+           ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+       ) AS MOVING_AVG_3MO
+FROM SALESLIB/MONTHLYSALES
+WHERE FISCAL_YEAR = 2026;
+
+-- ROWS frame keywords:
+--   UNBOUNDED PRECEDING  = from the first row of the partition
+--   N PRECEDING          = N rows before current row
+--   CURRENT ROW          = the current row itself
+--   N FOLLOWING          = N rows after current row
+--   UNBOUNDED FOLLOWING  = to the last row of the partition
+
+-- Running total (cumulative sum) — classic use of UNBOUNDED PRECEDING
+SELECT ORDER_DATE, ORDER_AMOUNT,
+       SUM(ORDER_AMOUNT) OVER (
+           ORDER BY ORDER_DATE
+           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+       ) AS RUNNING_TOTAL
+FROM ORDLIB/ORDMST
+WHERE FISCAL_YEAR = 2026
+ORDER BY ORDER_DATE;
+
+-- RANGE frame: sum all rows within 30 days of the current row's order date
+-- RANGE requires ORDER BY to be a numeric or date/time type
+SELECT ORDER_DATE, ORDER_AMOUNT,
+       SUM(ORDER_AMOUNT) OVER (
+           ORDER BY DAYS(ORDER_DATE)
+           RANGE BETWEEN 30 PRECEDING AND CURRENT ROW
+       ) AS ROLLING_30_DAY_SUM
+FROM ORDLIB/ORDMST
+ORDER BY ORDER_DATE;
+</pre>
+
+<h2>Aggregate Window Functions: Running Totals and Percentages</h2>
+
+<p>Any aggregate function (SUM, COUNT, AVG, MIN, MAX) can be used as a window function by adding an OVER clause. The key difference from GROUP BY: every source row appears in the output, with the aggregate value attached to each row.</p>
+
+<pre>
+-- Running total, running count, and cumulative percentage in one query
+SELECT ORDER_NO, ORDER_DATE, ORDER_AMOUNT,
+       SUM(ORDER_AMOUNT) OVER (ORDER BY ORDER_DATE
+           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CUMULATIVE_SALES,
+       COUNT(*)          OVER (ORDER BY ORDER_DATE
+           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS ORDER_COUNT_SO_FAR,
+       SUM(ORDER_AMOUNT) OVER () AS GRAND_TOTAL,
+       DECIMAL(ORDER_AMOUNT * 100.0 /
+               SUM(ORDER_AMOUNT) OVER (), 6, 2)              AS PCT_OF_TOTAL
+FROM ORDLIB/ORDMST
+WHERE STATUS = 'CL'   -- closed orders
+  AND FISCAL_YEAR = 2026
+ORDER BY ORDER_DATE;
+
+-- Year-to-date total alongside each monthly row
+SELECT FISCAL_YEAR, FISCAL_MONTH, MONTHLY_SALES,
+       SUM(MONTHLY_SALES) OVER (
+           PARTITION BY FISCAL_YEAR
+           ORDER BY FISCAL_MONTH
+           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+       ) AS YTD_SALES,
+       MAX(MONTHLY_SALES) OVER (PARTITION BY FISCAL_YEAR) AS BEST_MONTH_SALES,
+       MIN(MONTHLY_SALES) OVER (PARTITION BY FISCAL_YEAR) AS WORST_MONTH_SALES
+FROM SALESLIB/MONTHLYSALES
+ORDER BY FISCAL_YEAR, FISCAL_MONTH;
+</pre>
+
+<h2>Top-N Per Group Pattern</h2>
+
+<p>One of the most common query patterns in IBM i reporting is selecting the top N records per group — the top 3 orders per customer, the top 5 products per category, the most recent 10 transactions per account. Window functions make this a clean two-step: rank within the partition, then filter on the rank.</p>
+
+<pre>
+-- Top 3 orders by value for each customer
+SELECT ORDER_NO, CUST_NO, ORDER_DATE, ORDER_AMOUNT
+FROM (
+  SELECT ORDER_NO, CUST_NO, ORDER_DATE, ORDER_AMOUNT,
+         ROW_NUMBER() OVER (
+             PARTITION BY CUST_NO
+             ORDER BY ORDER_AMOUNT DESC
+         ) AS RN
+  FROM ORDLIB/ORDMST
+  WHERE STATUS IN ('OP', 'CL')
+    AND FISCAL_YEAR = 2026
+) RANKED
+WHERE RN <= 3
+ORDER BY CUST_NO, RN;
+
+-- Most recent invoice per customer (latest = 1)
+SELECT CUST_NO, INV_NO, INV_DATE, INV_AMOUNT
+FROM (
+  SELECT CUST_NO, INV_NO, INV_DATE, INV_AMOUNT,
+         ROW_NUMBER() OVER (PARTITION BY CUST_NO ORDER BY INV_DATE DESC) AS RN
+  FROM ARLIB/INVMST
+) R
+WHERE RN = 1;
+
+-- Remove duplicate rows: keep only the most recently inserted row per order
+-- (handles cases where a reprocessing job inserted duplicates)
+DELETE FROM ORDLIB/STAGINGTBL
+WHERE ROW_ID NOT IN (
+  SELECT MAX_ID FROM (
+    SELECT MAX(ROW_ID) OVER (PARTITION BY ORDER_NO) AS MAX_ID
+    FROM ORDLIB/STAGINGTBL
+  ) M
+);
+</pre>
+
+<h2>Window Functions in RPG Embedded SQL Cursors</h2>
+
+<p>Window functions are fully usable in cursor-based embedded SQL inside RPG programs. Declare the cursor with the window function in the SELECT, fetch rows as usual, and use the computed rank or running total directly in your RPG logic.</p>
+
+<pre>
+**FREE
+Ctl-Opt DftActGrp(*No) ActGrp('SALESGRP');
+
+Dcl-S  CustNo       Char(7);
+Dcl-S  OrdNo        Char(10);
+Dcl-S  OrdAmt       Packed(11:2);
+Dcl-S  CustRank     Int(10);
+Dcl-S  CustTotal    Packed(13:2);
+Dcl-S  SqlCode      Int(10);
+
+// Cursor uses window functions: rank per customer + customer total
+Exec SQL
+  DECLARE C_RANKED CURSOR FOR
+    SELECT CUST_NO, ORDER_NO, ORDER_AMOUNT,
+           RANK() OVER (PARTITION BY CUST_NO ORDER BY ORDER_AMOUNT DESC) AS CUST_RANK,
+           SUM(ORDER_AMOUNT) OVER (PARTITION BY CUST_NO) AS CUST_TOTAL
+    FROM ORDLIB/ORDMST
+    WHERE FISCAL_YEAR = 2026
+      AND STATUS = 'CL'
+    ORDER BY CUST_NO, CUST_RANK;
+
+Exec SQL OPEN C_RANKED;
+
+DoU SqlCode = 100;
+  Exec SQL
+    FETCH NEXT FROM C_RANKED
+    INTO :CustNo, :OrdNo, :OrdAmt, :CustRank, :CustTotal;
+  SqlCode = SQLCODE;
+
+  If SqlCode = 0;
+    // Only process the top 5 orders per customer
+    If CustRank <= 5;
+      // ... write to report or trigger bonus logic
+    EndIf;
+  EndIf;
+EndDo;
+
+Exec SQL CLOSE C_RANKED;
+*InLR = *On;
+</pre>
+
+<h2>Performance Considerations for Window Functions</h2>
+
+<p>Window functions in DB2 for i are well optimised by the SQL Query Engine (SQE), but there are practical considerations for large IBM i tables.</p>
+
+<ul>
+  <li><strong>Indexes on PARTITION BY columns</strong> — an index over the PARTITION BY column(s) allows the SQE to process each partition efficiently without a full sort. For <code>PARTITION BY CUST_NO ORDER BY ORDER_DATE</code>, an index on <code>(CUST_NO, ORDER_DATE)</code> is ideal.</li>
+  <li><strong>Avoid unnecessary OVER clauses</strong> — each unique OVER clause definition may require a separate sort pass. If multiple window functions share the same OVER definition, DB2 for i may reuse the same sort; different OVER definitions each require their own sort.</li>
+  <li><strong>Use Visual Explain</strong> — in ACS (Access Client Solutions), run Visual Explain on your window function query to confirm the SQE is using an index scan rather than a full table sort. Look for "Index Scan" in the plan when PARTITION BY matches an index prefix.</li>
+  <li><strong>CTEs improve readability but not always performance</strong> — wrapping window functions in a CTE (WITH clause) and filtering outside makes the SQL readable; the SQE pushes predicates through CTEs in most cases, so performance is generally equivalent to an inline subquery.</li>
+  <li><strong>*FIRST vs. *ALL optimization goal</strong> — if you are fetching only the top-N rows, consider <code>OPTIMIZE FOR 1 ROW</code> on the outer query to hint the SQE toward a plan optimised for early termination rather than full result set materialisation.</li>
+</ul>
+
+<pre>
+-- Using a CTE with window function for readability and filtered output
+WITH RANKED_ORDERS AS (
+  SELECT ORDER_NO, CUST_NO, ORDER_DATE, ORDER_AMOUNT,
+         RANK() OVER (PARTITION BY CUST_NO ORDER BY ORDER_AMOUNT DESC) AS RNK,
+         SUM(ORDER_AMOUNT) OVER (PARTITION BY CUST_NO)                  AS CUST_TOTAL,
+         COUNT(*)          OVER (PARTITION BY CUST_NO)                  AS CUST_ORDER_COUNT
+  FROM ORDLIB/ORDMST
+  WHERE FISCAL_YEAR = 2026
+)
+SELECT ORDER_NO, CUST_NO, ORDER_DATE, ORDER_AMOUNT,
+       RNK, CUST_TOTAL, CUST_ORDER_COUNT,
+       DECIMAL(ORDER_AMOUNT * 100.0 / CUST_TOTAL, 6, 2) AS PCT_OF_CUST
+FROM RANKED_ORDERS
+WHERE RNK <= 3
+ORDER BY CUST_NO, RNK
+OPTIMIZE FOR 10 ROWS;
+</pre>
+
+<em>Next post: CL data areas and data queues — creating and managing data areas with CRTDTAARA, CHGDTAARA, and RTVDTAARA, reading and writing data areas from CL programs, data area locking with ALCOBJ/DLCOBJ, creating data queues with CRTDTAQ, and using SNDDTAQ/RCVDTAQ for reliable inter-job communication on IBM i.</em>

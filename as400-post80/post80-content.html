@@ -1,0 +1,313 @@
+<p>The previous post covered IFS permissions and security on IBM i — managing stream file and directory authorities with CHGAUT and WRKOBJAUT, changing ownership with CHGOWN, applying access control lists with SETFACL and GETFACL in PASE, configuring the PASE umask for default creation permissions, auditing IFS access through QAUDJRN, and stream file security best practices. This post covers AI-driven anomaly detection on IBM i operational data: querying QSYS2 system views for job and performance metrics, establishing statistical baselines with DB2 SQL window functions, installing Python and scikit-learn in PASE, training an Isolation Forest model on historical IBM i data, building a real-time detection pipeline, and triggering automated alerts via email or data queue when anomalies are found on IBM i in 2026.</p>
+
+<h2>Why Anomaly Detection on IBM i?</h2>
+
+<p>IBM i generates a rich stream of operational data — job CPU usage, disk I/O, memory pool faults, transaction response times, failed signon attempts, lock waits, and journal activity — all queryable through the <code>QSYS2</code> SQL services. This data contains early warning signals for:</p>
+<ul>
+  <li><strong>Performance degradation</strong> — a batch job that normally runs in 4 minutes taking 40 minutes is an anomaly that warrants investigation before it affects end-of-day processing</li>
+  <li><strong>Security incidents</strong> — a user profile with 2 failed signons per day suddenly having 200 is an anomaly indicating a brute-force attack</li>
+  <li><strong>Application failures</strong> — a transaction rate that drops to zero during peak hours signals a hung job or a stalled data queue</li>
+  <li><strong>Disk pressure</strong> — auxiliary storage usage growing faster than the seasonal baseline indicates a runaway spool file or uncontrolled data accumulation</li>
+</ul>
+<p>Traditional threshold alerting (alert if CPU > 80%) misses context-dependent anomalies. An Isolation Forest model learns what "normal" looks like for each metric across time-of-day and day-of-week patterns, making it far more sensitive without generating false positives.</p>
+
+<h2>Step 1 — Collect Operational Data from QSYS2</h2>
+
+<p>IBM i 7.3+ includes the <code>QSYS2</code> SQL services that expose real-time and historical system data as SQL table functions and views. These are the data sources for the anomaly detection pipeline.</p>
+
+<pre>
+-- Current active jobs with CPU usage
+SELECT JOB_NAME, JOB_USER, JOB_TYPE, JOB_STATUS,
+       CPU_TIME, ELAPSED_CPU_PERCENTAGE,
+       TOTAL_DISK_IO_COUNT, DISK_IO_COUNT,
+       ELAPSED_ASYNC_DISK_IO_COUNT
+FROM TABLE(QSYS2.ACTIVE_JOB_INFO(
+    RESET_STATISTICS => 'YES',
+    SUBSYSTEM_LIST   => 'QBATCH,QINTER'
+)) A
+ORDER BY ELAPSED_CPU_PERCENTAGE DESC;
+
+-- Job history for the past 24 hours (from QHST journal)
+SELECT JOB_NAME, USER_NAME, JOB_END_SEVERITY,
+       JOB_ENTERED_SYSTEM_TIME, JOB_END_TIME,
+       ELAPSED_CPU_TIME / 1000000.0 AS CPU_SECONDS,
+       TOTAL_DISK_IO_COUNT
+FROM TABLE(QSYS2.JOB_INFO(
+    JOB_STATUS_FILTER => '*OUTQ',
+    JOB_USER_FILTER   => '*ALL'
+)) A
+WHERE JOB_END_TIME >= CURRENT_TIMESTAMP - 1 DAY
+ORDER BY JOB_END_TIME DESC;
+
+-- Memory pool faults (paging activity — indicator of memory pressure)
+SELECT POOL_NAME, POOL_SIZE, ACTIVE_TO_INELIGIBLE,
+       DATABASE_FAULTS, NONDATABASE_FAULTS,
+       DATABASE_PAGES, NONDATABASE_PAGES
+FROM QSYS2.SYSTEM_POOL_INFO;
+
+-- Disk usage trend — query ASP storage
+SELECT ASP_NUMBER, TOTAL_CAPACITY, TOTAL_CAPACITY_AVAILABLE,
+       DECIMAL((TOTAL_CAPACITY - TOTAL_CAPACITY_AVAILABLE) * 100.0
+               / TOTAL_CAPACITY, 5, 1) AS USED_PCT
+FROM QSYS2.ASP_INFO;
+
+-- Failed signon attempts in the past hour (security anomaly source)
+SELECT ENTRY_TIMESTAMP, USER_NAME, REMOTE_ADDRESS
+FROM TABLE(QSYS2.DISPLAY_JOURNAL(
+    JOURNAL_LIBRARY     => 'QSYS',
+    JOURNAL_NAME        => 'QAUDJRN',
+    JOURNAL_ENTRY_TYPES => 'PW'       -- PW = password violation
+)) A
+WHERE ENTRY_TIMESTAMP > CURRENT_TIMESTAMP - 1 HOUR;
+</pre>
+
+<h2>Step 2 — Build a Historical Baseline Table</h2>
+
+<p>Create a DB2 for i table to store the time-series operational metrics. A scheduled job (ADDJOBSCDE, covered next post) inserts a snapshot every 5 minutes. This accumulates the historical data needed to train the anomaly detection model.</p>
+
+<pre>
+-- Create the operational metrics history table
+CREATE TABLE APPLIB.OP_METRICS_HIST (
+  SAMPLE_TS           TIMESTAMP    NOT NULL DEFAULT CURRENT TIMESTAMP,
+  HOUR_OF_DAY         SMALLINT     NOT NULL,    -- 0-23
+  DAY_OF_WEEK         SMALLINT     NOT NULL,    -- 1=Sunday, 7=Saturday
+  ACTIVE_BATCH_JOBS   SMALLINT,
+  ACTIVE_INTER_JOBS   SMALLINT,
+  AVG_CPU_PCT         DECIMAL(5,2),
+  MAX_CPU_PCT         DECIMAL(5,2),
+  TOTAL_DISK_IO       BIGINT,
+  DB_POOL_FAULTS      INTEGER,
+  ASP_USED_PCT        DECIMAL(5,1),
+  FAILED_SIGNON_CNT   SMALLINT,
+  PRIMARY KEY (SAMPLE_TS)
+);
+
+-- CL program to insert a metrics snapshot (called every 5 minutes by ADDJOBSCDE)
+-- The actual data collection uses SQL INSERT...SELECT from QSYS2 views
+
+-- Sample INSERT
+INSERT INTO APPLIB.OP_METRICS_HIST (
+  HOUR_OF_DAY, DAY_OF_WEEK,
+  ACTIVE_BATCH_JOBS, ACTIVE_INTER_JOBS, AVG_CPU_PCT, MAX_CPU_PCT,
+  TOTAL_DISK_IO, DB_POOL_FAULTS, ASP_USED_PCT
+)
+SELECT
+  HOUR(CURRENT_TIMESTAMP),
+  DAYOFWEEK(CURRENT_TIMESTAMP),
+  COUNT(*) FILTER (WHERE JOB_TYPE = 'BCH'),
+  COUNT(*) FILTER (WHERE JOB_TYPE = 'INT'),
+  AVG(ELAPSED_CPU_PERCENTAGE),
+  MAX(ELAPSED_CPU_PERCENTAGE),
+  SUM(ELAPSED_ASYNC_DISK_IO_COUNT),
+  0,
+  (SELECT DECIMAL((TOTAL_CAPACITY - TOTAL_CAPACITY_AVAILABLE) * 100.0
+                  / TOTAL_CAPACITY, 5, 1)
+   FROM QSYS2.ASP_INFO FETCH FIRST 1 ROW ONLY)
+FROM TABLE(QSYS2.ACTIVE_JOB_INFO(RESET_STATISTICS => 'YES')) A;
+</pre>
+
+<h2>Step 3 — Install Python and scikit-learn in IBM i PASE</h2>
+
+<pre>
+/* Open a PASE shell */
+CALL QSYS/QP2TERM
+
+# Install Python 3 via IBM i open-source package manager
+yum install python39
+yum install python39-pip
+
+# Verify
+python3.9 --version    # Python 3.9.x
+
+# Install the required packages
+pip3 install scikit-learn    # Machine learning (Isolation Forest)
+pip3 install pandas          # Data manipulation
+pip3 install pyodbc          # ODBC connection to DB2 for i
+pip3 install numpy           # Numerical arrays
+
+# Verify scikit-learn install
+python3.9 -c "import sklearn; print(sklearn.__version__)"
+</pre>
+
+<h2>Step 4 — Train the Isolation Forest Model</h2>
+
+<p>The <strong>Isolation Forest</strong> algorithm detects anomalies by randomly partitioning the feature space and measuring how few splits are needed to isolate each point. Anomalies are isolated quickly (few splits); normal points require many splits. It works well with IBM i operational data because it handles high-dimensional numeric data, requires no labelled anomaly examples, and is computationally lightweight enough to retrain daily on IBM i PASE.</p>
+
+<pre>
+#!/QOpenSys/pkgs/bin/python3.9
+# /home/batch/ai/train_anomaly_model.py
+# Run weekly via ADDJOBSCDE to retrain on the latest 90 days of data
+
+import pyodbc
+import pandas as pd
+import numpy as np
+import pickle
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+
+# ── Connect to DB2 for i ──────────────────────────────
+conn = pyodbc.connect(
+    'DSN=IBMI;',
+    autocommit=True
+)
+
+# ── Load 90 days of historical metrics ───────────────
+query = """
+    SELECT HOUR_OF_DAY, DAY_OF_WEEK,
+           ACTIVE_BATCH_JOBS, ACTIVE_INTER_JOBS,
+           AVG_CPU_PCT, MAX_CPU_PCT,
+           TOTAL_DISK_IO, DB_POOL_FAULTS,
+           ASP_USED_PCT, FAILED_SIGNON_CNT
+    FROM APPLIB.OP_METRICS_HIST
+    WHERE SAMPLE_TS > CURRENT_TIMESTAMP - 90 DAYS
+    ORDER BY SAMPLE_TS
+"""
+df = pd.read_sql(query, conn)
+conn.close()
+
+print(f"Loaded {len(df)} samples for training")
+
+# ── Feature matrix ────────────────────────────────────
+features = ['HOUR_OF_DAY', 'DAY_OF_WEEK', 'ACTIVE_BATCH_JOBS',
+            'ACTIVE_INTER_JOBS', 'AVG_CPU_PCT', 'MAX_CPU_PCT',
+            'TOTAL_DISK_IO', 'DB_POOL_FAULTS', 'ASP_USED_PCT',
+            'FAILED_SIGNON_CNT']
+X = df[features].fillna(0).values
+
+# ── Normalise features (Isolation Forest is scale-sensitive) ─────
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# ── Train Isolation Forest ────────────────────────────
+# contamination=0.02 means we expect ~2% of samples to be anomalies
+model = IsolationForest(
+    n_estimators=200,
+    contamination=0.02,
+    random_state=42,
+    n_jobs=-1          # Use all available CPU cores in PASE
+)
+model.fit(X_scaled)
+
+# ── Persist the model and scaler to IFS ──────────────
+with open('/home/batch/ai/anomaly_model.pkl', 'wb') as f:
+    pickle.dump({'model': model, 'scaler': scaler, 'features': features}, f)
+
+print("Model trained and saved to /home/batch/ai/anomaly_model.pkl")
+anomaly_scores = model.decision_function(X_scaled)
+print(f"Score range: {anomaly_scores.min():.3f} to {anomaly_scores.max():.3f}")
+print(f"Samples flagged as anomaly: {(model.predict(X_scaled) == -1).sum()}")
+</pre>
+
+<h2>Step 5 — Real-Time Anomaly Detection and Alerting</h2>
+
+<pre>
+#!/QOpenSys/pkgs/bin/python3.9
+# /home/batch/ai/detect_anomaly.py
+# Run every 5 minutes via ADDJOBSCDE — checks the latest metrics snapshot
+
+import pyodbc, pickle, numpy as np, datetime, smtplib
+from email.mime.text import MIMEText
+
+MODEL_PATH = '/home/batch/ai/anomaly_model.pkl'
+ALERT_EMAIL = 'ibmi-ops@company.com'
+SMTP_HOST   = 'smtp.company.internal'
+
+# ── Load persisted model ──────────────────────────────
+with open(MODEL_PATH, 'rb') as f:
+    saved = pickle.load(f)
+model, scaler, features = saved['model'], saved['scaler'], saved['features']
+
+# ── Fetch the most recent metrics snapshot ────────────
+conn = pyodbc.connect('DSN=IBMI;', autocommit=True)
+cursor = conn.cursor()
+
+cursor.execute("""
+    SELECT HOUR_OF_DAY, DAY_OF_WEEK, ACTIVE_BATCH_JOBS, ACTIVE_INTER_JOBS,
+           AVG_CPU_PCT, MAX_CPU_PCT, TOTAL_DISK_IO, DB_POOL_FAULTS,
+           ASP_USED_PCT, FAILED_SIGNON_CNT, SAMPLE_TS
+    FROM APPLIB.OP_METRICS_HIST
+    ORDER BY SAMPLE_TS DESC
+    FETCH FIRST 1 ROW ONLY
+""")
+row = cursor.fetchone()
+
+if row is None:
+    print("No metrics available — exiting")
+    conn.close()
+    exit(0)
+
+sample_ts = row[-1]
+x_raw = np.array([[row[i] or 0 for i in range(len(features))]])
+x_scaled = scaler.transform(x_raw)
+
+prediction = model.predict(x_scaled)[0]   # 1 = normal, -1 = anomaly
+score      = model.decision_function(x_scaled)[0]
+
+if prediction == -1:
+    # ── Anomaly detected — send alert ─────────────────
+    metric_str = '\n'.join(
+        f'  {feat}: {x_raw[0][i]:.2f}'
+        for i, feat in enumerate(features)
+    )
+    alert_body = (
+        f'IBM i Anomaly Detected at {sample_ts}\n\n'
+        f'Anomaly score: {score:.4f} (negative = more anomalous)\n\n'
+        f'Current metrics:\n{metric_str}\n\n'
+        f'Investigate with: WRKACTJOB / WRKDSKSTS / NETSTAT OPTION(*CNN)'
+    )
+    msg = MIMEText(alert_body)
+    msg['Subject'] = f'[IBM i ALERT] Operational anomaly detected {sample_ts}'
+    msg['From']    = 'ibmi-monitor@company.com'
+    msg['To']      = ALERT_EMAIL
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, 25) as smtp:
+            smtp.sendmail(msg['From'], [ALERT_EMAIL], msg.as_string())
+        print(f"ALERT sent: anomaly at {sample_ts}, score={score:.4f}")
+    except Exception as e:
+        print(f"Email failed: {e}")
+
+    # ── Also write anomaly to DB2 for dashboarding ────
+    cursor.execute("""
+        INSERT INTO APPLIB.ANOMALY_LOG
+          (DETECTED_TS, ANOMALY_SCORE, METRICS_SNAPSHOT)
+        VALUES (CURRENT TIMESTAMP, ?, ?)
+    """, (float(score), str(dict(zip(features, x_raw[0])))))
+    conn.commit()
+
+else:
+    print(f"Normal sample at {sample_ts}, score={score:.4f}")
+
+conn.close()
+</pre>
+
+<h2>Scheduling the Detection Pipeline</h2>
+
+<pre>
+/* Schedule the metrics collection job every 5 minutes */
+ADDJOBSCDE JOB(COLLECTMTX) +
+           CMD(CALL PGM(APPLIB/CLCTMTX)) +
+           FRQ(*MINUTES) MINUTE(5) +
+           SCDDATE(*CURRENT) SCDTIME(*CURRENT) +
+           JOBD(APPLIB/BATCHJOBD) USER(BATCHUSR) +
+           TEXT('Collect IBM i operational metrics every 5 minutes')
+
+/* Schedule the anomaly detection job every 5 minutes (offset by 1 minute) */
+ADDJOBSCDE JOB(DETECTANOM) +
+           CMD(CALL PGM(QP2SHELL) PARM('/QOpenSys/pkgs/bin/python3.9' +
+               '/home/batch/ai/detect_anomaly.py')) +
+           FRQ(*MINUTES) MINUTE(5) +
+           SCDDATE(*CURRENT) SCDTIME(*CURRENT) +
+           JOBD(APPLIB/BATCHJOBD) USER(BATCHUSR) +
+           TEXT('Run AI anomaly detection on IBM i metrics every 5 minutes')
+
+/* Schedule weekly model retraining — Sunday at 02:00 */
+ADDJOBSCDE JOB(TRAINMODEL) +
+           CMD(CALL PGM(QP2SHELL) PARM('/QOpenSys/pkgs/bin/python3.9' +
+               '/home/batch/ai/train_anomaly_model.py')) +
+           FRQ(*WEEKLY) SCDDAY(*SUN) SCDTIME('020000') +
+           JOBD(APPLIB/BATCHJOBD) USER(BATCHUSR) +
+           TEXT('Retrain IBM i anomaly detection model weekly')
+</pre>
+
+<em>Next post: IBM i job scheduling with ADDJOBSCDE — adding recurring batch jobs to the IBM i job scheduler, managing schedules with WRKJOBSCDE and CHGJOBSCDE, creating schedule calendars for business days, exception calendars for bank holidays, retrieving schedule entries with RTVJOBSCDE in CL programs, holding and releasing schedules with HLDJOBSCDE and RLSJOBSCDE, and monitoring scheduled job execution history on IBM i in 2026.</em>

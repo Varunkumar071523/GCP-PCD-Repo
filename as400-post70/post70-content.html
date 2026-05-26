@@ -1,0 +1,411 @@
+<p>The previous post covered DB2 for i window functions — ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, FIRST_VALUE, and LAST_VALUE with the OVER clause, PARTITION BY, ORDER BY, and frame clauses for running totals, moving averages, and top-N-per-group patterns in IBM i analytical SQL queries. This post covers CL data areas and data queues on IBM i: creating and managing data areas with CRTDTAARA, RTVDTAARA, and CHGDTAARA, the local data area (LDA), using the DTAARA keyword in RPG programs, data area locking with ALCOBJ and DLCOBJ, creating FIFO, LIFO, and keyed data queues with CRTDTAQ, and using SNDDTAQ and RCVDTAQ for reliable inter-program and inter-job communication on IBM i in 2026.</p>
+
+<h2>What Are Data Areas on IBM i?</h2>
+
+<p>A <strong>data area</strong> is a small system object (object type <code>*DTAARA</code>) that stores a single value — a character string, decimal number, or logical value — accessible by any job or program with the correct authority. Data areas are persistent across job boundaries, survive IPL, and serve as a lightweight shared-memory mechanism for IBM i programs.</p>
+
+<p>Common uses for data areas:</p>
+<ul>
+  <li><strong>System flags and switches</strong> — a character <code>Y/N</code> data area controls whether a batch window is open for processing, whether maintenance mode is active, or whether a process is currently running</li>
+  <li><strong>Sequence counters</strong> — a packed decimal data area holds the last-used document number; each program reads, increments, and writes it back (with locking)</li>
+  <li><strong>Configuration values</strong> — system-wide parameters (batch schedule times, file server addresses, environment indicators) stored outside programs so they can be changed without a recompile</li>
+  <li><strong>Job-to-job signalling</strong> — one job sets a data area to signal a condition to another job polling it</li>
+</ul>
+
+<h2>Creating and Managing Data Areas: CRTDTAARA, CHGDTAARA, RTVDTAARA</h2>
+
+<p>The <code>CRTDTAARA</code> command creates a data area object in a specified library. The <code>TYPE</code> parameter determines what kind of value it holds.</p>
+
+<pre>
+/* Create a character data area — 10-character maintenance mode flag */
+CRTDTAARA DTAARA(APPLIB/MAINTMODE) TYPE(*CHAR) LEN(10) +
+          VALUE('INACTIVE') +
+          TEXT('Maintenance mode flag: ACTIVE or INACTIVE')
+
+/* Create a packed decimal data area — next document number */
+CRTDTAARA DTAARA(APPLIB/NEXTDOCNO) TYPE(*DEC) LEN(9 0) +
+          VALUE(1000000) +
+          TEXT('Next available document number sequence')
+
+/* Create a logical data area — batch window open flag */
+CRTDTAARA DTAARA(APPLIB/BATCHOPEN) TYPE(*LGL) VALUE('0') +
+          TEXT('Batch processing window open flag 1=open 0=closed')
+
+/* Display a data area value */
+DSPDTAARA DTAARA(APPLIB/MAINTMODE)
+
+/* Change a data area value from the command line */
+CHGDTAARA DTAARA(APPLIB/MAINTMODE) VALUE('ACTIVE')
+
+/* Retrieve a data area value into a CL variable */
+DCL VAR(&MODE) TYPE(*CHAR) LEN(10)
+RTVDTAARA DTAARA(APPLIB/MAINTMODE) RTNVAR(&MODE)
+
+IF COND(&MODE *EQ 'ACTIVE') THEN(DO)
+    SNDPGMMSG MSG('System in maintenance mode — batch suspended') +
+              MSGTYPE(*INFO) TOPGMQ(*EXT)
+    RETURN
+ENDDO
+
+/* Delete a data area */
+DLTDTAARA DTAARA(APPLIB/OLDCONFIG)
+</pre>
+
+<h2>The Local Data Area (LDA)</h2>
+
+<p>Every IBM i job has its own <strong>Local Data Area (LDA)</strong> — a 1024-byte <code>*CHAR</code> data area named <code>*LDA</code> that is unique to each job and is automatically created when the job starts. The LDA is ideal for passing parameters between programs in the same job without using program call parameters.</p>
+
+<pre>
+/* Write to the LDA from CL — positions 1-20: user ID, 21-30: environment */
+CHGDTAARA DTAARA(*LDA (1 20)) VALUE(&USERID)
+CHGDTAARA DTAARA(*LDA (21 10)) VALUE(&ENVCODE)
+
+/* Read from LDA — retrieve specific substring */
+DCL VAR(&USERID) TYPE(*CHAR) LEN(20)
+DCL VAR(&ENVCODE) TYPE(*CHAR) LEN(10)
+RTVDTAARA DTAARA(*LDA (1 20)) RTNVAR(&USERID)
+RTVDTAARA DTAARA(*LDA (21 10)) RTNVAR(&ENVCODE)
+
+/* Read and write the LDA in RPG using the DTAARA keyword */
+</pre>
+
+<pre>
+**FREE
+// Declare the LDA in RPG with the DTAARA(*LDA) keyword
+Dcl-DS  LdaDS    DTAArea(*LDA) Len(1024);
+  UserId   Char(20)  Pos(1);
+  EnvCode  Char(10)  Pos(21);
+  BranchNo Char(3)   Pos(31);
+  RunDate  Char(8)   Pos(34);    // YYYYMMDD
+End-DS;
+
+// Read the LDA (implicit IN at program start with DTAARA keyword)
+// Or explicitly:
+In *Lock LdaDS;
+
+// Modify a field
+EnvCode = 'PROD';
+
+// Write back
+Out LdaDS;
+</pre>
+
+<p>The <code>In *Lock</code> opcode locks the data area for exclusive update. Always pair it with <code>Out</code> or <code>Unlock</code> to release the lock; failing to unlock causes other programs to hang waiting for access.</p>
+
+<h2>Using the DTAARA Keyword in RPG</h2>
+
+<p>Any named data area (not just the LDA) can be bound to an RPG data structure or standalone field using the <code>DTAARA</code> keyword. The program automatically reads the data area at entry and writes it at exit when <code>*INLR = *On</code>.</p>
+
+<pre>
+**FREE
+// Bind a standalone field to a named data area
+Dcl-S  BatchOpen  Char(1)  DTAArea(APPLIB/BATCHOPEN);
+
+// Bind a data structure to a named data area
+Dcl-DS  SysConfig  DTAArea(APPLIB/SYSCONFIG) Qualified;
+  ServerAddr  Char(50);
+  PortNum     Packed(5:0);
+  TimeoutSecs Packed(3:0);
+  DebugFlag   Char(1);
+End-DS;
+
+// At program start, read the data areas explicitly
+In SysConfig;
+In BatchOpen;
+
+// Check flag
+If BatchOpen = '1';
+  // Proceed with processing
+EndIf;
+
+// Update config and write back
+SysConfig.TimeoutSecs = 30;
+Out SysConfig;
+
+// Increment a sequence number with locking
+Dcl-S  NextDocNo  Packed(9:0)  DTAArea(APPLIB/NEXTDOCNO);
+
+In *Lock NextDocNo;     // Acquire exclusive lock
+NextDocNo += 1;
+Out NextDocNo;          // Write and release lock
+</pre>
+
+<h2>Data Area Locking with ALCOBJ and DLCOBJ</h2>
+
+<p>When multiple jobs may update the same data area (e.g., a shared sequence counter), you must protect the read-modify-write cycle against concurrent access. IBM i provides two mechanisms: the <code>In *Lock</code> RPG opcode (which locks at the data area level) or explicit object locking via <code>ALCOBJ</code> and <code>DLCOBJ</code> in CL.</p>
+
+<pre>
+/* CL: Explicitly allocate a data area with exclusive lock before updating */
+PGM
+
+DCL VAR(&DOCNO) TYPE(*DEC) LEN(9 0)
+DCL VAR(&NEWNO) TYPE(*DEC) LEN(9 0)
+
+/* Allocate exclusive lock on the data area */
+ALCOBJ OBJ((APPLIB/NEXTDOCNO *DTAARA *EXCL)) WAIT(30)
+MONMSG MSGID(CPF1002) EXEC(DO)
+    SNDPGMMSG MSG('Cannot allocate NEXTDOCNO — timeout after 30 seconds') +
+              MSGTYPE(*ESCAPE)
+ENDDO
+
+/* Read current value */
+RTVDTAARA DTAARA(APPLIB/NEXTDOCNO) RTNVAR(&DOCNO)
+
+/* Increment and write back */
+CHGVAR VAR(&NEWNO) VALUE(&DOCNO + 1)
+CHGDTAARA DTAARA(APPLIB/NEXTDOCNO) VALUE(&NEWNO)
+
+/* Release the lock */
+DLCOBJ OBJ((APPLIB/NEXTDOCNO *DTAARA *EXCL))
+
+/* Return the new document number to caller via LDA or parameter */
+CHGDTAARA DTAARA(*LDA (100 9)) VALUE(&NEWNO)
+
+ENDPGM
+</pre>
+
+<p>Lock types for ALCOBJ: <code>*EXCL</code> (exclusive — no other job can read or write), <code>*EXCLRD</code> (exclusive for write — others can read), <code>*SHRUPD</code> (shared for update — multiple updaters serialised), <code>*SHRNUP</code> (shared no update — read-only access), <code>*SHRRD</code> (shared read — multiple readers, no writers).</p>
+
+<h2>Data Queues: What They Are and When to Use Them</h2>
+
+<p>A <strong>data queue</strong> (<code>*DTAQ</code>) is a system object designed specifically for inter-job communication. Unlike a data area, a data queue holds multiple entries (messages), with jobs sending entries to one end and receiving from the other. Data queues are the IBM i equivalent of a message queue or lightweight message broker — built into the OS, recoverable, and very fast.</p>
+
+<table>
+  <tr>
+    <th>Feature</th>
+    <th>Data Area</th>
+    <th>Data Queue</th>
+  </tr>
+  <tr>
+    <td>Number of values</td>
+    <td>One (single value)</td>
+    <td>Many (queue of entries)</td>
+  </tr>
+  <tr>
+    <td>Consumers</td>
+    <td>Any job can read at any time</td>
+    <td>One consumer receives each entry</td>
+  </tr>
+  <tr>
+    <td>Blocking receive</td>
+    <td>No — must poll</td>
+    <td>Yes — RCVDTAQ waits up to N seconds</td>
+  </tr>
+  <tr>
+    <td>Ordering</td>
+    <td>N/A</td>
+    <td>FIFO, LIFO, or keyed</td>
+  </tr>
+  <tr>
+    <td>Journaling</td>
+    <td>Optional</td>
+    <td>Optional (SNGRCV(*YES) for recovery)</td>
+  </tr>
+  <tr>
+    <td>Best for</td>
+    <td>Flags, counters, config values</td>
+    <td>Work items, event notifications, pipelines</td>
+  </tr>
+</table>
+
+<h2>Creating Data Queues with CRTDTAQ</h2>
+
+<pre>
+/* Create a FIFO data queue — work items submitted by order entry jobs */
+CRTDTAQ DTAQ(ORDLIB/ORDWORKQ) MAXLEN(200) +
+        SEQ(*FIFO) +
+        SIZE(*MAX16MB) +
+        TEXT('Order processing work queue — FIFO')
+
+/* Create a LIFO data queue — undo stack */
+CRTDTAQ DTAQ(APPLIB/UNDOSTK) MAXLEN(512) SEQ(*LIFO)
+
+/* Create a keyed data queue — route work by priority key */
+CRTDTAQ DTAQ(APPLIB/PRIORITYQ) MAXLEN(256) +
+        SEQ(*KEYED) KEYLEN(2) +
+        TEXT('Priority work queue: key=01(high) to 09(low)')
+
+/* Create a DDM data queue for distributed jobs */
+/* (points to a data queue on a remote IBM i) */
+CRTDTAQ DTAQ(APPLIB/REMOTEWKQ) MAXLEN(200) +
+        TYPE(*DDM) RMTDTAQ(REMLIB/WORKQ) +
+        RMTLOCNAME(REMIBMI *SNA)
+
+/* Key parameters: */
+/* MAXLEN: maximum bytes per entry (up to 64512 for standard, 16MB with SIZE(*MAX16MB)) */
+/* SEQ(*FIFO): first-in first-out */
+/* SEQ(*LIFO): last-in first-out (stack) */
+/* SEQ(*KEYED): entries ordered by key; KEYLEN specifies key length in bytes */
+/* SENDERID(*YES): sender job name recorded with each entry */
+/* FORCE(*YES): entries written to auxiliary storage immediately (recoverable) */
+</pre>
+
+<h2>Sending and Receiving Entries: SNDDTAQ and RCVDTAQ</h2>
+
+<p>In CL, <code>SNDDTAQ</code> and <code>RCVDTAQ</code> are the primary commands for working with data queues. In RPG and other HLL programs, the equivalent system APIs <code>QSNDDTAQ</code> and <code>QRCVDTAQ</code> are called directly.</p>
+
+<pre>
+/* Send a 200-byte work item to the FIFO order queue */
+PGM PARM(&ORDNO &CUSTNO)
+
+DCL VAR(&ORDNO)   TYPE(*CHAR) LEN(10)
+DCL VAR(&CUSTNO)  TYPE(*CHAR) LEN(7)
+DCL VAR(&ENTRY)   TYPE(*CHAR) LEN(200)
+DCL VAR(&ENTLEN)  TYPE(*DEC)  LEN(5 0) VALUE(200)
+
+/* Build the queue entry: order number + customer + padding */
+CHGVAR VAR(&ENTRY) VALUE(&ORDNO *CAT &CUSTNO)
+
+SNDDTAQ DTAQ(ORDLIB/ORDWORKQ) LEN(&ENTLEN) DATA(&ENTRY)
+
+ENDPGM
+</pre>
+
+<pre>
+/* Receive an entry from the order queue — wait up to 30 seconds */
+PGM
+
+DCL VAR(&ENTRY)   TYPE(*CHAR) LEN(200)
+DCL VAR(&ENTLEN)  TYPE(*DEC)  LEN(5 0) VALUE(200)
+DCL VAR(&WAIT)    TYPE(*DEC)  LEN(5 0) VALUE(30)
+DCL VAR(&ORDNO)   TYPE(*CHAR) LEN(10)
+DCL VAR(&CUSTNO)  TYPE(*CHAR) LEN(7)
+
+LOOP:
+  RCVDTAQ DTAQ(ORDLIB/ORDWORKQ) LEN(&ENTLEN) DATA(&ENTRY) +
+          WAIT(&WAIT)
+
+  /* If LEN returns 0, the wait timed out — no entry available */
+  IF COND(&ENTLEN *EQ 0) THEN(GOTO CMDLBL(CHECKEND))
+
+  /* Extract fields from entry */
+  CHGVAR VAR(&ORDNO)  VALUE(%SST(&ENTRY 1 10))
+  CHGVAR VAR(&CUSTNO) VALUE(%SST(&ENTRY 11 7))
+
+  /* Process the work item */
+  CALL PGM(ORDLIB/PRCORDER) PARM(&ORDNO &CUSTNO)
+
+CHECKEND:
+  /* Check if shutdown flag is set */
+  RTVDTAARA DTAARA(APPLIB/BATCHOPEN) RTNVAR(&OPEN)
+  IF COND(&OPEN *EQ '1') THEN(GOTO CMDLBL(LOOP))
+
+ENDPGM
+</pre>
+
+<h2>Keyed Data Queues for Priority Routing</h2>
+
+<p>Keyed data queues allow a consumer to receive entries selectively by key value — or all entries in key sequence. This is the IBM i mechanism for priority-based work queues, routing work to different consumers based on type, or implementing a publish-subscribe pattern where consumers filter by message type.</p>
+
+<pre>
+**FREE
+// QSNDDTAQ prototype for keyed data queue
+Dcl-PR  QSNDDTAQ     ExtPgm('QSNDDTAQ');
+  DtaqName    Char(10)  Const;
+  DtaqLib     Char(10)  Const;
+  DataLen     Packed(5:0) Const;
+  DataEntry   Char(256) Const;
+  KeyLen      Packed(3:0) Const Options(*NoPass);
+  KeyData     Char(2)   Const Options(*NoPass);
+End-PR;
+
+// QRCVDTAQ prototype
+Dcl-PR  QRCVDTAQ     ExtPgm('QRCVDTAQ');
+  DtaqName    Char(10)  Const;
+  DtaqLib     Char(10)  Const;
+  DataLen     Packed(5:0);
+  DataEntry   Char(256);
+  WaitTime    Packed(5:0) Const;
+  KeyOrder    Char(2)   Const Options(*NoPass);  // 'EQ', 'LT', 'GT', 'LE', 'GE', '  ' (any)
+  KeyLen      Packed(3:0) Const Options(*NoPass);
+  KeyData     Char(2)   Options(*NoPass);
+  SenderInfo  Char(44)  Options(*NoPass);
+  RemoveMsg   Char(10)  Const Options(*NoPass);
+End-PR;
+
+// Send a high-priority work item (key = '01')
+Dcl-S  EntryLen   Packed(5:0);
+Dcl-S  KeyLen     Packed(3:0);
+Dcl-S  WorkEntry  Char(256);
+Dcl-S  KeyValue   Char(2);
+
+EntryLen  = 256;
+KeyLen    = 2;
+KeyValue  = '01';    // High priority
+WorkEntry = 'ORD0001234' + 'CUST001' + *AllX'00';
+
+QSNDDTAQ('PRIORITYQ' : 'APPLIB' : EntryLen : WorkEntry : KeyLen : KeyValue);
+
+// Receive only high-priority entries (key = '01')
+Dcl-S  RcvLen    Packed(5:0);
+Dcl-S  RcvEntry  Char(256);
+Dcl-S  WaitSecs  Packed(5:0);
+Dcl-S  RcvKey    Char(2);
+
+WaitSecs = 10;
+RcvLen   = 256;
+RcvKey   = '01';
+
+QRCVDTAQ('PRIORITYQ' : 'APPLIB' : RcvLen : RcvEntry : WaitSecs :
+          'EQ' : KeyLen : RcvKey);
+If RcvLen > 0;
+  // Process high-priority entry
+EndIf;
+</pre>
+
+<h2>Real-World Pattern: Producer-Consumer Pipeline</h2>
+
+<p>A common IBM i batch architecture uses a data queue as the backbone of a producer-consumer pipeline: an order-entry interactive job sends new orders to a data queue, and one or more batch consumer jobs receive and process them without the interactive user waiting. This decouples the UI from the batch processing time.</p>
+
+<pre>
+/* Producer CL: called by order-entry RPG program after header insert */
+PGM PARM(&ORDNO)
+
+DCL VAR(&ORDNO)   TYPE(*CHAR) LEN(10)
+DCL VAR(&ENTRY)   TYPE(*CHAR) LEN(100)
+DCL VAR(&LEN)     TYPE(*DEC)  LEN(5 0) VALUE(100)
+DCL VAR(&TSTAMP)  TYPE(*CHAR) LEN(26)
+
+/* Record timestamp in entry for SLA monitoring */
+RTVSYSVAL SYSVAL(QDATE) RTNVAR(&TSTAMP)
+CHGVAR VAR(&ENTRY) VALUE(&ORDNO *CAT &TSTAMP)
+
+/* Send to the processing queue */
+SNDDTAQ DTAQ(ORDLIB/ORDWORKQ) LEN(&LEN) DATA(&ENTRY)
+
+/* Send to audit queue as well (for compliance) */
+SNDDTAQ DTAQ(ORDLIB/ORDAUDITQ) LEN(&LEN) DATA(&ENTRY)
+
+ENDPGM
+
+/* Consumer CL: running as a server job in ORDBATCH subsystem */
+PGM
+
+DCL VAR(&ENTRY)   TYPE(*CHAR) LEN(100)
+DCL VAR(&LEN)     TYPE(*DEC)  LEN(5 0) VALUE(100)
+DCL VAR(&ORDNO)   TYPE(*CHAR) LEN(10)
+DCL VAR(&RUNNING) TYPE(*LGL)  VALUE('1')
+
+DOWHILE COND(&RUNNING)
+    CHGVAR VAR(&LEN) VALUE(100)
+    RCVDTAQ DTAQ(ORDLIB/ORDWORKQ) LEN(&LEN) DATA(&ENTRY) WAIT(-1)
+    /* WAIT(-1): wait indefinitely until an entry arrives */
+
+    IF COND(&LEN *GT 0) THEN(DO)
+        CHGVAR VAR(&ORDNO) VALUE(%SST(&ENTRY 1 10))
+        CALL PGM(ORDLIB/PRCORDER) PARM(&ORDNO)
+        MONMSG MSGID(CPF0000) EXEC(DO)
+            SNDPGMMSG MSGID(CPF9898) MSGF(QCPFMSG) +
+                      MSGDTA('Order processing failed for ' *CAT &ORDNO) +
+                      MSGTYPE(*ESCAPE)
+        ENDDO
+    ENDDO
+
+    /* Check shutdown flag (set by operator to stop server job gracefully) */
+    RTVDTAARA DTAARA(APPLIB/BATCHOPEN) RTNVAR(&RUNNING)
+ENDDO
+
+ENDPGM
+</pre>
+
+<em>Next post: IFS stream file I/O from RPG — using Qp0lOpen, Qp0lRead, Qp0lWrite, and Qp0lClose UNIX-type APIs to read and write IFS stream files from ILE RPG programs, setting open flags for create/append/read-only modes, handling CCSID encoding, generating CSV files, and parsing INI-style configuration files at runtime on IBM i.</em>

@@ -1,0 +1,299 @@
+<p>The previous post covered AI-assisted RPG modernization — converting fixed-format RPG to free-format with CVTRPGSRC and IBM Merlin's converter, using LLMs like watsonx Code Assistant and GitHub Copilot to explain and refactor legacy RPG code, AI-generated RPGUnit test stubs, the practical step-by-step modernization workflow, and what AI models consistently get wrong about RPG. This post covers IBM i journal management: what journaling is and why it matters, creating journals and journal receivers, the STRJRNOBJ and ENDJRNOBJ commands, managing the journal receiver chain, reading journal entries with DSPJRN and the DISPLAY_JOURNAL SQL table function, configuring remote journaling for high availability, and using the QAUDJRN security audit journal for compliance on IBM i in 2026.</p>
+
+<h2>What Is Journaling on IBM i?</h2>
+
+<p>Journaling is IBM i's mechanism for recording every change made to a database object — every INSERT, UPDATE, DELETE, and DDL change — to a sequential journal. The journal is a log of before-images and after-images of changed records, along with metadata: the job that made the change, the timestamp, the user profile, and the commit cycle identifier.</p>
+
+<p>Journaling serves three distinct purposes on IBM i:</p>
+<ul>
+  <li><strong>Commitment control (transactions)</strong> — journaling is a prerequisite for using COMMIT and ROLLBACK in DB2 for i. Without journaling, SQL DML statements cannot participate in transactions. Any table used in a COMMIT/ROLLBACK must be journaled.</li>
+  <li><strong>High availability and disaster recovery</strong> — journal entries can be replicated to a remote IBM i system via remote journaling. HA solutions like IBM PowerHA SystemMirror for i, MIMIX, and Maxava read the journal stream and replay changes on the standby system in near-real-time.</li>
+  <li><strong>Auditing and recovery</strong> — the journal provides a complete record of all changes for compliance auditing, and allows recovering a database file to any prior point in time using APYJRNCHG (Apply Journal Changes) or RMVJRNCHG (Remove Journal Changes).</li>
+</ul>
+
+<h2>Creating Journals and Journal Receivers</h2>
+
+<p>A <strong>journal receiver</strong> is a physical object that stores the journal entries. A <strong>journal</strong> is a catalog object that manages one or more journal receivers. The journal receiver is the actual storage; the journal is the control structure. You create the receiver first, then the journal.</p>
+
+<pre>
+/* Step 1: Create a journal receiver */
+CRTJRNRCV JRNRCV(APPLIB/APPJRNRCV0001) +
+          THRESHOLD(500000)      /* Detach receiver when it reaches 500 MB */
+          TEXT('Application journal receiver - initial')
+
+/* Step 2: Create the journal, attaching the receiver */
+CRTJRN JRN(APPLIB/APPJRN) +
+       JRNRCV(APPLIB/APPJRNRCV0001) +
+       MNGRCV(*SYSTEM)    /* IBM i automatically attaches new receivers */
+       DLTRCV(*YES)       /* Automatically delete detached receivers when safe */
+       MINENTDTA(*NONE)   /* Include full before/after images */
+       TEXT('Application journal')
+
+/* Alternative: MNGRCV(*USER) if you want to manage receivers manually */
+/* DLTRCV(*NO) if you need to retain all receivers for compliance */
+</pre>
+
+<p>Key CRTJRN parameters:</p>
+<ul>
+  <li><code>MNGRCV(*SYSTEM)</code> — IBM i automatically attaches a new receiver when the current one reaches its threshold. This is the recommended setting for most production environments.</li>
+  <li><code>MNGRCV(*USER)</code> — you manually attach receivers with CHGJRN. Gives full control but requires a receiver management procedure in your operations runbook.</li>
+  <li><code>DLTRCV(*YES)</code> — IBM i deletes receivers that are no longer needed for recovery (all committed transactions have been applied). Set to <code>*NO</code> if regulatory requirements mandate keeping the full journal history.</li>
+  <li><code>RCVSIZOPT(*MAXOPT1 *MAXOPT2 *MAXOPT3)</code> — enables receiver compression and deduplication to reduce storage requirements on high-volume journals.</li>
+</ul>
+
+<h2>Journaling Database Objects with STRJRNOBJ</h2>
+
+<p><code>STRJRNOBJ</code> (Start Journal Object) begins recording changes to a physical file, SQL table, data area, or data queue to the specified journal. For DB2 for i tables used with commitment control, every table in the application must be journaled.</p>
+
+<pre>
+/* Journal a single physical file */
+STRJRNOBJ OBJ(APPLIB/CUSTMST) OBJTYPE(*FILE) JRN(APPLIB/APPJRN) +
+          IMAGES(*BOTH)    /* Record both before-image and after-image */
+          OMTJRNE(*OPNCLO) /* Omit open/close entries to reduce volume */
+
+/* Journal multiple files — use a list */
+STRJRNOBJ OBJ((APPLIB/CUSTMST) (APPLIB/ORDMST) (APPLIB/ORDLIN)) +
+          OBJTYPE(*FILE) JRN(APPLIB/APPJRN) IMAGES(*BOTH)
+
+/* Journal all files in a library */
+STRJRNOBJ OBJ(APPLIB/*ALL) OBJTYPE(*FILE) JRN(APPLIB/APPJRN) +
+          IMAGES(*BOTH) OMTJRNE(*OPNCLO)
+
+/* End journaling for a file */
+ENDJRNOBJ OBJ(APPLIB/OLDFILE) OBJTYPE(*FILE) JRN(APPLIB/APPJRN)
+</pre>
+
+<p>The <code>IMAGES(*BOTH)</code> parameter records both the before-image (the record as it was before the change) and the after-image (the record after the change). This is required for:</p>
+<ul>
+  <li>Commitment control ROLLBACK to work correctly</li>
+  <li>Remote journaling and HA replication</li>
+  <li>Point-in-time recovery using APYJRNCHG/RMVJRNCHG</li>
+</ul>
+
+<p>Use <code>IMAGES(*AFTER)</code> only when you need to audit what changed (not roll back), and you want to minimize journal volume. For any table in a COMMIT scope, <code>IMAGES(*BOTH)</code> is required.</p>
+
+<h2>Journal Receiver Chain Management</h2>
+
+<p>Over time, the current journal receiver fills up and a new one is attached. All receivers that have ever been attached to a journal form the <strong>receiver chain</strong> — a linked list of receivers. The chain is important for recovery: to recover to any point in time, the full unbroken receiver chain from that time to the present must be available.</p>
+
+<pre>
+/* Manually attach a new receiver and detach the current one */
+/* Use this when MNGRCV(*USER) is set, or to force a rollover */
+CHGJRN JRN(APPLIB/APPJRN) JRNRCV(*GEN)
+/* *GEN tells IBM i to generate a new receiver name (APPJRNRCV0002, etc.) */
+
+/* Manually create and attach a specific receiver */
+CRTJRNRCV JRNRCV(APPLIB/APPJRNRCV0003) THRESHOLD(500000)
+CHGJRN JRN(APPLIB/APPJRN) JRNRCV(APPLIB/APPJRNRCV0003)
+/* The old receiver (APPJRNRCV0002) is now detached */
+
+/* View all receivers in the journal's receiver chain */
+WRKJRN JRN(APPLIB/APPJRN)
+/* Option 8 (Display journal attributes) shows the receiver chain */
+
+/* SQL alternative — query the receiver chain */
+SELECT JOURNAL_LIBRARY, JOURNAL_NAME,
+       ATTACHED_JOURNAL_RECEIVER_LIBRARY,
+       ATTACHED_JOURNAL_RECEIVER_NAME,
+       JOURNAL_STATE
+FROM   QSYS2.JOURNAL_INFO
+WHERE  JOURNAL_LIBRARY = 'APPLIB'
+AND    JOURNAL_NAME    = 'APPJRN';
+</pre>
+
+<p>Receiver retention policy:</p>
+<ul>
+  <li>Keep receivers until the last save of all journaled objects is older than the oldest receiver — this ensures any recovery operation can read journal entries from the save point forward</li>
+  <li>For HA environments: keep receivers until the remote journal has confirmed all entries have been applied to the standby system</li>
+  <li>For compliance: keep receivers for the regulatory retention period (often 1–7 years depending on industry)</li>
+  <li>Save journal receivers to tape or cloud storage before deleting them from disk</li>
+</ul>
+
+<h2>DSPJRN — Reading Journal Entries</h2>
+
+<p><code>DSPJRN</code> (Display Journal) reads entries from one or more journal receivers and displays them or outputs them to a file. It is used for ad-hoc investigation of what changes were made to a file during a time window.</p>
+
+<pre>
+/* Display all journal entries for CUSTMST in the last hour */
+DSPJRN JRN(APPLIB/APPJRN) +
+       FILE((APPLIB/CUSTMST)) +
+       ENTTYP(*RCD) +          /* Record-level entries only (omit open/close) */
+       FROMTIME('2026-07-03' '07:00:00') +
+       TOTIME('2026-07-03' '08:00:00') +
+       OUTPUT(*PRINT)
+
+/* Output journal entries to a database file for SQL analysis */
+DSPJRN JRN(APPLIB/APPJRN) +
+       FILE((APPLIB/CUSTMST)) +
+       ENTTYP(*RCD) +
+       FROMTIME('2026-07-01' '00:00:00') +
+       TOTIME('2026-07-03' '23:59:59') +
+       OUTPUT(*OUTFILE) +
+       OUTFILE(QTEMP/JRNOUT) +
+       OUTFMT(*TYPE5)   /* Type 5 includes full before/after images */
+</pre>
+
+<p>DSPJRN entry types (ENTTYP parameter):</p>
+<ul>
+  <li><code>PT</code> — PUT (INSERT)</li>
+  <li><code>UP</code> — UPDATE</li>
+  <li><code>DL</code> — DELETE</li>
+  <li><code>PX</code> — PUT with before-image</li>
+  <li><code>UB</code> — UPDATE before-image</li>
+  <li><code>BR</code> — ROLLBACK</li>
+  <li><code>CM</code> — COMMIT</li>
+  <li><code>*RCD</code> — all record-level entries (PT, UP, DL, PX, UB)</li>
+  <li><code>*ALL</code> — every entry including open/close/commit</li>
+</ul>
+
+<h2>SQL Access to Journal Data with DISPLAY_JOURNAL</h2>
+
+<p>The <code>QSYS2.DISPLAY_JOURNAL</code> table function (IBM i 7.3+) provides SQL-based access to journal entries without the DSPJRN command. This is the modern approach for querying journal data programmatically from RPG, Python, or SQL scripts:</p>
+
+<pre>
+-- Find all UPDATE entries for customer 100001 in the last 24 hours
+SELECT
+    ENTRY_TIMESTAMP,
+    JOB_NAME,
+    USER_NAME,
+    JOURNAL_ENTRY_TYPE,
+    OBJECT_NAME,
+    BEFORE_IMAGE,
+    AFTER_IMAGE
+FROM TABLE(
+    QSYS2.DISPLAY_JOURNAL(
+        JOURNAL_LIBRARY => 'APPLIB',
+        JOURNAL_NAME    => 'APPJRN',
+        JOURNAL_ENTRY_TYPES => 'UP UB',
+        STARTING_TIMESTAMP  => CURRENT_TIMESTAMP - 24 HOURS,
+        OBJECT_LIBRARY      => 'APPLIB',
+        OBJECT_NAME         => 'CUSTMST'
+    )
+) AS JRN_ENTRIES
+WHERE JSON_VALUE(AFTER_IMAGE, '$.CUSNO') = '100001'
+ORDER BY ENTRY_TIMESTAMP DESC;
+
+-- Count changes by user profile today
+SELECT
+    USER_NAME,
+    JOURNAL_ENTRY_TYPE,
+    COUNT(*) AS change_count
+FROM TABLE(
+    QSYS2.DISPLAY_JOURNAL(
+        JOURNAL_LIBRARY => 'APPLIB',
+        JOURNAL_NAME    => 'APPJRN',
+        JOURNAL_ENTRY_TYPES => 'PT UP DL',
+        STARTING_TIMESTAMP  => CURRENT DATE,
+        OBJECT_LIBRARY      => 'APPLIB',
+        OBJECT_NAME         => 'ORDMST'
+    )
+) AS J
+GROUP BY USER_NAME, JOURNAL_ENTRY_TYPE
+ORDER BY USER_NAME, JOURNAL_ENTRY_TYPE;
+</pre>
+
+<h2>Remote Journaling for High Availability</h2>
+
+<p>Remote journaling streams journal entries from the production IBM i system to a remote IBM i system over TCP/IP in near-real-time. IBM PowerHA SystemMirror for i, MIMIX, and Maxava all use remote journaling as the data replication transport layer.</p>
+
+<pre>
+/* Add a remote journal — stream APPJRN entries to the standby system */
+ADDRMTJRN JRN(APPLIB/APPJRN) +
+          RMTSYS(STANDBY.COMPANY.COM) +    /* Remote IBM i hostname */
+          RMTJRN(APPLIB/APPJRN) +          /* Journal name on remote system */
+          RMTJRNRCV(APPLIB/RMTRCV0001) +   /* First receiver on remote */
+          DLYMSGSND(*SYNC) +               /* *SYNC = synchronous (zero data loss) */
+                                           /* *ASYNC = asynchronous (better perf) */
+          MSGQSND(APPLIB/HAEVTQ)           /* Notify this message queue on errors */
+
+/* Check remote journal status */
+WRKRMTJRN JRN(APPLIB/APPJRN)
+
+/* SQL view of remote journal replication lag */
+SELECT
+    REMOTE_JOURNAL_LIBRARY,
+    REMOTE_JOURNAL_NAME,
+    REMOTE_SYSTEM,
+    REPLICATION_STATE,
+    REPLICATION_LAG_SECONDS,
+    LAST_SEQUENCE_NUMBER_SENT,
+    LAST_SEQUENCE_NUMBER_APPLIED
+FROM QSYS2.REMOTE_JOURNAL_INFO
+WHERE JOURNAL_LIBRARY = 'APPLIB'
+AND   JOURNAL_NAME    = 'APPJRN';
+</pre>
+
+<p>Synchronous vs asynchronous remote journaling:</p>
+<ul>
+  <li><strong>*SYNC</strong> — a journal entry on the production system is not committed until the remote system confirms receipt. Zero data loss (RPO = 0) but adds network round-trip latency to every write operation. Suitable for zero-RPO requirements over a low-latency LAN or WAN.</li>
+  <li><strong>*ASYNC</strong> — journal entries are sent to the remote system independently of the local commit. Minimal performance impact on production, but a small window of potential data loss (seconds to minutes) if the production system fails before the remote catches up. Suitable for most HA deployments where a small RPO is acceptable.</li>
+</ul>
+
+<h2>QAUDJRN — The Security Audit Journal</h2>
+
+<p>IBM i maintains a special system-level journal named <code>QAUDJRN</code> in <code>QSYS</code>. QAUDJRN records security-relevant events: user sign-ons and sign-offs, authority failures, object create/delete/rename, profile changes, and command execution by privileged users. QAUDJRN is the primary tool for security compliance auditing on IBM i.</p>
+
+<pre>
+/* Enable security auditing — set QAUDLVL system value */
+/* QAUDLVL controls which events are audited system-wide */
+CHGSYSVAL SYSVAL(QAUDLVL) VALUE('*AUTFAIL *CREATE *DELETE *OBJMGT *SECCFG *SYSMGT')
+/* Common values:
+   *AUTFAIL  — authority failures (someone tried and failed to access something)
+   *CREATE   — object creation
+   *DELETE   — object deletion
+   *OBJMGT   — object rename, move, restore
+   *SECCFG   — security configuration changes (profile, authorization list)
+   *SYSMGT   — system management changes
+   *PGMFAIL  — program failures (domain violations, etc.)
+   *JOBBAS   — job start/end                                                  */
+
+/* Enable auditing — QAUDCTL must include *AUDLVL to activate QAUDJRN */
+CHGSYSVAL SYSVAL(QAUDCTL) VALUE('*AUDLVL *OBJAUD *NOQTEMP')
+
+/* Query recent authority failures from QAUDJRN using DISPLAY_JOURNAL */
+SELECT
+    ENTRY_TIMESTAMP,
+    USER_NAME,
+    JOB_NAME,
+    ENTRY_DATA
+FROM TABLE(
+    QSYS2.DISPLAY_JOURNAL(
+        JOURNAL_LIBRARY     => 'QSYS',
+        JOURNAL_NAME        => 'QAUDJRN',
+        JOURNAL_ENTRY_TYPES => 'AF',        -- AF = Authority Failure
+        STARTING_TIMESTAMP  => CURRENT_TIMESTAMP - 7 DAYS
+    )
+) AS AUDIT
+ORDER BY ENTRY_TIMESTAMP DESC
+FETCH FIRST 100 ROWS ONLY;
+
+/* Find all users who signed on in the last 24 hours */
+SELECT
+    ENTRY_TIMESTAMP,
+    USER_NAME,
+    JOB_NAME,
+    ENTRY_DATA
+FROM TABLE(
+    QSYS2.DISPLAY_JOURNAL(
+        JOURNAL_LIBRARY     => 'QSYS',
+        JOURNAL_NAME        => 'QAUDJRN',
+        JOURNAL_ENTRY_TYPES => 'SL',        -- SL = Signon
+        STARTING_TIMESTAMP  => CURRENT_TIMESTAMP - 24 HOURS
+    )
+) AS AUDIT
+ORDER BY ENTRY_TIMESTAMP DESC;
+</pre>
+
+<h2>Journaling Best Practices for 2026</h2>
+
+<ul>
+  <li><strong>Journal all application tables from day one</strong> — retrofitting journaling onto an existing application that uses commitment control is painful; start journaled</li>
+  <li><strong>Use MNGRCV(*SYSTEM)</strong> for most production journals — IBM i manages receiver rotation reliably; only use *USER if you have specific receiver naming or retention requirements</li>
+  <li><strong>Set THRESHOLD to 500 MB or 1 GB</strong> on journal receivers — smaller receivers are easier to save and restore individually, and the chain is easier to manage</li>
+  <li><strong>Save journal receivers to tape/cloud before deleting</strong> — SAVJRNRCV should be part of your save strategy, separate from SAVLIB</li>
+  <li><strong>Monitor QAUDJRN authority failures daily</strong> — a sudden spike in AF entries is a security incident indicator; automate a daily report using QSYS2.DISPLAY_JOURNAL and email it to the security team</li>
+  <li><strong>Use OMTJRNE(*OPNCLO)</strong> — open and close entries add significant volume to high-concurrency journals with no value for recovery or auditing; omit them</li>
+  <li><strong>Test recovery procedures quarterly</strong> — journal-based recovery (APYJRNCHG, remote journal failover) must be tested in a non-production environment; untested recovery procedures fail at the worst possible time</li>
+</ul>
+
+<em>Next post: IBM i IFS Permissions and Security — understanding IFS object authority, *PUBLIC access patterns, CHGAUT and CHGOWN commands, IFS access control lists, symbolic links and their authority implications, setting up secure IFS directory trees for PASE applications, and auditing IFS access with QAUDJRN.</em>

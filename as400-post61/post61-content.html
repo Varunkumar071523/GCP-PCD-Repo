@@ -1,0 +1,311 @@
+<p>The previous post covered IBM i journal management — creating journals and journal receivers with CRTJRN and CRTJRNRCV, starting and ending object journaling with STRJRNOBJ and ENDJRNOBJ, managing the receiver chain with CHGJRN, reading journal entries with DSPJRN and the QSYS2.DISPLAY_JOURNAL SQL table function, configuring remote journaling for high availability, and using the QAUDJRN security audit journal for compliance. This post covers IBM i IFS permissions and security: the IFS authority model versus QSYS.LIB, controlling *PUBLIC access, using CHGAUT and CHGOWN to set permissions and ownership, configuring IFS access control lists, symbolic link authority implications, designing secure PASE application directory trees, and auditing IFS access through QAUDJRN.</p>
+
+<h2>The IBM i IFS Authority Model</h2>
+
+<p>The Integrated File System (IFS) uses a POSIX-style permission model rather than the object authority model used in QSYS.LIB. Every IFS object (file, directory, symbolic link) has three sets of permissions — owner, group, and *PUBLIC — each with read, write, and execute bits. This maps directly to Unix <code>rwxrwxrwx</code> notation.</p>
+
+<p>IBM i IFS authority structure:</p>
+<ul>
+  <li><strong>Owner permissions</strong> — the user profile that owns the object (as set by CHGOWN). Has full control regardless of group or *PUBLIC settings unless explicitly restricted.</li>
+  <li><strong>Group permissions</strong> — apply to members of the primary group profile assigned to the object (CHGPGP). Group authority is evaluated only if the accessing user is not the owner.</li>
+  <li><strong>*PUBLIC permissions</strong> — apply to all other users. The most dangerous setting: if *PUBLIC has read and write access, every user on the system can modify the file.</li>
+  <li><strong>Authorization list</strong> — a named list of user authorities that can be attached to IFS objects via <code>CHGAUT</code> with the <code>DTAAUT(*RWX) OBJAUT(*ALL)</code> syntax. Authorization lists allow consistent authority management across many objects.</li>
+</ul>
+
+<p>The IFS authority model versus QSYS.LIB:</p>
+
+<table>
+  <thead>
+    <tr><th>Feature</th><th>IFS (POSIX model)</th><th>QSYS.LIB (object model)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Authority unit</td><td>Read / Write / Execute bits</td><td>*USE, *CHANGE, *ALL, *EXCLUDE</td></tr>
+    <tr><td>*PUBLIC default</td><td>Configurable per object</td><td>Set by CRTAUT system value</td></tr>
+    <tr><td>Group authority</td><td>Primary group profile</td><td>Group profiles and supplemental groups</td></tr>
+    <tr><td>Audit command</td><td>CHGAUD on object</td><td>CHGAUD on object or CHGOBJAUD</td></tr>
+    <tr><td>Extended ACL</td><td>CHGAUT with *ACL parameter</td><td>EDTOBJAUT for per-user entries</td></tr>
+  </tbody>
+</table>
+
+<h2>Default *PUBLIC Authority and Why It Is a Risk</h2>
+
+<p>When a new directory or file is created in the IFS, its *PUBLIC authority is derived from the <strong>CRTAUT</strong> parameter of the parent directory (set via CHGDIRAUT) or from the system value <code>QCRTAUT</code>. On many IBM i systems, <code>QCRTAUT</code> defaults to <code>*CHANGE</code>, meaning every user on the system has read and write access to every new file unless explicitly restricted.</p>
+
+<pre>
+/* Check the current QCRTAUT system value */
+DSPSYSVAL SYSVAL(QCRTAUT)
+
+/* A value of *CHANGE here means all new IFS objects are world-writable */
+/* Change to *EXCLUDE to make all new objects private by default */
+CHGSYSVAL SYSVAL(QCRTAUT) VALUE('*EXCLUDE')
+
+/* Verify the IFS root directory *PUBLIC authority */
+WRKLNK OBJ('/') DETAIL(*ALL)
+/* Option 5 = Display IFS object attributes including authority */
+
+/* Display authority on a specific IFS directory */
+DSPLNKAUT OBJ('/opt/appdata')
+</pre>
+
+<p>On a typical IBM i system exposed to the internet (running web applications or PASE services), leaving *PUBLIC at *CHANGE on IFS directories is a significant security exposure. Any authenticated IBM i user — including low-privilege service accounts — can read, write, or delete files in those directories. The fix is to lock down *PUBLIC on all application directories and use specific user profile authority instead.</p>
+
+<h2>CHGAUT — Changing IFS Object Authority</h2>
+
+<p><code>CHGAUT</code> (Change Authority) is the primary command for setting IFS object permissions. It controls the data authority (read/write/execute) and the object authority (object management, object alter, object reference) for a specific user or *PUBLIC.</p>
+
+<pre>
+/* Remove all *PUBLIC authority from an application data directory */
+CHGAUT OBJ('/opt/appdata') +
+       USER(*PUBLIC) +
+       DTAAUT(*NONE) +
+       OBJAUT(*NONE) +
+       SUBTREE(*ALL)   /* Apply recursively to all subdirectories and files */
+
+/* Grant the application service account full access */
+CHGAUT OBJ('/opt/appdata') +
+       USER(APPSVCUSR) +
+       DTAAUT(*RWX) +    /* Read, Write, Execute */
+       OBJAUT(*ALL) +
+       SUBTREE(*ALL)
+
+/* Grant a read-only reporting user read access without write */
+CHGAUT OBJ('/opt/appdata/reports') +
+       USER(RPTUSER) +
+       DTAAUT(*RX) +     /* Read + Execute (needed to list directory) */
+       OBJAUT(*NONE)
+
+/* Grant specific PASE group read access to a shared config directory */
+CHGAUT OBJ('/opt/appconf') +
+       USER(APPGRP) +
+       DTAAUT(*RX) +
+       OBJAUT(*NONE) +
+       SUBTREE(*ALL)
+</pre>
+
+<p>The <code>SUBTREE(*ALL)</code> parameter makes CHGAUT recursive — it applies the authority change to the specified object and all objects within it. Without SUBTREE, only the single object is changed. For securing a directory tree, always use SUBTREE(*ALL) in the initial lockdown, then add back specific authorities with individual CHGAUT calls.</p>
+
+<h2>CHGOWN — Changing IFS Object Ownership</h2>
+
+<p><code>CHGOWN</code> (Change Owner) changes the owning user profile of an IFS object. The owner has full control of the object by default. Correct ownership is important for application files: service accounts should own the files they read and write, not the administrator profile that created them.</p>
+
+<pre>
+/* Change the owner of an application directory to the service account */
+CHGOWN OBJ('/opt/appdata') +
+       NEWOWN(APPSVCUSR) +
+       RSTDIRAUT(*YES) +   /* Reset directory authority to match new owner */
+       SUBTREE(*ALL)       /* Apply to all objects in the subtree */
+
+/* Change ownership of a specific configuration file */
+CHGOWN OBJ('/opt/appconf/app.properties') +
+       NEWOWN(APPSVCUSR)
+
+/* Change the primary group for an IFS object */
+CHGPGP OBJ('/opt/appdata') +
+       NEWPGP(APPGRP) +
+       SUBTREE(*ALL)
+
+/* Verify ownership after changes */
+WRKLNK OBJ('/opt/appdata') DETAIL(*ALL)
+/* Column 'Owner' and 'Primary group' should now show APPSVCUSR and APPGRP */
+</pre>
+
+<p>Ownership best practices: application service accounts should own their working directories, log files, and configuration files. The QSYS and QSECOFR profiles should not own application IFS content — if QSECOFR owns a file and a security auditor disables QSECOFR (a common hardening step), the file becomes inaccessible to the application.</p>
+
+<h2>IFS Access Control Lists</h2>
+
+<p>The standard POSIX permission model (owner / group / *PUBLIC) only allows three sets of permissions. For more granular control — for example, giving three different user profiles three different levels of access to the same directory — IBM i supports <strong>Access Control Lists (ACLs)</strong>. ACLs allow individual per-user or per-group permission entries in addition to the standard owner/group/*PUBLIC settings.</p>
+
+<pre>
+/* Add a specific user entry to the ACL of an IFS directory */
+/* This grants AUDITUSER read-only access without changing *PUBLIC */
+CHGAUT OBJ('/opt/appdata/invoices') +
+       USER(AUDITUSER) +
+       DTAAUT(*RX) +
+       OBJAUT(*NONE)
+
+/* Add an authorization list to the IFS object ACL */
+/* First create the authorization list */
+CRTAUTL AUTL(APPAUTL) AUT(*EXCLUDE) TEXT('Application data access list')
+
+/* Add specific users to the authorization list */
+ADDAUTLE AUTL(APPAUTL) USER(APPSVCUSR)  AUT(*CHANGE)
+ADDAUTLE AUTL(APPAUTL) USER(RPTUSER)    AUT(*USE)
+ADDAUTLE AUTL(APPAUTL) USER(AUDITUSER)  AUT(*USE)
+
+/* Attach the authorization list to the IFS directory */
+CHGAUT OBJ('/opt/appdata') +
+       AUTL(APPAUTL) +
+       SUBTREE(*ALL)
+
+/* Display the full ACL for an IFS object */
+DSPLNKAUT OBJ('/opt/appdata/invoices')
+/* Shows all individual ACL entries, owner, group, and *PUBLIC */
+
+/* SQL alternative — query IFS object authority */
+SELECT OBJECT_NAME, USER_NAME, DATA_AUTHORITY, OBJECT_AUTHORITY
+FROM   QSYS2.IFS_OBJECT_STATISTICS
+WHERE  PATH_NAME LIKE '/opt/appdata%'
+ORDER BY OBJECT_NAME, USER_NAME;
+</pre>
+
+<h2>CHGDIRAUT — Inheriting Authority on New Objects</h2>
+
+<p>By default, when a new file is created inside a directory, it inherits the <code>QCRTAUT</code> system value. <code>CHGDIRAUT</code> (Change Directory Authority) overrides this for a specific directory, so all new objects created within that directory inherit a specific *PUBLIC authority setting instead of the system default.</p>
+
+<pre>
+/* Set the directory's creation authority for new objects */
+/* Any file created inside /opt/appdata will have *PUBLIC = *NONE */
+CHGDIRAUT DIR('/opt/appdata') +
+           DTAAUT(*NONE) +   /* New objects: *PUBLIC data authority */
+           OBJAUT(*NONE)     /* New objects: *PUBLIC object authority */
+
+/* Set read-only creation authority for a shared staging directory */
+CHGDIRAUT DIR('/opt/staging') +
+           DTAAUT(*RX) +
+           OBJAUT(*NONE)
+
+/* Verify the creation authority setting */
+WRKLNK OBJ('/opt/appdata') DETAIL(*ALL)
+/* The 'CRTAUT' field in the directory attributes shows the inherited setting */
+</pre>
+
+<p>CHGDIRAUT is a one-time setup step: run it after creating each application directory and before any application files are created in it. This ensures that files created programmatically by the application (log files, report output, uploaded files) automatically have the correct *PUBLIC authority without requiring manual CHGAUT calls after each creation.</p>
+
+<h2>Symbolic Links and Their Authority Implications</h2>
+
+<p>Symbolic links (symlinks) in the IFS can create unexpected authority bypass scenarios. A symlink is a pointer to another IFS object. The authority checked when accessing an object <em>through</em> a symlink is the authority on the <strong>target</strong> object, not the symlink itself. This means:</p>
+
+<ul>
+  <li>If <code>/opt/appdata/config</code> is a symlink to <code>/QOpenSys/etc/passwd</code>, a user with read access to <code>/opt/appdata</code> can read the target even if they have no authority to <code>/QOpenSys/etc/passwd</code> directly — as long as the target grants them access.</li>
+  <li>Conversely, a symlink pointing to a restricted target does not grant extra access: authority is still evaluated against the target object.</li>
+  <li>The symlink itself has its own authority. Creating a symlink requires write access to the parent directory. Deleting a symlink requires write access to the parent directory (not the target).</li>
+</ul>
+
+<pre>
+/* Create a symbolic link */
+/* ADDLNK is the IBM i command for creating IFS symlinks */
+ADDLNK OBJ('/opt/sharedlib/libcommon.so') +
+       NEWLNK('/opt/appdata/lib/libcommon.so') +
+       LNKTYPE(*SYMBOLIC)
+
+/* List symbolic links in a directory — shows the target path */
+WRKLNK OBJ('/opt/appdata/lib/*') DETAIL(*ALL)
+/* Objects with LNKTYPE = *SYMBOLIC show the target in the detail */
+
+/* Remove a symbolic link (does NOT delete the target) */
+RMVLNK OBJLNK('/opt/appdata/lib/libcommon.so')
+
+/* Security scan: find all symlinks in an application directory tree */
+/* Run from a PASE shell */
+find /opt/appdata -type l -ls 2>/dev/null
+/* Review each symlink target for unexpected authority implications */
+</pre>
+
+<p>Security rule: audit all symlinks in application IFS directories during security reviews. A malicious symlink pointing from an application's data directory to a sensitive system file is a classic privilege escalation technique. Use QAUDJRN entry type <code>LK</code> (link operations) to detect unexpected symlink creation.</p>
+
+<h2>Setting Up Secure IFS Directory Trees for PASE Applications</h2>
+
+<p>A well-structured PASE application should have its IFS directory tree organised by access pattern, with each directory's authority tightly scoped. The following example shows a production-ready IFS directory structure for a Node.js application running in PASE:</p>
+
+<pre>
+/* Step 1: Create the top-level application directory tree */
+MKDIR DIR('/opt/nodeapp')
+MKDIR DIR('/opt/nodeapp/app')     /* Application source code */
+MKDIR DIR('/opt/nodeapp/config')  /* Configuration files */
+MKDIR DIR('/opt/nodeapp/logs')    /* Application log output */
+MKDIR DIR('/opt/nodeapp/data')    /* Working data files */
+MKDIR DIR('/opt/nodeapp/uploads') /* User-uploaded files */
+
+/* Step 2: Set *PUBLIC to *NONE on all directories */
+CHGAUT OBJ('/opt/nodeapp') USER(*PUBLIC) DTAAUT(*NONE) OBJAUT(*NONE) SUBTREE(*ALL)
+
+/* Step 3: Set correct ownership */
+CHGOWN OBJ('/opt/nodeapp') NEWOWN(NODEAPP) SUBTREE(*ALL)
+
+/* Step 4: Grant the Node.js service account full access to its own directories */
+CHGAUT OBJ('/opt/nodeapp/app')     USER(NODEAPP) DTAAUT(*RX)  OBJAUT(*NONE)
+CHGAUT OBJ('/opt/nodeapp/config')  USER(NODEAPP) DTAAUT(*RX)  OBJAUT(*NONE)
+CHGAUT OBJ('/opt/nodeapp/logs')    USER(NODEAPP) DTAAUT(*RWX) OBJAUT(*NONE)
+CHGAUT OBJ('/opt/nodeapp/data')    USER(NODEAPP) DTAAUT(*RWX) OBJAUT(*NONE)
+CHGAUT OBJ('/opt/nodeapp/uploads') USER(NODEAPP) DTAAUT(*RWX) OBJAUT(*NONE)
+
+/* Step 5: Set directory creation authorities so new files inherit *NONE */
+CHGDIRAUT DIR('/opt/nodeapp/logs')    DTAAUT(*NONE) OBJAUT(*NONE)
+CHGDIRAUT DIR('/opt/nodeapp/data')    DTAAUT(*NONE) OBJAUT(*NONE)
+CHGDIRAUT DIR('/opt/nodeapp/uploads') DTAAUT(*NONE) OBJAUT(*NONE)
+
+/* Step 6: Grant the operations team read access to logs */
+CHGAUT OBJ('/opt/nodeapp/logs') USER(OPSGRP) DTAAUT(*RX) OBJAUT(*NONE)
+
+/* Step 7: Restrict execute bit on config files (config files should not be executable) */
+CHGAUT OBJ('/opt/nodeapp/config/app.env') USER(NODEAPP) DTAAUT(*R) OBJAUT(*NONE)
+</pre>
+
+<h2>Auditing IFS Access with QAUDJRN</h2>
+
+<p>IBM i can audit IFS object access events through QAUDJRN just like QSYS.LIB object access. To enable IFS auditing, set the CHGAUD attribute on the IFS object and ensure QAUDJRN is active with the correct QAUDLVL values.</p>
+
+<pre>
+/* Enable auditing on a sensitive IFS directory for all access */
+/* CHGAUD works on IFS objects just like QSYS.LIB objects */
+CHGAUD OBJ('/opt/nodeapp/config') +
+        OBJAUD(*ALL) +     /* Audit all access attempts (read + write + failure) */
+        SUBTREE(*ALL)
+
+/* Enable only failure auditing to reduce volume */
+CHGAUD OBJ('/opt/nodeapp/uploads') +
+        OBJAUD(*FAILURE) +
+        SUBTREE(*ALL)
+
+/* Ensure QAUDLVL includes *OBJRW (object read/write access auditing) */
+CHGSYSVAL SYSVAL(QAUDLVL) VALUE('*AUTFAIL *CREATE *DELETE *OBJMGT *OBJRW *SECCFG')
+
+/* Query QAUDJRN for IFS access failures in the last 24 hours */
+SELECT
+    ENTRY_TIMESTAMP,
+    USER_NAME,
+    JOB_NAME,
+    ENTRY_DATA
+FROM TABLE(
+    QSYS2.DISPLAY_JOURNAL(
+        JOURNAL_LIBRARY     => 'QSYS',
+        JOURNAL_NAME        => 'QAUDJRN',
+        JOURNAL_ENTRY_TYPES => 'AF',       -- AF = Authority Failure
+        STARTING_TIMESTAMP  => CURRENT_TIMESTAMP - 24 HOURS
+    )
+) AS AUDIT
+WHERE JSON_VALUE(ENTRY_DATA, '$.OBJECT_NAME') LIKE '/opt/nodeapp%'
+ORDER BY ENTRY_TIMESTAMP DESC;
+
+/* Query for IFS object deletions (entry type DS = Delete/Remove) */
+SELECT
+    ENTRY_TIMESTAMP,
+    USER_NAME,
+    JOB_NAME,
+    ENTRY_DATA
+FROM TABLE(
+    QSYS2.DISPLAY_JOURNAL(
+        JOURNAL_LIBRARY     => 'QSYS',
+        JOURNAL_NAME        => 'QAUDJRN',
+        JOURNAL_ENTRY_TYPES => 'DS',
+        STARTING_TIMESTAMP  => CURRENT_TIMESTAMP - 7 DAYS
+    )
+) AS AUDIT
+ORDER BY ENTRY_TIMESTAMP DESC
+FETCH FIRST 200 ROWS ONLY;
+</pre>
+
+<h2>IFS Security Best Practices for 2026</h2>
+
+<ul>
+  <li><strong>Change QCRTAUT to *EXCLUDE</strong> — this is the single most impactful system-wide IFS security setting; it makes all new IFS objects private by default and forces explicit authority grants</li>
+  <li><strong>Audit *PUBLIC = *CHANGE on application directories</strong> — run a weekly SQL query against QSYS2.IFS_OBJECT_STATISTICS to find directories where *PUBLIC has write access; this is common in legacy PASE deployments</li>
+  <li><strong>Use dedicated service accounts per application</strong> — each PASE application (Node.js, Python, Java) should have its own low-privilege user profile; never run application processes as QSECOFR</li>
+  <li><strong>Apply CHGDIRAUT to all writable application directories</strong> — prevents new log files and data files from inheriting permissive *PUBLIC settings from the system default</li>
+  <li><strong>Audit symlinks during security reviews</strong> — scan all application IFS directories for unexpected symbolic links that could create authority bypass paths</li>
+  <li><strong>Enable QAUDJRN *OBJRW auditing on sensitive directories</strong> — configuration directories, credential files, and key stores should have full access auditing enabled; review the audit log weekly</li>
+  <li><strong>Use authorization lists for multi-application shared directories</strong> — CRTAUTL and ADDAUTLE provide a single management point for authority to shared IFS directories; changes to the authorization list immediately affect all attached objects</li>
+  <li><strong>Do not store credentials as world-readable IFS files</strong> — API keys, database passwords, and TLS private keys stored in <code>/home/user/.env</code> files with *PUBLIC read access are a frequent source of credential exposure on IBM i PASE applications</li>
+</ul>
+
+<em>Next post: IBM i RPG Subfile Programming — designing subfile and subfile control record formats in DDS, the SFLPAG and SFLSIZ relationship, loading subfile records with WRITE in a loop, displaying subfiles with SFLDSP and SFLDSPCTL, implementing page-up and page-down paging logic in free-format RPG, handling option codes, and positioning the cursor with SFLRCDNBR.</em>

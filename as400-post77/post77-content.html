@@ -1,0 +1,289 @@
+<p>The previous post covered DB2 for i common table expressions and recursive SQL — the WITH clause for non-recursive CTEs, chaining multiple CTEs for readable multi-step queries, recursive CTEs with anchor and recursive members, bill-of-materials traversal, organisational hierarchy queries, and cycle detection in self-referencing data on IBM i. This post covers IBM i output queue and print management: the output queue object model, creating and configuring output queues with CRTOUTQ and CHGOUTQ, working with spooled files using WRKOUTQ and WRKSPLF, moving, holding, releasing, and deleting spooled files, copying spooled files to PDF with IBM i Transform Services, sending spooled files to remote systems with SNDNETSPLF, and managing printer writers with STRPRTWTR and ENDWTR on IBM i in 2026.</p>
+
+<h2>IBM i Print Architecture: Output Queues, Spooled Files, and Writers</h2>
+
+<p>IBM i print processing uses a three-stage pipeline. Understanding all three stages is essential for troubleshooting why a report is not printing, how to redirect output to a different printer, or how to convert a spooled file to PDF for email delivery.</p>
+
+<ol>
+  <li><strong>Spooled file generation</strong> — an RPG or CL program writes to a printer file (<code>*PRTF</code> device). Instead of going directly to a printer, the output is captured as a <strong>spooled file</strong> (SPLF) in an output queue. The spooled file contains the SCS or IPDS print data stream.</li>
+  <li><strong>Output queue</strong> (<code>*OUTQ</code>) — a queue object that holds spooled files waiting to be printed. Every output queue has attributes controlling which printer writer it feeds, whether output is held automatically, and access authority.</li>
+  <li><strong>Printer writer job</strong> — a system job (<code>QSPL</code> subsystem) that reads spooled files from an output queue and sends the print data stream to a physical printer or print server. The writer is the bridge between the output queue and the device.</li>
+</ol>
+
+<table>
+  <tr>
+    <th>Object</th>
+    <th>Type</th>
+    <th>Created by</th>
+    <th>Manages</th>
+  </tr>
+  <tr>
+    <td>Printer device description</td>
+    <td>*DEVD</td>
+    <td>CRTDEVPRT</td>
+    <td>Physical or virtual printer connection</td>
+  </tr>
+  <tr>
+    <td>Output queue</td>
+    <td>*OUTQ</td>
+    <td>CRTOUTQ</td>
+    <td>Holds spooled files; feeds a writer</td>
+  </tr>
+  <tr>
+    <td>Printer writer job</td>
+    <td>System job</td>
+    <td>STRPRTWTR</td>
+    <td>Reads from OUTQ, sends to printer</td>
+  </tr>
+  <tr>
+    <td>Spooled file</td>
+    <td>*SPLF (inside *OUTQ)</td>
+    <td>Program writing to *PRTF</td>
+    <td>One print job's output data</td>
+  </tr>
+</table>
+
+<h2>Creating and Configuring Output Queues: CRTOUTQ, CHGOUTQ</h2>
+
+<pre>
+/* Create an output queue for the accounts payable printer */
+CRTOUTQ OUTQ(APPLIB/APPRINTS) +
+        MAXPAGES(*NOMAX) +
+        OPRCTL(*YES) +       /* Operators can work with this queue */
+        DSPOPTS(*YES) +      /* Users can display options */
+        AUTCHK(*DTAAUT) +    /* Use data authority for access control */
+        SEQ(*FIFO) +         /* Print in arrival sequence */
+        WRTSEP(*FILE) +      /* Print a separator page between spooled files */
+        TEXT('AP department printer output queue')
+
+/* Create a hold queue — all spooled files arrive held, must be released manually */
+CRTOUTQ OUTQ(APPLIB/HELDQ) +
+        HOLD(*YES) +         /* All spooled files arrive in HLD status */
+        MAXPAGES(*NOMAX) +
+        TEXT('Held output queue for management approval before printing')
+
+/* Change an output queue — disable automatic printing (disconnect from writer) */
+CHGOUTQ OUTQ(APPLIB/APPRINTS) +
+        PTRDVCNAM(*NONE)     /* Detach from any writer — files accumulate until writer starts */
+
+/* Change queue to automatically print to a specific printer */
+CHGOUTQ OUTQ(APPLIB/APPRINTS) +
+        PTRDVCNAM(PRT_AP01)  /* Attach to printer device PRT_AP01 */
+
+/* Display output queue attributes */
+DSPOUTQ OUTQ(APPLIB/APPRINTS)
+
+/* Delete an output queue — fails if it contains spooled files */
+DLTOUTQ OUTQ(APPLIB/OLDQ)
+</pre>
+
+<h2>Working with Spooled Files: WRKOUTQ and WRKSPLF</h2>
+
+<p><code>WRKOUTQ</code> is the primary 5250 interactive command for managing an output queue and its spooled files. <code>WRKSPLF</code> shows spooled files across all output queues — useful for finding a specific user's reports.</p>
+
+<pre>
+/* Work with a specific output queue — shows all spooled files */
+WRKOUTQ OUTQ(APPLIB/APPRINTS)
+/* Options available on each spooled file entry:
+   1=Send    2=Change    3=Hold    4=Delete    5=Display
+   6=Release 7=Message   8=Attributes  9=Work with printer
+*/
+
+/* Work with all spooled files for the current user */
+WRKSPLF
+
+/* Work with all spooled files for a specific user on a specific queue */
+WRKSPLF SELECT(DEVUSER *ALL APPLIB/APPRINTS)
+
+/* Work with all spooled files in RDY (ready to print) status */
+WRKSPLF SELECT(*ALL *ALL *ALL *ALL RDY)
+
+/* Display the contents of a spooled file (pageable on screen) */
+DSPSPLF FILE(QPRINT) JOB(123456/DEVUSER/RPTJOB)
+
+/* Display spooled file contents and convert to printable output */
+DSPSPLF FILE(INVOICERPT) SPLNBR(3)
+</pre>
+
+<h2>Spooled File Operations: Hold, Release, Move, Copy, Delete</h2>
+
+<pre>
+/* Hold a spooled file — stops it from printing, keeps it in the queue */
+HLDSPLF FILE(INVOICERPT) JOB(123456/DEVUSER/INVJOB) SPLNBR(1)
+
+/* Hold all spooled files in an output queue */
+HLDSPLF FILE(*ALL) JOB(*ALL) SPLNBR(*ALL) OUTQ(APPLIB/APPRINTS)
+
+/* Release a held spooled file — moves it back to RDY status */
+RLSSPLF FILE(INVOICERPT) JOB(123456/DEVUSER/INVJOB) SPLNBR(1)
+
+/* Change spooled file attributes — redirect to a different output queue */
+CHGSPLFA FILE(INVOICERPT) JOB(123456/DEVUSER/INVJOB) SPLNBR(1) +
+          OUTQ(APPLIB/MGMTQ)   /* Move to management approval queue */
+
+/* Change copies, priority, and form type */
+CHGSPLFA FILE(SALESRPT) JOB(*) SPLNBR(*LAST) +
+          COPIES(3) +
+          OUTPTY(1) +          /* Priority 1 = highest */
+          FORMTYPE(LETTER)
+
+/* Copy a spooled file to a different output queue (preserves original) */
+CPYSPLF FILE(MONTHLYSUM) TOFILE(*SAME) +
+        JOB(123456/DEVUSER/SUMJOB) SPLNBR(1) +
+        TOOUTQ(APPLIB/ARCHIVEQ)
+
+/* Copy spooled file to a physical file member for programmatic processing */
+CPYSPLF FILE(CUSTLIST) TOFILE(APPLIB/PRTDATA) +
+        JOB(123456/DEVUSER/LISTJOB) SPLNBR(1) +
+        TOMBR(CUSTLIST0718)
+
+/* Delete a single spooled file */
+DLTSPLF FILE(INVOICERPT) JOB(123456/DEVUSER/INVJOB) SPLNBR(1)
+
+/* Delete all spooled files older than 7 days (CL loop pattern) */
+PGM
+DCL VAR(&CUTDATE) TYPE(*CHAR) LEN(10)
+/* Calculate cutoff date using QCMD or date arithmetic */
+/* Then use WRKSPLF with OUTPUT(*OUTFILE) and delete based on creation date */
+/* Or use the QSPOPNSP / QSPRJOBF API for programmatic spooled file selection */
+ENDPGM
+</pre>
+
+<h2>Converting Spooled Files to PDF: IBM i Transform Services</h2>
+
+<p>IBM i Transform Services (part of the IBM i operating system, no additional licence required) can convert SCS and AFPDS spooled files to PDF directly on the IBM i. The result is written to the IFS as a PDF stream file, ready for email attachment or download.</p>
+
+<pre>
+/* Convert a spooled file to PDF in the IFS using Transform Services */
+/* TRANSFORM command is available from the IBM i print subsystem */
+
+/* Method 1: Use CRTPDF (Create PDF) — available on IBM i 7.3+ */
+CRTPDF FROMFILE(INVOICERPT) FROMJOB(123456/DEVUSER/INVJOB) +
+       FROMSPLNBR(1) +
+       TOSTREAM('/home/batch/pdf/invoice_' *CAT &INVNO *CAT '.pdf') +
+       TOFMT(*PDF)
+
+/* Method 2: Change the spooled file's output queue to a PDF-producing queue
+   (configure an output queue to use an IBM i PDF transform writer) */
+
+/* Method 3: Use the QSPTGETF (Spool Get File) API or the iText / Apache PDFBox
+   library in PASE — for programmatic PDF generation with custom formatting */
+
+/* CL program pattern: generate and email a spooled file as PDF */
+PGM PARM(&INVNO)
+
+DCL VAR(&INVNO)   TYPE(*CHAR) LEN(10)
+DCL VAR(&PDFPATH) TYPE(*CHAR) LEN(256)
+DCL VAR(&SPLF)    TYPE(*CHAR) LEN(10)  VALUE('INVOICERPT')
+
+CHGVAR VAR(&PDFPATH) VALUE('/home/batch/pdf/inv_' *CAT &INVNO *CAT '.pdf')
+
+/* Run the RPG program that generates the spooled file */
+CALL PGM(ARLIB/PRCINVOICE) PARM(&INVNO)
+
+/* Convert the last spooled file written by this job to PDF */
+CRTPDF FROMFILE(*SPLF &SPLF) FROMJOB(*) FROMSPLNBR(*LAST) +
+       TOSTREAM(&PDFPATH) TOFMT(*PDF)
+
+/* Send the PDF via email using SNDDST or a custom SMTP program */
+CALL PGM(APPLIB/SNDEMAILPDF) PARM(&PDFPATH &INVNO)
+
+ENDPGM
+</pre>
+
+<h2>Sending Spooled Files Over the Network: SNDNETSPLF</h2>
+
+<p><code>SNDNETSPLF</code> (Send Network Spooled File) transmits a spooled file to an output queue on a remote IBM i system using DDM or SNA distribution services. This is the traditional mechanism for routing printed output to a remote IBM i site — for example, sending invoices from the head office IBM i to a branch office IBM i for local printing.</p>
+
+<pre>
+/* Send a spooled file to an output queue on a remote IBM i */
+SNDNETSPLF FILE(INVOICERPT) JOB(123456/DEVUSER/INVJOB) SPLNBR(1) +
+            TOUSRID(BRANCHOP *BRANCH01) +   /* User on remote system */
+            TOOUTQ(APPLIB/BRANCHQ)
+
+/* Send to a user's message queue (they receive a message with the spooled file) */
+SNDNETSPLF FILE(MONTHRPT) JOB(*) SPLNBR(*LAST) +
+            TOUSRID(MGRNORTHON *SYSTEM)
+
+/* For internet-based delivery (email), use SNDSMTPEMM or a custom SMTP CL program */
+/* SNDSMTPEMM can attach the PDF generated by CRTPDF */
+SNDSMTPEMM RCP(('manager@company.com' *TO)) +
+           SUBJECT('Monthly Report - July 2026') +
+           NOTE('Please find the monthly report attached.') +
+           ATTACH(('/home/batch/pdf/monthly_july_2026.pdf' *PDF))
+</pre>
+
+<h2>Managing Printer Writers: STRPRTWTR, ENDWTR, WRKWTR</h2>
+
+<p>A <strong>printer writer job</strong> is the system process that takes spooled files from an output queue and sends them to a printer. Writers run in the <code>QSPL</code> subsystem. Starting, stopping, and adjusting writers is a core IBM i operator task.</p>
+
+<pre>
+/* Start a printer writer for a specific printer device */
+STRPRTWTR DEV(PRT_AP01) +
+          OUTQ(APPLIB/APPRINTS) +  /* Read from this output queue */
+          FORMTYPE(*ALL) +         /* Print all form types */
+          FILESEP(1) +             /* 1 separator page between files */
+          WTRSEP(*FIRST) +         /* Separator at start of each file */
+          MSGQ(APPLIB/PRTOPRQ)     /* Send operator messages to this queue */
+
+/* Start a writer using the default printer output queue */
+STRPRTWTR DEV(PRT_AP01)
+
+/* Work with all active printer writers */
+WRKWTR TYPE(*PRT)
+
+/* Hold a writer — pauses printing at the end of the current page */
+HLDWTR WTR(PRT_AP01)
+
+/* Release a held writer */
+RLSWTR WTR(PRT_AP01)
+
+/* End a writer — wait for the current spooled file to finish */
+ENDWTR WTR(PRT_AP01) OPTION(*CNTRLD)
+
+/* End a writer immediately — interrupts mid-file */
+ENDWTR WTR(PRT_AP01) OPTION(*IMMED)
+
+/* Change the output queue a writer reads from (reroute output) */
+CHGWTR WTR(PRT_AP01) OUTQ(APPLIB/TEMPQ)
+
+/* Start the QSPL subsystem if it is not active (required for writers) */
+STRSBS SBSD(QSYS/QSPL)
+</pre>
+
+<h2>Automating Spooled File Management from CL</h2>
+
+<p>Production environments often need automated housekeeping: deleting spooled files older than a retention period, automatically converting critical reports to PDF, or monitoring output queues for stalled files. Here is a CL program that purges old spooled files from a queue using the <code>QSYS2.OUTPUT_QUEUE_ENTRIES</code> table function.</p>
+
+<pre>
+/* Query spooled file metadata using the SQL table function */
+SELECT JOB_NAME, FILE_NAME, SPOOLED_FILE_NUMBER,
+       STATUS, CREATE_TIMESTAMP,
+       DAYS_BETWEEN(CURRENT_DATE, DATE(CREATE_TIMESTAMP)) AS AGE_DAYS
+FROM TABLE(QSYS2.OUTPUT_QUEUE_ENTRIES(
+    OUTPUT_QUEUE_LIBRARY => 'APPLIB',
+    OUTPUT_QUEUE_NAME    => 'APPRINTS'
+)) A
+WHERE STATUS IN ('RDY', 'HLD')
+  AND DAYS_BETWEEN(CURRENT_DATE, DATE(CREATE_TIMESTAMP)) > 30
+ORDER BY CREATE_TIMESTAMP;
+
+/* Use the result to drive a CL deletion loop — or use DLTSPLF directly */
+/* For large-scale cleanup, WRKSPLF SELECT(...) OUTPUT(*OUTFILE)
+   writes to a database file; process with a CL program */
+
+/* CL: delete spooled files for a specific job that have already printed */
+PGM PARM(&JOBNAME)
+DCL VAR(&JOBNAME) TYPE(*CHAR) LEN(26)
+
+OVRDBF FILE(QPDSPFFD) TOFILE(QTEMP/SPLINFO) MBR(*FIRST)
+WRKSPLF SELECT(&JOBNAME) OUTPUT(*OUTFILE) OUTFILE(QTEMP/SPLINFO)
+
+/* Loop through QTEMP/SPLINFO and delete each entry with status = OPN (printed) */
+/* Use CPYFRMQRYF or RPG program to process the outfile */
+
+DLTOVR FILE(QPDSPFFD)
+ENDPGM
+</pre>
+
+<em>Next post: IBM MQ messaging from IBM i — creating queue managers and local queues, setting up sender and receiver channels for point-to-point messaging, sending and receiving persistent messages with MQPUT and MQGET from RPG programs, configuring MQ Triggering to start IBM i jobs on message arrival, handling dead letter queues, and monitoring MQ activity with AMQSPUT and AMQSGET on IBM i in 2026.</em>

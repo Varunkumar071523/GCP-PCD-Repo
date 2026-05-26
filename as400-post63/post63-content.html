@@ -1,0 +1,370 @@
+<p>The previous post covered IBM i RPG subfile programming — designing SFL and SFLCTL record formats in DDS, the SFLPAG and SFLSIZ relationship, loading subfile records with WRITE in a loop using an embedded SQL cursor, displaying and clearing with SFLDSP and SFLDSPCTL indicator control, processing user input with READC, page-at-a-time paging logic, and cursor positioning with SFLRCDNBR. This post covers DB2 for i CTEs and recursive SQL: the WITH clause syntax, chaining multiple CTEs, using CTEs in UPDATE and DELETE statements, traversing hierarchical data with WITH RECURSIVE, BOM explosion, organisational hierarchy queries, cycle detection, and CTE performance considerations on IBM i in 2026.</p>
+
+<h2>What Is a CTE and Why Use One?</h2>
+
+<p>A <strong>Common Table Expression (CTE)</strong> is a named, temporary result set defined with the <code>WITH</code> clause at the start of a SELECT, INSERT, UPDATE, or DELETE statement. The CTE exists only for the duration of the single SQL statement in which it is defined — it is not stored as a view or a table.</p>
+
+<p>CTEs improve SQL maintainability in three concrete ways:</p>
+<ul>
+  <li><strong>Readability</strong> — a complex nested subquery becomes a named, readable step; future developers can read the WITH clause to understand each logical stage of the query</li>
+  <li><strong>Reuse within a statement</strong> — the same CTE can be referenced multiple times in the main query without repeating the subquery logic</li>
+  <li><strong>Recursive traversal</strong> — only CTEs (not subqueries or derived tables) support the WITH RECURSIVE syntax for traversing trees and graphs</li>
+</ul>
+
+<p>A CTE is not automatically better than a derived table or a view for performance — the DB2 for i query optimiser (SQE) may materialise or inline a CTE depending on complexity. Understanding when CTEs help and when they are neutral is part of writing good SQL on IBM i.</p>
+
+<h2>Basic CTE Syntax</h2>
+
+<p>The simplest form: a single CTE used to avoid repeating a subquery:</p>
+
+<pre>
+-- Find customers whose total order value exceeds their credit limit
+-- Without CTE: nested subquery in WHERE clause is hard to read
+-- With CTE: each step is named and readable
+
+WITH OrderTotals AS (
+    SELECT
+        CUSNO,
+        SUM(ORDAMT) AS total_ordered
+    FROM ORDLIB.ORDMST
+    WHERE ORDSTS NOT IN ('X', 'C')    -- Exclude cancelled orders
+    GROUP BY CUSNO
+)
+SELECT
+    C.CUSNO,
+    C.CUSNAM,
+    C.CRDLMT,
+    OT.total_ordered,
+    OT.total_ordered - C.CRDLMT AS over_limit_amount
+FROM   ORDLIB.CUSTMST  C
+JOIN   OrderTotals     OT ON OT.CUSNO = C.CUSNO
+WHERE  OT.total_ordered > C.CRDLMT
+ORDER BY over_limit_amount DESC;
+</pre>
+
+<h2>Chaining Multiple CTEs</h2>
+
+<p>Multiple CTEs can be chained in a single WITH clause, separated by commas. Each CTE can reference any CTE defined before it in the chain. This is the primary technique for breaking a complex multi-step analytical query into readable stages:</p>
+
+<pre>
+-- Monthly sales summary with rank and running total
+-- Step 1: raw order totals by month and region
+-- Step 2: rank each region within each month
+-- Step 3: running total across months
+
+WITH MonthlySales AS (
+    SELECT
+        YEAR(ORDDAT)  AS sale_year,
+        MONTH(ORDDAT) AS sale_month,
+        REGION,
+        SUM(ORDAMT)   AS monthly_total
+    FROM   SALESLIB.ORDMST
+    WHERE  ORDSTS = 'C'              -- Completed orders only
+    AND    ORDDAT >= DATE('2026-01-01')
+    GROUP BY YEAR(ORDDAT), MONTH(ORDDAT), REGION
+),
+RankedSales AS (
+    SELECT
+        sale_year,
+        sale_month,
+        REGION,
+        monthly_total,
+        RANK() OVER (
+            PARTITION BY sale_year, sale_month
+            ORDER BY monthly_total DESC
+        ) AS region_rank
+    FROM MonthlySales
+),
+RunningTotal AS (
+    SELECT
+        sale_year,
+        sale_month,
+        REGION,
+        monthly_total,
+        region_rank,
+        SUM(monthly_total) OVER (
+            PARTITION BY REGION
+            ORDER BY sale_year, sale_month
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS running_total
+    FROM RankedSales
+)
+SELECT
+    sale_year,
+    sale_month,
+    REGION,
+    monthly_total,
+    region_rank,
+    DECIMAL(running_total, 15, 2) AS running_total
+FROM RunningTotal
+WHERE region_rank <= 3            -- Top 3 regions per month only
+ORDER BY sale_year, sale_month, region_rank;
+</pre>
+
+<p>This query has three logical stages — aggregation, ranking, running total — each expressed as a named CTE. The final SELECT is a simple filter and sort. Without CTEs, this would require three levels of nested derived tables, which are significantly harder to read and debug.</p>
+
+<h2>CTEs in UPDATE and DELETE Statements</h2>
+
+<p>CTEs can be used in DML statements (UPDATE, DELETE, INSERT) on DB2 for i. This is useful when the filter condition for the DML requires a complex multi-table join or aggregation that is cleaner as a CTE than as a correlated subquery.</p>
+
+<pre>
+-- Mark orders as 'H' (Hold) for customers who have exceeded their credit limit
+WITH OverLimitCustomers AS (
+    SELECT
+        C.CUSNO
+    FROM   ORDLIB.CUSTMST  C
+    JOIN   (SELECT CUSNO, SUM(ORDAMT) AS total_open
+            FROM   ORDLIB.ORDMST
+            WHERE  ORDSTS = 'O'
+            GROUP BY CUSNO) OT ON OT.CUSNO = C.CUSNO
+    WHERE  OT.total_open > C.CRDLMT
+)
+UPDATE ORDLIB.ORDMST
+SET    ORDSTS = 'H',
+       HLDDAT = CURRENT DATE
+WHERE  ORDSTS = 'O'
+AND    CUSNO IN (SELECT CUSNO FROM OverLimitCustomers);
+
+-- Delete old audit log rows older than 90 days, but keep at least
+-- one row per user as the most recent record (using CTE to identify keepers)
+WITH LatestAudit AS (
+    SELECT
+        USER_NAME,
+        MAX(AUDIT_TIMESTAMP) AS latest_ts
+    FROM APPLIB.AUDITLOG
+    GROUP BY USER_NAME
+)
+DELETE FROM APPLIB.AUDITLOG AL
+WHERE  AL.AUDIT_TIMESTAMP < CURRENT_TIMESTAMP - 90 DAYS
+AND    NOT EXISTS (
+    SELECT 1
+    FROM   LatestAudit LA
+    WHERE  LA.USER_NAME  = AL.USER_NAME
+    AND    LA.latest_ts  = AL.AUDIT_TIMESTAMP
+);
+</pre>
+
+<h2>WITH RECURSIVE — Traversing Hierarchical Data</h2>
+
+<p>The <code>WITH RECURSIVE</code> syntax allows a CTE to reference itself, enabling traversal of tree and graph structures stored in a parent-child relationship. DB2 for i has supported recursive CTEs since IBM i 7.1. The recursive CTE has two mandatory parts joined by UNION ALL:</p>
+<ol>
+  <li><strong>Anchor member</strong> — the non-recursive starting point (the root of the tree)</li>
+  <li><strong>Recursive member</strong> — the part that references the CTE itself to walk one level deeper</li>
+</ol>
+
+<pre>
+-- Employee organisational hierarchy
+-- Table: APPLIB.EMPORG (EMPNO, EMPNAM, MGRNO, DEPT, SALARY)
+-- MGRNO references EMPNO of the employee's manager; top-level managers have MGRNO = 0
+
+WITH RECURSIVE OrgTree (
+    EMPNO, EMPNAM, MGRNO, DEPT, SALARY, LEVEL, PATH
+) AS (
+    -- Anchor: start with the CEO (no manager)
+    SELECT
+        EMPNO,
+        EMPNAM,
+        MGRNO,
+        DEPT,
+        SALARY,
+        0                                   AS LEVEL,
+        CAST(EMPNAM AS VARCHAR(500))        AS PATH
+    FROM APPLIB.EMPORG
+    WHERE MGRNO = 0
+
+    UNION ALL
+
+    -- Recursive member: join each employee to their manager row
+    SELECT
+        E.EMPNO,
+        E.EMPNAM,
+        E.MGRNO,
+        E.DEPT,
+        E.SALARY,
+        OT.LEVEL + 1,
+        OT.PATH CONCAT ' > ' CONCAT E.EMPNAM
+    FROM   APPLIB.EMPORG  E
+    JOIN   OrgTree         OT ON OT.EMPNO = E.MGRNO
+)
+SELECT
+    LEVEL,
+    REPEAT('  ', LEVEL) CONCAT EMPNAM  AS indented_name,
+    DEPT,
+    DECIMAL(SALARY, 11, 2)             AS salary,
+    PATH                               AS reporting_chain
+FROM OrgTree
+ORDER BY PATH;
+</pre>
+
+<p>The <code>LEVEL</code> pseudo-column (computed manually here as an incrementing integer) indicates depth in the tree. The <code>PATH</code> column builds a human-readable breadcrumb of the reporting chain at each level.</p>
+
+<h2>BOM Explosion with Recursive SQL</h2>
+
+<p>Bill of Materials (BOM) explosion is the classic recursive SQL use case in manufacturing IBM i applications. The BOM table stores a parent-component relationship; the recursive CTE walks the tree to find all components at every level needed to build a top-level item.</p>
+
+<pre>
+-- BOM table: APPLIB.BOMLNK (PARITEM, CMPITEM, QTYPER, UOFM)
+-- PARITEM = parent item number, CMPITEM = component item number
+-- QTYPER = quantity of component per one unit of parent
+
+WITH RECURSIVE BOMExplosion (
+    PARITEM, CMPITEM, QTYPER, UOFM, LEVEL, EXTENDED_QTY, PATH
+) AS (
+    -- Anchor: direct components of the top-level item (part P10050)
+    SELECT
+        PARITEM,
+        CMPITEM,
+        QTYPER,
+        UOFM,
+        1                               AS LEVEL,
+        QTYPER                          AS EXTENDED_QTY,
+        CAST(PARITEM AS VARCHAR(200))   AS PATH
+    FROM APPLIB.BOMLNK
+    WHERE PARITEM = 'P10050'
+
+    UNION ALL
+
+    -- Recursive: components of each component found so far
+    SELECT
+        B.PARITEM,
+        B.CMPITEM,
+        B.QTYPER,
+        B.UOFM,
+        BE.LEVEL + 1,
+        BE.EXTENDED_QTY * B.QTYPER,   -- Multiply quantities down the tree
+        BE.PATH CONCAT ' > ' CONCAT B.PARITEM
+    FROM   APPLIB.BOMLNK  B
+    JOIN   BOMExplosion    BE ON BE.CMPITEM = B.PARITEM
+    WHERE  BE.LEVEL < 10               -- Safety stop: max 10 levels deep
+)
+SELECT
+    LEVEL,
+    REPEAT('  ', LEVEL) CONCAT CMPITEM   AS component,
+    DECIMAL(EXTENDED_QTY, 11, 4)         AS extended_qty,
+    UOFM,
+    PATH                                 AS bom_path
+FROM BOMExplosion
+ORDER BY PATH, LEVEL;
+</pre>
+
+<p>The <code>WHERE BE.LEVEL &lt; 10</code> clause is a critical safety guard. Without it, a circular BOM reference (item A requires item B which requires item A) causes infinite recursion, which DB2 for i will terminate with an SQL error after hitting the maximum recursion depth (default 200 iterations). A level limit or explicit cycle detection is mandatory for production BOM queries.</p>
+
+<h2>Cycle Detection in Recursive CTEs</h2>
+
+<p>DB2 for i does not have a built-in <code>CYCLE</code> clause (as some other databases do), but cycle detection can be implemented by checking whether the current node's ID already appears in the PATH string:</p>
+
+<pre>
+WITH RECURSIVE SafeBOM (
+    PARITEM, CMPITEM, QTYPER, LEVEL, PATH, IS_CYCLE
+) AS (
+    -- Anchor
+    SELECT
+        PARITEM, CMPITEM, QTYPER,
+        1,
+        CAST(PARITEM AS VARCHAR(1000)),
+        CASE WHEN LOCATE(PARITEM, CAST(PARITEM AS VARCHAR(1000))) > 0
+             THEN 1 ELSE 0 END
+    FROM APPLIB.BOMLNK
+    WHERE PARITEM = 'P10050'
+
+    UNION ALL
+
+    -- Recursive member — stop if cycle detected
+    SELECT
+        B.PARITEM, B.CMPITEM, B.QTYPER,
+        SB.LEVEL + 1,
+        SB.PATH CONCAT '>' CONCAT B.PARITEM,
+        CASE WHEN LOCATE('>' CONCAT B.PARITEM CONCAT '>', '>' CONCAT SB.PATH CONCAT '>') > 0
+             THEN 1 ELSE 0 END
+    FROM   APPLIB.BOMLNK  B
+    JOIN   SafeBOM         SB ON SB.CMPITEM = B.PARITEM AND SB.IS_CYCLE = 0
+    WHERE  SB.LEVEL < 15
+)
+SELECT PARITEM, CMPITEM, QTYPER, LEVEL, IS_CYCLE, PATH
+FROM SafeBOM
+ORDER BY PATH;
+-- IS_CYCLE = 1 rows indicate where a circular reference exists in the BOM data
+</pre>
+
+<h2>CTE Performance Considerations on IBM i</h2>
+
+<p>CTEs on DB2 for i are handled by the SQL Query Engine (SQE), which decides independently whether to materialise the CTE (evaluate it once and store the result) or inline it (substitute the CTE definition everywhere it is referenced, like a macro). Understanding this matters for performance:</p>
+
+<ul>
+  <li><strong>Single-reference CTEs are usually inlined</strong> — if a CTE is referenced only once, SQE typically substitutes its definition into the outer query and optimises the combined query as a whole. The CTE has no performance overhead in this case.</li>
+  <li><strong>Multi-reference CTEs may be materialised</strong> — if a CTE is referenced two or more times in the main query, SQE may evaluate it once and store the intermediate result in a temporary table, then join against that result twice. This avoids repeating the inner query but adds a sort/spool step.</li>
+  <li><strong>Recursive CTEs are always materialised</strong> — the iterative nature of recursion requires materialisation; SQE cannot inline a recursive CTE.</li>
+  <li><strong>Use Visual Explain to check materialisation</strong> — in ACS (Access Client Solutions) Run SQL Scripts, press F13 or use the Visual Explain button after running a query to see whether each CTE was inlined or materialised, and whether indexes were used at each step.</li>
+</ul>
+
+<pre>
+-- Check the plan cache for a specific CTE query
+-- Run after executing the BOM explosion query above
+SELECT
+    QQTIM    AS elapsed_seconds,
+    QQJNM    AS job_name,
+    QQUCNT   AS rows_returned,
+    QQUSERID AS user_id
+FROM QSYS2.SYSPLANSTMTSTATISTICS
+WHERE QQSTMT LIKE '%BOMExplosion%'
+ORDER BY QQTIM DESC
+FETCH FIRST 10 ROWS ONLY;
+</pre>
+
+<h2>CTEs vs Views vs Derived Tables</h2>
+
+<table>
+  <thead>
+    <tr><th>Feature</th><th>CTE (WITH)</th><th>SQL View</th><th>Derived Table (inline)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Scope</td><td>Single statement</td><td>Persistent, reusable</td><td>Single statement</td></tr>
+    <tr><td>Named reference</td><td>Yes</td><td>Yes (via QSYS2 or library)</td><td>No (anonymous)</td></tr>
+    <tr><td>Recursive support</td><td>Yes (WITH RECURSIVE)</td><td>No</td><td>No</td></tr>
+    <tr><td>Multi-use in query</td><td>Yes</td><td>Yes</td><td>No (must repeat)</td></tr>
+    <tr><td>Performance hint</td><td>SQE decides materialise/inline</td><td>SQE merges with outer query</td><td>Always inlined</td></tr>
+    <tr><td>Maintenance</td><td>In SQL only</td><td>DDL object in library</td><td>In SQL only</td></tr>
+  </tbody>
+</table>
+
+<p>Use a CTE when the logic is needed only within one query and is too complex to read as a nested derived table. Use a view when the same query structure is needed across multiple programs or SQL scripts. Use a derived table (inline subquery) for simple, short filters that do not benefit from naming.</p>
+
+<h2>Practical CTE Patterns for IBM i Applications</h2>
+
+<pre>
+-- Pattern: CTE to identify duplicate rows before deletion
+WITH DuplicateOrders AS (
+    SELECT
+        ORDNO,
+        ROW_NUMBER() OVER (
+            PARTITION BY CUSNO, ORDDAT, ORDAMT
+            ORDER BY ORDNO ASC
+        ) AS row_num
+    FROM ORDLIB.ORDMST
+)
+DELETE FROM ORDLIB.ORDMST
+WHERE ORDNO IN (
+    SELECT ORDNO
+    FROM   DuplicateOrders
+    WHERE  row_num > 1        -- Keep only the first occurrence
+);
+
+-- Pattern: CTE for a paginated query result in an RPG program
+-- Using OFFSET/FETCH for paging (IBM i 7.2+)
+WITH PagedOrders AS (
+    SELECT
+        ORDNO, CUSNO, CUSNAM, ORDAMT, ORDDAT, ORDSTS,
+        ROW_NUMBER() OVER (ORDER BY ORDDAT DESC, ORDNO DESC) AS rn
+    FROM   ORDLIB.ORDMST O
+    JOIN   ORDLIB.CUSTMST C ON C.CUSNO = O.CUSNO
+    WHERE  O.ORDSTS = 'O'
+)
+SELECT ORDNO, CUSNO, CUSNAM, ORDAMT, ORDDAT, ORDSTS
+FROM   PagedOrders
+WHERE  rn BETWEEN :startRow AND :endRow
+ORDER BY rn;
+-- :startRow and :endRow are host variables from the RPG program
+-- Page 1: startRow=1, endRow=20; Page 2: startRow=21, endRow=40
+</pre>
+
+<em>Next post: IBM i Job Scheduling with ADDJOBSCDE — adding and managing job schedule entries with ADDJOBSCDE and WRKJOBSCDE, scheduling patterns for daily, weekly, and monthly batch jobs, failure notification via message queues, the IBM Advanced Job Scheduler (5770-JS1) for complex job dependencies, and querying schedule history with QSYS2.SCHEDULED_JOB_INFO.</em>

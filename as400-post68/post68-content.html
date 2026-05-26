@@ -1,0 +1,543 @@
+<p>The previous post covered IBM watsonx on Power for IBM i — deploying Granite foundation models close to your IBM i data, calling the watsonx Inference API from RPG and Python, building retrieval-augmented generation pipelines with DB2 for i as the vector store, and integrating AI inference into production RPG batch jobs. This post covers ILE RPG date, time, and timestamp handling: declaring date/time/timestamp fields, converting between format codes, performing arithmetic with %DIFF and %ADDUR, calculating fiscal periods, using CEE date APIs (CEEDAYS, CEEJULDY, CEEDATE) for century-safe logic, and embedding SQL date functions directly in RPG programs on IBM i in 2026.</p>
+
+<h2>Date, Time, and Timestamp Data Types in ILE RPG</h2>
+
+<p>ILE RPG provides three distinct data types for temporal data. Understanding which to use — and how IBM i stores them internally — prevents the subtle bugs that plagued fixed-format RPG programs when the century rolled over.</p>
+
+<ul>
+  <li><strong>Date (D)</strong> — stores a calendar date. Internal format is always <code>*ISO</code> (YYYY-MM-DD). Displayed or moved using a format code: <code>*MDY</code>, <code>*DMY</code>, <code>*YMD</code>, <code>*ISO</code>, <code>*USA</code>, <code>*EUR</code>, <code>*JUL</code>.</li>
+  <li><strong>Time (T)</strong> — stores a time of day. Internal format is always <code>*ISO</code> (HH.MM.SS). The separator character can be colon, period, comma, or none.</li>
+  <li><strong>Timestamp (Z)</strong> — stores a combined date and time with microseconds: <code>YYYY-MM-DD-HH.MM.SS.MMMMMM</code>. Used for audit trails, event sequencing, and DB2 temporal tables.</li>
+</ul>
+
+<pre>
+**FREE
+// Declare date, time, and timestamp variables
+Dcl-S   OrderDate       Date(*ISO);
+Dcl-S   ShipTime        Time(*ISO);
+Dcl-S   AuditStamp      Timestamp;
+Dcl-S   DueDate         Date(*ISO);
+Dcl-S   FiscalPeriod    Packed(6:0);    // YYYYMM
+Dcl-S   DaysRemaining   Int(10);
+
+// Declare with keyword defaults
+Dcl-S   InvoiceDate     Date(*ISO)    Inz(*Sys);   // Today's date
+Dcl-S   PostTime        Time(*ISO)    Inz(*Sys);   // Current time
+Dcl-S   ChangeStamp     Timestamp     Inz(*Sys);   // Current timestamp
+
+// Declare in a data structure (common in order processing)
+Dcl-DS  OrderHeader     Qualified;
+  OrderNo     Char(10);
+  CustNo      Char(7);
+  OrderDt     Date(*ISO);
+  RequiredDt  Date(*ISO);
+  ShippedDt   Date(*ISO);
+  CreatedTs   Timestamp;
+End-DS;
+</pre>
+
+<p>The <code>Inz(*Sys)</code> keyword initialises a date field to today's date, a time field to the current system time, and a timestamp to the current system timestamp — equivalent to calling <code>%Date()</code>, <code>%Time()</code>, or <code>%Timestamp()</code> with no argument at runtime.</p>
+
+<h2>%DATE, %TIME, and %TIMESTAMP Built-In Functions</h2>
+
+<p>The <code>%DATE</code>, <code>%TIME</code>, and <code>%TIMESTAMP</code> built-in functions convert other values — character strings, numeric packed fields, or the system clock — into typed date/time values.</p>
+
+<pre>
+**FREE
+Dcl-S   CharDate        Char(10);
+Dcl-S   PackedDate      Packed(8:0);    // YYYYMMDD
+Dcl-S   PackedMDY       Packed(6:0);    // MMDDYY
+Dcl-S   Result          Date(*ISO);
+Dcl-S   Today           Date(*ISO);
+Dcl-S   NowStamp        Timestamp;
+
+// Get system date and time
+Today    = %Date();               // Current date in *ISO format
+NowStamp = %Timestamp();          // Current timestamp
+
+// Convert character string to date
+CharDate = '2026-07-11';
+Result   = %Date(CharDate : *ISO);   // Parse ISO format
+
+CharDate = '07/11/26';
+Result   = %Date(CharDate : *MDY);   // Parse MDY with / separator
+
+// Convert packed numeric to date
+PackedDate = 20260711;
+Result     = %Date(PackedDate : *ISO0);  // *ISO0 = YYYYMMDD no separators
+
+PackedMDY  = 071126;
+Result     = %Date(PackedMDY : *MDY0);   // *MDY0 = MMDDYY no separators
+
+// Extract date from timestamp
+NowStamp = %Timestamp();
+Result   = %Date(NowStamp);    // Extracts date portion
+
+// %TIME examples
+Dcl-S  NowTime   Time(*ISO);
+Dcl-S  CharTime  Char(8);
+
+NowTime  = %Time();                   // Current time
+CharTime = '14:35:22';
+NowTime  = %Time(CharTime : *ISO);    // Parse HH:MM:SS format
+
+// %TIMESTAMP examples
+Dcl-S  FullStamp  Timestamp;
+Dcl-S  CharStamp  Char(26);
+
+CharStamp = '2026-07-11-14.35.22.000000';
+FullStamp = %Timestamp(CharStamp);      // Parse full timestamp string
+</pre>
+
+<h2>Format Conversion with %CHAR and Date Formatting</h2>
+
+<p>Use <code>%CHAR</code> to convert a date, time, or timestamp back to a character string in any supported format. This is essential when writing to output files, building SQL strings, or displaying dates in 5250 screens with a specific format.</p>
+
+<pre>
+**FREE
+Dcl-S  OrderDate    Date(*ISO);
+Dcl-S  Display8     Char(8);
+Dcl-S  DisplayISO   Char(10);
+Dcl-S  DisplayMDY   Char(8);
+Dcl-S  DisplayEUR   Char(10);
+
+OrderDate  = %Date();    // Today
+
+// Convert to various character formats
+DisplayISO = %Char(OrderDate : *ISO);    // '2026-07-11'
+DisplayMDY = %Char(OrderDate : *MDY);   // '07/11/26'  (MM/DD/YY)
+DisplayEUR = %Char(OrderDate : *EUR);   // '11.07.2026' (DD.MM.YYYY)
+Display8   = %Char(OrderDate : *ISO0);  // '20260711'  (no separators)
+
+// Convert packed 8-digit date to display format
+Dcl-S  PackedDt    Packed(8:0);
+Dcl-S  AsDt        Date(*ISO);
+Dcl-S  Formatted   Char(10);
+
+PackedDt  = 20260711;
+AsDt      = %Date(PackedDt : *ISO0);
+Formatted = %Char(AsDt : *EUR);   // '11.07.2026'
+
+// Extract year, month, day components
+Dcl-S  YearNum     Int(10);
+Dcl-S  MonthNum    Int(10);
+Dcl-S  DayNum      Int(10);
+
+YearNum  = %SubDt(OrderDate : *YEARS);   // 2026
+MonthNum = %SubDt(OrderDate : *MONTHS);  // 7
+DayNum   = %SubDt(OrderDate : *DAYS);    // 11
+</pre>
+
+<p><code>%SUBDT</code> (Sub Date/Time) extracts a component of a date, time, or timestamp. For timestamps, you can also extract <code>*HOURS</code>, <code>*MINUTES</code>, <code>*SECONDS</code>, and <code>*MSECONDS</code>.</p>
+
+<h2>Date Arithmetic: %DIFF and %ADDUR / %SUBUR</h2>
+
+<p><code>%DIFF</code> calculates the difference between two dates, times, or timestamps. <code>%ADDUR</code> adds a duration to a date and <code>%SUBUR</code> subtracts one. These operations work cleanly across month boundaries, leap years, and century boundaries — eliminating the error-prone Julian-date arithmetic that plagued older RPG programs.</p>
+
+<pre>
+**FREE
+Dcl-S  OrderDate    Date(*ISO);
+Dcl-S  DueDate      Date(*ISO);
+Dcl-S  ShippedDate  Date(*ISO);
+Dcl-S  DaysLate     Int(10);
+Dcl-S  MonthsDiff   Int(10);
+Dcl-S  PromiseDate  Date(*ISO);
+Dcl-S  NetTermsDate Date(*ISO);
+
+OrderDate   = %Date('2026-06-01' : *ISO);
+DueDate     = %Date('2026-07-11' : *ISO);
+ShippedDate = %Date('2026-07-15' : *ISO);
+
+// Calculate days between two dates
+DaysLate   = %Diff(ShippedDate : DueDate : *DAYS);   // 4
+MonthsDiff = %Diff(DueDate : OrderDate : *MONTHS);   // 1
+
+// %ADDUR: add a duration to a date
+// Syntax: %ADDUR(value:duration-code)
+PromiseDate  = %AddDur(OrderDate : 30 : *DAYS);    // 2026-07-01
+NetTermsDate = %AddDur(OrderDate : 2  : *MONTHS);  // 2026-08-01
+
+// Add years
+Dcl-S  ReviewDate   Date(*ISO);
+ReviewDate = %AddDur(%Date() : 1 : *YEARS);   // One year from today
+
+// %SUBUR: subtract a duration from a date
+Dcl-S  PriorMonth   Date(*ISO);
+PriorMonth = %SubDur(%Date() : 1 : *MONTHS);  // First day of last month? No — exactly 1 month back
+
+// Working with timestamps
+Dcl-S  StartStamp   Timestamp;
+Dcl-S  EndStamp     Timestamp;
+Dcl-S  ElapsedSecs  Int(20);
+Dcl-S  ElapsedMSecs Int(20);
+
+StartStamp  = %Timestamp();
+// ... processing ...
+EndStamp    = %Timestamp();
+ElapsedSecs  = %Diff(EndStamp : StartStamp : *SECONDS);
+ElapsedMSecs = %Diff(EndStamp : StartStamp : *MSECONDS);
+</pre>
+
+<h2>Fiscal Period and Business Day Calculations</h2>
+
+<p>Real-world IBM i applications frequently need to calculate fiscal periods (not calendar months), quarter-end dates, and business day offsets. These patterns use the date arithmetic built-ins combined with standard RPG logic.</p>
+
+<pre>
+**FREE
+// Calculate fiscal period (April–March fiscal year: FY2027 starts April 2026)
+Dcl-S  TodayDt       Date(*ISO);
+Dcl-S  FiscalYear    Int(10);
+Dcl-S  FiscalMonth   Int(10);
+Dcl-S  FiscalPeriod  Packed(6:0);   // YYYYMM in fiscal terms
+Dcl-S  CalMonth      Int(10);
+Dcl-S  CalYear       Int(10);
+
+TodayDt    = %Date();
+CalMonth   = %SubDt(TodayDt : *MONTHS);
+CalYear    = %SubDt(TodayDt : *YEARS);
+
+// Fiscal year starts April 1 — months 4-12 belong to FY starting this year
+// Months 1-3 belong to FY that started prior year
+If CalMonth >= 4;
+  FiscalYear  = CalYear + 1;
+  FiscalMonth = CalMonth - 3;
+Else;
+  FiscalYear  = CalYear;
+  FiscalMonth = CalMonth + 9;
+EndIf;
+
+FiscalPeriod = (FiscalYear * 100) + FiscalMonth;
+
+// Calculate quarter-end date
+Dcl-S  QtrEndDate  Date(*ISO);
+Dcl-S  QtrMonth    Int(10);
+
+// Find which quarter we're in, then build the last day of that quarter
+Select;
+  When CalMonth <= 3;
+    QtrMonth  = 3;
+  When CalMonth <= 6;
+    QtrMonth  = 6;
+  When CalMonth <= 9;
+    QtrMonth  = 9;
+  Other;
+    QtrMonth  = 12;
+EndSl;
+
+// Build quarter-end date: first day of next quarter minus 1 day
+QtrEndDate = %Date(%Char(CalYear : *ZERO) + '-'
+                  + %EditC(QtrMonth : 'X') + '-01' : *ISO);
+// This gives first day of quarter-end month; add to last day logic as needed
+
+// Net payment terms: 30 days from invoice, but not on weekend
+Dcl-S  InvoiceDt   Date(*ISO);
+Dcl-S  DueDt       Date(*ISO);
+Dcl-S  DayOfWeek   Int(10);
+
+InvoiceDt = %Date();
+DueDt     = %AddDur(InvoiceDt : 30 : *DAYS);
+
+// %Rem and day-of-week: Monday=2 through Sunday=1 in IBM i DAYOFWEEK SQL
+// Use embedded SQL to get day of week
+Exec SQL
+  SET :DayOfWeek = DAYOFWEEK(:DueDt);
+// 1=Sunday, 2=Monday, ... 7=Saturday
+If DayOfWeek = 7;          // Saturday → push to Monday
+  DueDt = %AddDur(DueDt : 2 : *DAYS);
+ElseIf DayOfWeek = 1;      // Sunday → push to Monday
+  DueDt = %AddDur(DueDt : 1 : *DAYS);
+EndIf;
+</pre>
+
+<h2>CEE Date APIs: CEEDAYS, CEEJULDY, and CEEDATE</h2>
+
+<p>The <strong>ILE CEE (Common Execution Environment) date APIs</strong> provide century-safe date manipulation that predates the RPG built-in functions. They remain important when you need Lilian day numbers (days since October 14, 1582 — the Gregorian calendar start), when interfacing with older service programs, or when converting between Gregorian and Julian calendar dates.</p>
+
+<pre>
+**FREE
+// Prototype declarations for CEE date APIs
+Dcl-PR  CEEDAYS        ExtProc('CEEDAYS');
+  InputDate   Char(30) Const;
+  PicStr      Char(30) Const;
+  LilianDays  Int(10);
+  FC          Char(12) Options(*Omit);    // Feedback code
+End-PR;
+
+Dcl-PR  CEEJULDY       ExtProc('CEEJULDY');
+  LilianDays  Int(10)  Const;
+  JulYear     Int(10);
+  JulDay      Int(10);
+  FC          Char(12) Options(*Omit);
+End-PR;
+
+Dcl-PR  CEEDATE        ExtProc('CEEDATE');
+  LilianDays  Int(10)  Const;
+  PicStr      Char(30) Const;
+  OutputDate  Char(30);
+  FC          Char(12) Options(*Omit);
+End-PR;
+
+Dcl-PR  CEEDYWK        ExtProc('CEEDYWK');
+  LilianDays  Int(10)  Const;
+  DayOfWeek   Int(10);
+  FC          Char(12) Options(*Omit);
+End-PR;
+
+// Convert a date to a Lilian day number
+Dcl-S  LilDays   Int(10);
+Dcl-S  InDate    Char(10);
+Dcl-S  PicStr    Char(30);
+Dcl-S  DayOfWk   Int(10);
+
+InDate  = '2026-07-11';
+PicStr  = 'YYYY-MM-DD';
+
+CEEDAYS(InDate : PicStr : LilDays : *Omit);
+// LilDays now contains the Lilian day number for 2026-07-11
+
+// Convert Lilian day number back to a date in any picture format
+Dcl-S  OutDate   Char(10);
+PicStr  = 'MM/DD/YYYY';
+CEEDATE(LilDays : PicStr : OutDate : *Omit);   // '07/11/2026'
+
+// Get day of week from Lilian day (1=Monday, 7=Sunday)
+CEEDYWK(LilDays : DayOfWk : *Omit);
+
+// Convert to Julian date (year + day-of-year)
+Dcl-S  JulYear   Int(10);
+Dcl-S  JulDay    Int(10);
+CEEJULDY(LilDays : JulYear : JulDay : *Omit);
+// JulYear = 2026, JulDay = 192 (192nd day of 2026)
+
+// Add N business days using Lilian arithmetic
+Dcl-S  StartLil  Int(10);
+Dcl-S  ResultLil Int(10);
+Dcl-S  DayNum    Int(10);
+Dcl-S  BizDays   Int(10);
+Dcl-S  Added     Int(10);
+
+BizDays  = 10;
+Added    = 0;
+StartLil = LilDays;
+ResultLil = StartLil;
+
+DoU Added = BizDays;
+  ResultLil += 1;
+  CEEDYWK(ResultLil : DayNum : *Omit);
+  If DayNum <= 5;        // Monday-Friday
+    Added += 1;
+  EndIf;
+EndDo;
+
+// Convert result back to a date character string
+CEEDATE(ResultLil : 'YYYY-MM-DD' : OutDate : *Omit);
+</pre>
+
+<h2>Embedded SQL Date Functions in RPG</h2>
+
+<p>DB2 for i provides a rich set of SQL date functions accessible directly inside RPG with embedded SQL. These complement the RPG built-ins and are often cleaner for set-based or complex calendar calculations.</p>
+
+<pre>
+**FREE
+Dcl-S  TodayDt        Date(*ISO);
+Dcl-S  LastDayOfMo    Date(*ISO);
+Dcl-S  FirstDayOfMo   Date(*ISO);
+Dcl-S  WeekNum        Int(10);
+Dcl-S  QuarterNum     Int(10);
+Dcl-S  DayName        Char(10);
+Dcl-S  MonthEndDate   Date(*ISO);
+
+// Get today's date via SQL CURRENT_DATE
+Exec SQL SET :TodayDt = CURRENT_DATE;
+
+// First and last day of current month
+Exec SQL
+  SET :FirstDayOfMo = DATE(YEAR(CURRENT_DATE) CONCAT '-'
+                       CONCAT MONTH(CURRENT_DATE) CONCAT '-01');
+
+Exec SQL
+  SET :LastDayOfMo = LAST_DAY(CURRENT_DATE);
+
+// Week number, quarter number
+Exec SQL
+  SET :WeekNum    = WEEK_ISO(CURRENT_DATE);  // ISO week: Mon=first day of week
+Exec SQL
+  SET :QuarterNum = QUARTER(CURRENT_DATE);   // 1-4
+
+// Add interval via SQL TIMESTAMPADD
+Dcl-S  FutureDate  Date(*ISO);
+Exec SQL
+  SET :FutureDate = DATE(TIMESTAMPADD(SQL_TSI_MONTH, 3, TIMESTAMP(:TodayDt, '00:00:00')));
+
+// TIMESTAMPDIFF for precise elapsed time
+Dcl-S  StartTS    Timestamp;
+Dcl-S  EndTS      Timestamp;
+Dcl-S  SecsDiff   Int(20);
+
+StartTS = %Timestamp('2026-07-11-08.00.00.000000');
+EndTS   = %Timestamp();
+Exec SQL
+  SET :SecsDiff = TIMESTAMPDIFF(2, CHAR(:EndTS) CONCAT CHAR(:StartTS));
+  -- SQL_TSI_SECOND=2, SQL_TSI_MINUTE=4, SQL_TSI_HOUR=8
+
+// Format a date for a report heading using SQL VALUE / CHAR
+Dcl-S  ReportHdr  Char(30);
+Exec SQL
+  SET :ReportHdr = CHAR(DATE_FORMAT(CURRENT_DATE, '%d %B %Y'));
+  -- Returns '11 July 2026'
+</pre>
+
+<h2>Date Handling in Stored Procedures and SQL Cursors</h2>
+
+<p>When looping through date-range data with an embedded SQL cursor, combine RPG date arithmetic with cursor fetch to build efficient range queries and age calculations.</p>
+
+<pre>
+**FREE
+Ctl-Opt DftActGrp(*No) ActGrp('SALESGRP');
+
+// Find all orders more than 90 days old with no shipment
+Dcl-S  CutoffDate   Date(*ISO);
+Dcl-S  OrdNo        Char(10);
+Dcl-S  CustNo       Char(7);
+Dcl-S  OrdDt        Date(*ISO);
+Dcl-S  AgeDays      Int(10);
+Dcl-S  SqLCode      Int(10);
+
+CutoffDate = %SubDur(%Date() : 90 : *DAYS);
+
+Exec SQL
+  DECLARE C_OLD_ORDERS CURSOR FOR
+    SELECT ORDER_NO, CUST_NO, ORDER_DATE,
+           DAYS_BETWEEN(CURRENT_DATE, ORDER_DATE) AS AGE_DAYS
+    FROM ORDLIB/ORDMST
+    WHERE ORDER_DATE < :CutoffDate
+      AND SHIPPED_DATE IS NULL
+    ORDER BY ORDER_DATE;
+
+Exec SQL OPEN C_OLD_ORDERS;
+
+DoU SqLCode = 100;
+  Exec SQL
+    FETCH NEXT FROM C_OLD_ORDERS
+    INTO :OrdNo, :CustNo, :OrdDt, :AgeDays;
+
+  SqLCode = SQLCODE;
+  If SqLCode = 0;
+    // Process overdue order
+    // AgeDays > 90 at this point
+  EndIf;
+EndDo;
+
+Exec SQL CLOSE C_OLD_ORDERS;
+
+// Age calculation: calculate customer age from birthdate
+Dcl-S  BirthDate  Date(*ISO);
+Dcl-S  AgeYears   Int(10);
+Dcl-S  AgeMonths  Int(10);
+
+BirthDate = %Date('1985-03-22' : *ISO);
+AgeYears  = %Diff(%Date() : BirthDate : *YEARS);
+AgeMonths = %Diff(%Date() : BirthDate : *MONTHS) - (AgeYears * 12);
+</pre>
+
+<h2>Date Handling Pitfalls and Best Practices</h2>
+
+<p>IBM i date handling has several well-known pitfalls that continue to trip up developers migrating from fixed-format RPG. Here are the most common ones and how to avoid them.</p>
+
+<table>
+  <tr>
+    <th>Pitfall</th>
+    <th>Problem</th>
+    <th>Solution</th>
+  </tr>
+  <tr>
+    <td>Two-digit year (YYMMDD)</td>
+    <td>Century ambiguity: 26 = 1926 or 2026?</td>
+    <td>Always use <code>*ISO</code> or <code>*ISO0</code> (YYYYMMDD) for storage; use <code>*MDY0</code> / <code>*DMY0</code> only for display after confirming the century window</td>
+  </tr>
+  <tr>
+    <td>NULL date columns</td>
+    <td><code>%Date()</code> fails on NULL SQL host variable; program crashes</td>
+    <td>Use <code>COALESCE</code> in the SELECT or check <code>SQLIND</code> indicator variable before using the date field</td>
+  </tr>
+  <tr>
+    <td>Packed date arithmetic</td>
+    <td>Adding 1 to 20261131 does not give 20261201</td>
+    <td>Convert to Date type first, add duration, convert back: <code>%Date(packed : *ISO0)</code> then <code>%AddDur</code></td>
+  </tr>
+  <tr>
+    <td>Month-end edge case</td>
+    <td><code>%AddDur(2026-01-31 : 1 : *MONTHS)</code> = 2026-02-28 (not 2026-03-03)</td>
+    <td>IBM i clips to the last day of the month — usually what you want for billing cycles. Test explicitly for month-end logic.</td>
+  </tr>
+  <tr>
+    <td>Timestamp precision</td>
+    <td>Comparing timestamps with <code>=</code> fails due to microsecond differences</td>
+    <td>Use <code>%Diff(ts1 : ts2 : *SECONDS) = 0</code> for same-second comparison, or truncate with <code>DATE(ts)</code></td>
+  </tr>
+</table>
+
+<h2>Complete Example: Order Age Report with Date Calculations</h2>
+
+<p>This complete program reads the order master file and produces a report showing each order's age in days, the calculated due date, and whether the order is overdue — using the full range of date built-ins covered in this post.</p>
+
+<pre>
+**FREE
+Ctl-Opt DftActGrp(*No) ActGrp('RPTGRP') Option(*SrcStmt);
+
+// File and data structure declarations
+Dcl-F   ORDRPT    Printer OflInd(*InOF);
+
+Dcl-DS  OrderRec  ExtName('ORDLIB/ORDMST') Qualified;
+End-DS;
+
+Dcl-S  TodayDt    Date(*ISO);
+Dcl-S  DueDt      Date(*ISO);
+Dcl-S  AgeDays    Int(10);
+Dcl-S  OverdueFlg Char(1);
+Dcl-S  DueDateStr Char(10);
+Dcl-S  AgeStr     Char(4);
+Dcl-S  SqlCode    Int(10);
+
+TodayDt = %Date();
+
+Exec SQL
+  DECLARE C_ORDERS CURSOR FOR
+    SELECT ORDER_NO, CUST_NO, ORDER_DATE, TERMS_DAYS
+    FROM ORDLIB/ORDMST
+    WHERE STATUS = 'OP'
+    ORDER BY ORDER_DATE;
+
+Exec SQL OPEN C_ORDERS;
+
+DoU SqlCode = 100;
+  Exec SQL
+    FETCH NEXT FROM C_ORDERS
+    INTO :OrderRec.OrderNo, :OrderRec.CustNo,
+         :OrderRec.OrderDate, :OrderRec.TermsDays;
+
+  SqlCode = SQLCODE;
+
+  If SqlCode = 0;
+    DueDt      = %AddDur(OrderRec.OrderDate : OrderRec.TermsDays : *DAYS);
+    AgeDays    = %Diff(TodayDt : OrderRec.OrderDate : *DAYS);
+    OverdueFlg = *Blank;
+
+    If TodayDt > DueDt;
+      OverdueFlg = '*';
+    EndIf;
+
+    DueDateStr = %Char(DueDt : *ISO);
+    AgeStr     = %Char(AgeDays);
+
+    // Write detail line to report
+    Write ORDRPT;
+  EndIf;
+EndDo;
+
+Exec SQL CLOSE C_ORDERS;
+
+*InLR = *On;
+</pre>
+
+<em>Next post: DB2 for i window functions — ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, FIRST_VALUE, and LAST_VALUE with the OVER clause, PARTITION BY, and ORDER BY for advanced analytical SQL on IBM i without self-joins or subqueries.</em>

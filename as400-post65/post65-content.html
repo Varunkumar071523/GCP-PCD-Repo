@@ -1,0 +1,365 @@
+<p>The previous post covered IBM i job scheduling — adding and managing job schedule entries with ADDJOBSCDE and WRKJOBSCDE, scheduling frequency patterns for daily, weekly, and monthly batch jobs, CL-based failure notifications via message queues, the IBM Advanced Job Scheduler (5770-JS1) for dependency-aware job chains, and querying schedule status with QSYS2.SCHEDULED_JOB_INFO. This post covers IBM i outbound email: configuring the SMTP server with CHGSMTPA and STRTCPSVR, sending plain-text alerts with SNDDST and SNDSMTPEMM from CL, building multipart HTML email from RPG using MIME formatting and HTTPAPI, sending notifications from PASE with Python smtplib, email with attachments, and a reusable CL email alert wrapper for batch job failures in 2026.</p>
+
+<h2>IBM i Email Architecture</h2>
+
+<p>IBM i has several mechanisms for sending outbound email, each suited to different use cases:</p>
+
+<table>
+  <thead>
+    <tr><th>Method</th><th>Best For</th><th>Requires</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>SNDDST</td><td>Simple inter-user messages, basic SMTP relay</td><td>SMTP server configured, distribution list</td></tr>
+    <tr><td>SNDSMTPEMM</td><td>CL-based plain-text email to external addresses</td><td>IBM i 7.2+, SMTP configured</td></tr>
+    <tr><td>HTTPAPI (RPG)</td><td>HTML email, attachments, MIME body from RPG programs</td><td>HTTPAPI open-source library installed</td></tr>
+    <tr><td>Python smtplib (PASE)</td><td>Complex HTML email, attachments, programmatic generation</td><td>Python 3 in PASE via yum</td></tr>
+    <tr><td>Node.js nodemailer (PASE)</td><td>HTML templates, OAuth2 auth, modern SMTP</td><td>Node.js in PASE, npm package</td></tr>
+  </tbody>
+</table>
+
+<p>All of these ultimately relay through an SMTP server. IBM i can use its own built-in SMTP server (part of 5770-TC1 TCP/IP Connectivity Utilities) to relay to an internal mail relay, Microsoft Exchange, or a cloud SMTP service like SendGrid or Amazon SES.</p>
+
+<h2>Configuring SMTP on IBM i</h2>
+
+<p>Before any email method works, the IBM i SMTP server must be configured and running. The SMTP configuration lives in CHGSMTPA (Change SMTP Attributes):</p>
+
+<pre>
+/* Step 1: Configure SMTP server attributes */
+CHGSMTPA MAILROUTER('mail.company.com') +   /* Internal SMTP relay hostname */
+          PORT(25) +                          /* Standard SMTP port */
+          FWDHUBSVR(*NONE) +
+          USRDFNDTA(*NONE)
+
+/* For authenticated relay (Microsoft 365, Google Workspace, SendGrid) */
+/* Requires IBM i 7.4 TR4+ or 7.3 TR10+ for SMTP AUTH support */
+CHGSMTPA MAILROUTER('smtp.sendgrid.net') +
+          PORT(587) +
+          AUTHTYPE(*LOGIN) +                  /* LOGIN or PLAIN */
+          SMTPUSER('apikey') +
+          SMTPPWD('SG.xxxxxxxxxxxxxx')        /* SendGrid API key as password */
+
+/* Step 2: Set the IBM i system name for outbound email headers */
+CHGTCPDMN DMNNAME('ibmi.company.com')
+
+/* Step 3: Start the SMTP server */
+STRTCPSVR SERVER(*SMTP)
+
+/* Verify SMTP is running */
+WRKTCPSTS OPTION(*IFC) /* Confirm port 25 or 587 is in LISTEN state */
+
+/* Step 4: Configure the system mail directory entry for the IBM i host */
+WRKDIRE   /* Add an entry for the local system if not present */
+/* Ensure SMTP routing is enabled: CHGDIRE USER(*SYSUSER) USRDFNFLD((SMTPSERVER 'SMTP') ...) */
+</pre>
+
+<h2>SNDDST — Sending Distribution Messages</h2>
+
+<p><code>SNDDST</code> (Send Distribution) is the traditional IBM i inter-user messaging system. When SMTP is configured, SNDDST can route messages to external email addresses via the IBM i mail router. It is best suited for simple plain-text notifications to a small list of recipients.</p>
+
+<pre>
+/* Send a plain-text message to an external email address */
+SNDDST TYPE(*MIMEMAIL) +
+       TOINTNET(('opsalerts@company.com')) +
+       SUBJECT('IBM i Nightly Batch Complete') +
+       LONGMSG('The nightly order processing batch ORDNIGHT completed +
+                successfully at 22:47 on 2026-07-08. +
+                Total orders processed: 1,847. +
+                Next run: 2026-07-09 22:00.')
+
+/* Send to multiple recipients */
+SNDDST TYPE(*MIMEMAIL) +
+       TOINTNET(('opsalerts@company.com') +
+                ('manager@company.com')) +
+       SUBJECT('ORDNIGHT batch complete') +
+       LONGMSG('Batch completed successfully.')
+
+/* Send from a CL program with variable message body */
+/* Build the message text in a variable first */
+DCL VAR(&MSGBODY) TYPE(*CHAR) LEN(500)
+CHGVAR VAR(&MSGBODY) VALUE('Batch ORDNIGHT FAILED at ' *CAT &FAILTIME *CAT +
+                           '. Error: ' *CAT &ERRMSG)
+
+SNDDST TYPE(*MIMEMAIL) +
+       TOINTNET(('opsalerts@company.com')) +
+       SUBJECT('CRITICAL: ORDNIGHT batch FAILED') +
+       LONGMSG(&MSGBODY)
+</pre>
+
+<h2>SNDSMTPEMM — Sending SMTP Email from CL</h2>
+
+<p><code>SNDSMTPEMM</code> (Send SMTP Email Message) is available from IBM i 7.2 onward and provides a cleaner CL interface for SMTP email without the distribution services infrastructure that SNDDST requires. It supports explicit FROM, TO, CC, BCC, SUBJECT, and body parameters:</p>
+
+<pre>
+/* Send a simple plain-text alert email from CL */
+SNDSMTPEMM TOADR(('opsalerts@company.com' *INTERNET)) +
+            SUBJECT('IBM i Batch Alert') +
+            NOTE('Nightly order batch completed at 22:47. +
+                  Orders processed: 1847. Invoice run completed.') +
+            FROMADR('ibmi-alerts@company.com') +
+            FROMNAME('IBM i Production System')
+
+/* CL batch failure alert — typical pattern used in production CL programs */
+DCL VAR(&SUBJLINE) TYPE(*CHAR) LEN(100)
+DCL VAR(&NOTELINE) TYPE(*CHAR) LEN(1000)
+DCL VAR(&PGMNAME)  TYPE(*CHAR) LEN(10)   VALUE('ORDNGTPRC')
+DCL VAR(&FAILTIME) TYPE(*CHAR) LEN(6)
+
+/* Get current time into &FAILTIME */
+RTVSYSVAL SYSVAL(QTIME) RTNVAR(&FAILTIME)
+
+CHGVAR VAR(&SUBJLINE) VALUE('CRITICAL: ' *CAT &PGMNAME *CAT ' FAILED')
+CHGVAR VAR(&NOTELINE) VALUE('Program ' *CAT &PGMNAME *CAT +
+                             ' failed at ' *CAT &FAILTIME *CAT +
+                             '. Check JOBLOG for details. +
+                             System: PROD-IBMI. Job: ORDNIGHT.')
+
+SNDSMTPEMM TOADR(('opsalerts@company.com' *INTERNET) +
+                  ('oncall@company.com'    *INTERNET)) +
+            SUBJECT(&SUBJLINE) +
+            NOTE(&NOTELINE) +
+            FROMADR('ibmi-noreply@company.com') +
+            FROMNAME('IBM i Production')
+</pre>
+
+<h2>Reusable CL Email Alert Wrapper</h2>
+
+<p>Wrapping SNDSMTPEMM in a reusable CL program that accepts subject and body parameters makes it easy to add email notifications to any batch CL program without repeating the SNDSMTPEMM boilerplate:</p>
+
+<pre>
+/* APPLIB/SNDEMLALRT — Reusable email alert sender */
+/* Parameters: &SUBJECT (char 100), &MSGBODY (char 2000) */
+/* Usage: CALL APPLIB/SNDEMLALRT PARM(&SUBJECT &MSGBODY) */
+
+PGM PARM(&SUBJECT &MSGBODY)
+
+DCL VAR(&SUBJECT) TYPE(*CHAR) LEN(100)
+DCL VAR(&MSGBODY) TYPE(*CHAR) LEN(2000)
+DCL VAR(&RECIPIENT) TYPE(*CHAR) LEN(50) VALUE('opsalerts@company.com')
+
+MONMSG MSGID(CPF0000) EXEC(GOTO CMDLBL(SENDERROR))
+
+SNDSMTPEMM TOADR((&RECIPIENT *INTERNET)) +
+            SUBJECT(&SUBJECT) +
+            NOTE(&MSGBODY) +
+            FROMADR('ibmi-noreply@company.com') +
+            FROMNAME('IBM i Prod')
+
+GOTO CMDLBL(ENDPGM)
+
+SENDERROR:
+  /* If email fails, at minimum notify the system operator */
+  SNDPGMMSG MSGID(CPF9898) MSGF(QCPFMSG) +
+       MSGDTA('SNDEMLALRT: Email send failed for: ' *CAT &SUBJECT) +
+       TOMSGQ(QSYSOPR)
+
+ENDPGM:
+  ENDPGM
+</pre>
+
+<p>Any batch CL program can then call this wrapper:</p>
+
+<pre>
+/* Inside ORDNGTPRC error handler */
+ERROR:
+  RCVMSG MSGTYPE(*EXCP) MSG(&ERRMSG)
+  CHGVAR VAR(&SUBJECT) VALUE('CRITICAL: ORDNIGHT batch FAILED')
+  CHGVAR VAR(&BODY) VALUE('Batch ORDNIGHT failed. Error: ' *CAT &ERRMSG)
+  CALL PGM(APPLIB/SNDEMLALRT) PARM(&SUBJECT &BODY)
+</pre>
+
+<h2>HTML Email from RPG Using MIME</h2>
+
+<p>SNDSMTPEMM only supports plain text. For rich HTML email with tables, colours, and formatted reports, the best approach from RPG is to call an SMTP server directly using the HTTPAPI open-source library, which supports raw TCP socket communication and SMTP command sequences. Alternatively, write the MIME email body to an IFS stream file and invoke a PASE sendmail or Python script to deliver it.</p>
+
+<pre>
+**FREE
+// Build an HTML email report and write it to IFS for PASE delivery
+// APPLIB/QRPGLESRC  Member: EMLRPTSND
+
+ctl-opt dftactgrp(*no) actgrp('APPGRP') option(*nodebugio);
+
+dcl-c CRLF x'0d25';   // IBM i EBCDIC CRLF sequence for IFS text files
+
+dcl-s wHandle  int(10);
+dcl-s wLine    varchar(500);
+dcl-s wRptFile varchar(200) inz('/tmp/dailyrpt.html');
+dcl-s wMsgFile varchar(200) inz('/tmp/dailyrpt_email.txt');
+
+// Build the HTML email body — write to a temp IFS file
+// Then call a Python script in PASE to send it via SMTP
+BuildHtmlReport();
+WriteEmailWrapper();
+SendViaPase();
+*inlr = *on;
+
+dcl-proc BuildHtmlReport;
+  // Open IFS stream file for write
+  wHandle = open(%trim(wRptFile): O_WRONLY + O_CREAT + O_TRUNC + O_CCSID: 8+4+2: 1208);
+
+  WriteHtmlLine(wHandle: '<!DOCTYPE html><html><body>');
+  WriteHtmlLine(wHandle: '<h2>Daily Order Summary — ' + %char(%date()) + '</h2>');
+  WriteHtmlLine(wHandle: '<table border="1" cellpadding="4" cellspacing="0">');
+  WriteHtmlLine(wHandle: '<tr><th>Region</th><th>Orders</th><th>Total Amount</th></tr>');
+
+  // Fetch summary from DB2
+  exec sql
+    DECLARE sumCursor CURSOR FOR
+    SELECT REGION,
+           COUNT(*) AS ord_count,
+           SUM(ORDAMT) AS ord_total
+    FROM   SALESLIB.ORDMST
+    WHERE  DATE(ORDDAT) = CURRENT DATE
+    AND    ORDSTS = 'C'
+    GROUP BY REGION
+    ORDER BY REGION;
+
+  exec sql OPEN sumCursor;
+
+  dcl-ds sumRow qualified;
+    region  char(10);
+    cnt     int(10);
+    total   packed(15:2);
+  end-ds;
+
+  exec sql FETCH NEXT FROM sumCursor
+           INTO :sumRow.region, :sumRow.cnt, :sumRow.total;
+
+  dow sqlcode = 0;
+    wLine = '<tr><td>' + %trim(sumRow.region) + '</td><td>'
+          + %char(sumRow.cnt) + '</td><td>'
+          + %editc(sumRow.total: '1') + '</td></tr>';
+    WriteHtmlLine(wHandle: wLine);
+    exec sql FETCH NEXT FROM sumCursor
+             INTO :sumRow.region, :sumRow.cnt, :sumRow.total;
+  enddo;
+
+  exec sql CLOSE sumCursor;
+
+  WriteHtmlLine(wHandle: '</table></body></html>');
+  callp close(wHandle);
+end-proc;
+
+dcl-proc WriteEmailWrapper;
+  // Write the full MIME email message with headers to a second file
+  // This file is passed to Python for SMTP delivery
+  wHandle = open(%trim(wMsgFile): O_WRONLY + O_CREAT + O_TRUNC + O_CCSID: 8+4+2: 1208);
+
+  WriteHtmlLine(wHandle: 'TO: management@company.com');
+  WriteHtmlLine(wHandle: 'FROM: ibmi-reports@company.com');
+  WriteHtmlLine(wHandle: 'SUBJECT: Daily Order Summary ' + %char(%date()));
+  WriteHtmlLine(wHandle: 'MIME-Version: 1.0');
+  WriteHtmlLine(wHandle: 'Content-Type: text/html; charset=UTF-8');
+  WriteHtmlLine(wHandle: '');
+  // Append the HTML body inline (for small reports)
+  // For large reports: reference the separate HTML file in a multipart MIME envelope
+  WriteHtmlLine(wHandle: '<html><body>See attached report.</body></html>');
+
+  callp close(wHandle);
+end-proc;
+</pre>
+
+<h2>Sending Email from PASE with Python</h2>
+
+<p>Python's <code>smtplib</code> and <code>email</code> modules provide the cleanest way to send rich HTML email with attachments from IBM i PASE. Install Python 3 via yum if not already present:</p>
+
+<pre>
+# Install Python 3 in PASE (run from a PASE SSH session)
+yum install python39
+pip3 install --upgrade pip
+
+# /opt/appscripts/send_daily_report.py
+import smtplib
+import os
+from email.mime.multipart import MIMEMultipart
+from email.mime.text      import MIMEText
+from email.mime.base      import MIMEBase
+from email                import encoders
+from datetime             import date
+
+SMTP_HOST = 'mail.company.com'
+SMTP_PORT = 587
+SMTP_USER = 'ibmi-alerts@company.com'
+SMTP_PASS = os.environ.get('SMTP_PASSWORD', '')   # Load from environment, never hardcode
+
+def send_html_report(to_addresses, subject, html_body, attachment_path=None):
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = subject
+    msg['From']    = 'IBM i Reports <ibmi-reports@company.com>'
+    msg['To']      = ', '.join(to_addresses)
+
+    # Attach HTML body
+    msg.attach(MIMEText(html_body, 'html', 'utf-8'))
+
+    # Attach a file if provided (e.g., a CSV or PDF report)
+    if attachment_path and os.path.exists(attachment_path):
+        with open(attachment_path, 'rb') as f:
+            part = MIMEBase('application', 'octet-stream')
+            part.set_payload(f.read())
+        encoders.encode_base64(part)
+        filename = os.path.basename(attachment_path)
+        part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
+        msg.attach(part)
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(
+            'ibmi-reports@company.com',
+            to_addresses,
+            msg.as_string()
+        )
+
+if __name__ == '__main__':
+    today = date.today().strftime('%Y-%m-%d')
+    html = f"""
+    &lt;html&gt;&lt;body&gt;
+    &lt;h2&gt;Daily Order Summary — {today}&lt;/h2&gt;
+    &lt;p&gt;Report generated by IBM i production system.&lt;/p&gt;
+    &lt;/body&gt;&lt;/html&gt;
+    """
+    send_html_report(
+        to_addresses=['management@company.com', 'opsalerts@company.com'],
+        subject=f'Daily Order Summary {today}',
+        html_body=html,
+        attachment_path=f'/tmp/ordersummary_{today}.csv'
+    )
+    print('Email sent successfully.')
+</pre>
+
+<p>Call the Python script from a CL program or RPG program using the PASE QP2SHELL or STRPASE service:</p>
+
+<pre>
+/* Call Python email script from CL */
+/* PASE environment must be available */
+QSH CMD('export SMTP_PASSWORD=''secretpassword'' && +
+         /QOpenSys/pkgs/bin/python3 /opt/appscripts/send_daily_report.py')
+
+/* Alternative: use STRPASE and run the script in the background */
+SBMJOB JOB(EMLRPT) JOBQ(APPLIB/APPJOBQ) +
+       CMD(QSH CMD('/QOpenSys/pkgs/bin/python3 /opt/appscripts/send_daily_report.py'))
+</pre>
+
+<h2>Email Troubleshooting on IBM i</h2>
+
+<ul>
+  <li><strong>WRKSMTPJRN</strong> — displays the SMTP server journal; shows every connection attempt, relay error, and delivery status. This is the first place to look when email is not being delivered.</li>
+  <li><strong>DSPJRN JRN(QSYS/QZMF)</strong> — the mail server framework journal; shows processing of outbound mail queue entries</li>
+  <li><strong>WRKMLMQ</strong> — work with the mail message queue; shows messages queued for delivery, including those stuck in retry</li>
+  <li><strong>SNDSMTPEMM VERBOSE(*YES)</strong> — enables verbose logging for SMTP command exchanges; useful when diagnosing AUTH failures with cloud SMTP providers</li>
+  <li>Check that the SMTP port (25 or 587) is not blocked by a network firewall between IBM i and the mail relay</li>
+  <li>Verify the IBM i system name (CHGTCPDMN DMNNAME) resolves correctly in DNS — many cloud SMTP providers reject email from hosts with unresolvable FQDNs</li>
+</ul>
+
+<h2>Email Notification Best Practices for IBM i in 2026</h2>
+
+<ul>
+  <li><strong>Never hardcode SMTP passwords in CL or RPG source</strong> — store SMTP credentials in a data area, an IFS file readable only by the service account, or an environment variable loaded at runtime</li>
+  <li><strong>Use SNDSMTPEMM for simple CL alerts and Python for HTML reports</strong> — SNDSMTPEMM is operationally simpler but limited to plain text; Python smtplib handles attachments, HTML bodies, and modern SMTP AUTH with minimal code</li>
+  <li><strong>Build a single reusable alert CL program (SNDEMLALRT)</strong> — every batch CL program should call a shared wrapper rather than duplicating SNDSMTPEMM calls; changes to recipients or SMTP settings need to happen in one place</li>
+  <li><strong>Alert on failure, not on success</strong> — successful jobs create noise; reserve email alerts for failures, warnings, and abnormal completions; only send success notifications for critical end-of-day runs that downstream teams depend on</li>
+  <li><strong>Test email before go-live on each environment</strong> — SMTP relay configuration differs between development, QA, and production; test-send an alert from each environment during cutover</li>
+  <li><strong>Monitor the SMTP journal weekly</strong> — a growing queue of undelivered messages in WRKMLMQ indicates a relay problem that will eventually cause alerts to be missed silently</li>
+</ul>
+
+<em>Next post: IBM i Memory Pools and Pool Sizing — understanding the *BASE, *INTERACT, and *SPOOL shared pool architecture, setting pool sizes and activity levels with WRKSHRPOOL and CHGSHRPOOL, diagnosing paging faults using Collection Services and WRKMEMPOOL, configuring automatic performance adjustment (APA), and sizing memory pools for interactive, batch, and PASE workloads on IBM i in 2026.</em>

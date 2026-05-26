@@ -1,0 +1,328 @@
+<p>The previous post covered IBM i job scheduling with ADDJOBSCDE — adding recurring batch jobs to the IBM i job scheduler, managing schedules with WRKJOBSCDE and CHGJOBSCDE, creating schedule calendars for business days, exception calendars for bank holidays, retrieving schedule entries with RTVJOBSCDE in CL programs, holding and releasing schedules with HLDJOBSCDE and RLSJOBSCDE, and monitoring scheduled job execution history on IBM i. This post covers IBM i commitment control and transaction management: why commitment control is required for reliable multi-file updates, starting and ending commitment definitions with STRCMTCTL and ENDCMTCTL, the journal requirement before using commitment control, issuing COMMIT and ROLLBACK from CL and RPG programs, using savepoints with SAVEPOINT and ROLLBACK TO SAVEPOINT in DB2 embedded SQL, handling commitment control errors, and designing reliable multi-file update patterns on IBM i in 2026.</p>
+
+<h2>Why Commitment Control?</h2>
+
+<p>Without commitment control, every database write on IBM i takes effect immediately and permanently. If a program that updates three related files (order header, order lines, inventory) fails between the second and third write, the database is left in an inconsistent state — the order exists but inventory was never decremented. Commitment control groups multiple database operations into an <strong>atomic unit of work (UOW)</strong>: either all operations commit together or all are rolled back, leaving the database in the state it was before the UOW began.</p>
+
+<pre>
+/* Commitment control requires journaling on every file in the UOW */
+/* Step 1: Create a journal receiver and journal */
+CRTJRNRCV JRNRCV(APPLIB/APPRJRN01) THRESHOLD(100000)
+CRTJRN    JRN(APPLIB/APPJRN) JRNRCV(APPLIB/APPRJRN01) +
+          MNGRCV(*SYSTEM) DLTRCV(*YES)
+
+/* Step 2: Start journaling on every physical file used in the UOW */
+STRJRNPF  FILE(ORDLIB/ORDMST)  JRN(APPLIB/APPJRN)
+STRJRNPF  FILE(ORDLIB/ORDLIN)  JRN(APPLIB/APPJRN)
+STRJRNPF  FILE(INVLIB/INVMST)  JRN(APPLIB/APPJRN)
+
+/* Verify journaling is active on a file */
+DSPFD FILE(ORDLIB/ORDMST) TYPE(*JRN)
+/* Look for: Journal . . . . . . . : APPJRN   Library: APPLIB */
+</pre>
+
+<h2>Starting and Ending Commitment Definitions: STRCMTCTL and ENDCMTCTL</h2>
+
+<p>A <strong>commitment definition</strong> is the job-level record of which files are under commitment control and what the current UOW contains. <code>STRCMTCTL</code> starts commitment control for the current job; <code>ENDCMTCTL</code> ends it. Each job can have only one active commitment definition at a time. The <code>LCKLVL</code> parameter controls locking behaviour during the UOW.</p>
+
+<pre>
+/* Start commitment control — *CHG: only lock records being changed */
+/* *CS (cursor stability): default — locks records read under commitment control */
+/* *ALL: locks every record read, whether changed or not */
+STRCMTCTL LCKLVL(*CHG) +
+          CMTSCOPE(*JOB) +      /* Commitment definition scope: this job only */
+          TEXT('Order entry UOW commitment definition')
+
+/* End commitment control — ENDCMTCTL performs an implicit COMMIT first */
+ENDCMTCTL
+
+/* Check if commitment control is active for the current job */
+DSPJOB OPTION(*CMTDFN)
+/* Displays commitment definition details including lock level and journal */
+</pre>
+
+<h2>COMMIT and ROLLBACK in CL Programs</h2>
+
+<p>Once commitment control is active, <code>COMMIT</code> permanently applies all changes in the current UOW and starts a new empty UOW. <code>ROLLBACK</code> undoes all changes in the current UOW without applying any of them, returning the database to the state at the last COMMIT point.</p>
+
+<pre>
+/* CL program: update order header and lines under commitment control */
+PGM PARM(&ORDNO &CUSTNO)
+
+DCL VAR(&ORDNO)  TYPE(*CHAR)  LEN(10)
+DCL VAR(&CUSTNO) TYPE(*CHAR)  LEN(8)
+DCL VAR(&ERRMSG) TYPE(*CHAR)  LEN(80)
+
+/* Start commitment control if not already active */
+STRCMTCTL LCKLVL(*CHG)
+
+/* Perform the multi-file update */
+CALL PGM(ORDLIB/UPDORDHDR) PARM(&ORDNO &CUSTNO)
+MONMSG MSGID(CPF0000) EXEC(DO)
+    CHGVAR VAR(&ERRMSG) VALUE('Order header update failed for ' *CAT &ORDNO)
+    ROLLBACK
+    SNDPGMMSG MSG(&ERRMSG) MSGTYPE(*ESCAPE)
+    RETURN
+ENDDO
+
+CALL PGM(ORDLIB/UPDORDLIN) PARM(&ORDNO)
+MONMSG MSGID(CPF0000) EXEC(DO)
+    ROLLBACK
+    SNDPGMMSG MSG('Order line update failed — rolled back') MSGTYPE(*ESCAPE)
+    RETURN
+ENDDO
+
+CALL PGM(INVLIB/UPDinventory) PARM(&ORDNO)
+MONMSG MSGID(CPF0000) EXEC(DO)
+    ROLLBACK
+    SNDPGMMSG MSG('Inventory update failed — rolled back') MSGTYPE(*ESCAPE)
+    RETURN
+ENDDO
+
+/* All updates succeeded — commit the UOW */
+COMMIT
+SNDPGMMSG MSG('Order ' *CAT &ORDNO *CAT ' committed successfully') TOPGMQ(*EXT)
+
+ENDCMTCTL
+ENDPGM
+</pre>
+
+<h2>COMMIT and ROLLBACK in ILE RPG</h2>
+
+<p>In ILE RPG programs, commitment control is activated by setting <code>COMMIT(*YES)</code> on each file's F-spec. All I/O operations on those files are automatically placed under the commitment definition. <code>COMMIT</code> and <code>ROLBK</code> opcodes complete or undo the current UOW.</p>
+
+<pre>
+**FREE
+Ctl-Opt DftActGrp(*No) ActGrp('ORDGRP');
+
+// ── File declarations under commitment control ─────────────
+FOrderHdr  UF A  E           K DISK    COMMIT(*YES)
+FOrderLin  UF A  E           K DISK    COMMIT(*YES)
+FInventory UF A  E           K DISK    COMMIT(*YES)
+
+// ── Process an order ──────────────────────────────────────
+Dcl-S  OrdNo    Char(10);
+Dcl-S  LineNo   Packed(3:0);
+Dcl-S  Qty      Packed(7:0);
+Dcl-S  Updated  Ind;
+
+// Write the order header
+OrdNo = 'ORD0012345';
+Write OrdHdrRec;   // Writes to ORDERHEADER file — within the current UOW
+
+// Write each order line
+LineNo = 1;
+Qty    = 25;
+Write OrdLinRec;   // Writes to ORDERLINES file — within the same UOW
+
+// Update inventory
+Chain OrdNo InvRec;
+If %Found;
+    InvQtyOnHand -= Qty;
+    Update InvRec;  // Within the same UOW
+    Updated = *On;
+EndIf;
+
+If Updated;
+    Commit;    // All three writes commit atomically
+Else;
+    Rolbk;     // Inventory record not found — roll back all writes
+    // Send error message
+EndIf;
+
+*InLR = *On;
+</pre>
+
+<h2>COMMIT and ROLLBACK in Embedded SQL</h2>
+
+<p>RPG programs using embedded SQL manage the UOW with <code>EXEC SQL COMMIT</code> and <code>EXEC SQL ROLLBACK</code>. The SQL SET TRANSACTION statement controls the isolation level. Files opened with SQL are automatically under commitment control when the connection is not set to AUTOCOMMIT.</p>
+
+<pre>
+**FREE
+Ctl-Opt DftActGrp(*No) ActGrp('SQLGRP');
+
+// Disable autocommit — all SQL DML is now under commitment control
+Exec SQL SET OPTION COMMIT = *CHG;   // *CHG = only changed rows are locked
+
+Dcl-S  OrdNo    Char(10)  Inz('ORD0012345');
+Dcl-S  CustNo   Char(8)   Inz('C0001234');
+Dcl-S  SqlCode  Int(10);
+
+// Insert order header
+Exec SQL
+    INSERT INTO ORDLIB.ORDMST (ORD_NO, CUST_NO, ORD_DATE, STATUS)
+    VALUES (:OrdNo, :CustNo, CURRENT_DATE, 'O');
+
+SqlCode = SQLCODE;
+If SqlCode <> 0;
+    Exec SQL ROLLBACK;
+    // Handle error
+    *InLR = *On;
+    Return;
+EndIf;
+
+// Insert order lines
+Exec SQL
+    INSERT INTO ORDLIB.ORDLIN (ORD_NO, LINE_NO, PROD_NO, QTY)
+    VALUES (:OrdNo, 1, 'PROD001', 25);
+
+If SQLCODE <> 0;
+    Exec SQL ROLLBACK;
+    *InLR = *On;
+    Return;
+EndIf;
+
+// Update inventory
+Exec SQL
+    UPDATE INVLIB.INVMST
+    SET QTY_ON_HAND = QTY_ON_HAND - 25
+    WHERE PROD_NO = 'PROD001'
+      AND QTY_ON_HAND >= 25;
+
+If SQLCODE <> 0 Or SQLERRD(3) = 0;   // SQLERRD(3) = rows affected
+    Exec SQL ROLLBACK;
+    *InLR = *On;
+    Return;
+EndIf;
+
+// All statements succeeded — commit
+Exec SQL COMMIT;
+
+*InLR = *On;
+</pre>
+
+<h2>Savepoints: SAVEPOINT and ROLLBACK TO SAVEPOINT</h2>
+
+<p>A <strong>savepoint</strong> marks a point within a UOW to which you can roll back without discarding the entire UOW. Savepoints are useful when a large transaction has multiple phases — you want to undo a phase that failed without losing the work done in earlier phases. Savepoints are supported in DB2 for i embedded SQL (IBM i 7.1+) and are released automatically at COMMIT or ROLLBACK.</p>
+
+<pre>
+**FREE
+Ctl-Opt DftActGrp(*No) ActGrp('SPGRP');
+
+Exec SQL SET OPTION COMMIT = *CHG;
+
+Dcl-S  BatchNo  Char(10)  Inz('BATCH001');
+Dcl-S  i        Int(10);
+
+// ── Phase 1: Update order headers ─────────────────────────
+Exec SQL SAVEPOINT sp_headers ON ROLLBACK RETAIN CURSORS;
+
+Exec SQL
+    UPDATE ORDLIB.ORDMST
+    SET STATUS = 'P'
+    WHERE BATCH_NO = :BatchNo AND STATUS = 'O';
+
+If SQLCODE < 0;
+    Exec SQL ROLLBACK TO SAVEPOINT sp_headers;
+    // Phase 1 failed — rolled back to start of phase 1 only
+    // Continue with cleanup without losing prior committed work
+Else;
+    Exec SQL RELEASE SAVEPOINT sp_headers;
+EndIf;
+
+// ── Phase 2: Update inventory for the batch ───────────────
+Exec SQL SAVEPOINT sp_inventory ON ROLLBACK RETAIN CURSORS;
+
+Exec SQL
+    UPDATE INVLIB.INVMST I
+    SET QTY_ON_HAND = QTY_ON_HAND -
+        (SELECT SUM(OL.QTY)
+         FROM ORDLIB.ORDLIN OL
+         JOIN ORDLIB.ORDMST OM ON OM.ORD_NO = OL.ORD_NO
+         WHERE OM.BATCH_NO = :BatchNo AND OM.STATUS = 'P'
+           AND OL.PROD_NO = I.PROD_NO)
+    WHERE EXISTS (
+        SELECT 1 FROM ORDLIB.ORDLIN OL
+        JOIN ORDLIB.ORDMST OM ON OM.ORD_NO = OL.ORD_NO
+        WHERE OM.BATCH_NO = :BatchNo AND OL.PROD_NO = I.PROD_NO
+    );
+
+If SQLCODE < 0;
+    Exec SQL ROLLBACK TO SAVEPOINT sp_inventory;
+Else;
+    Exec SQL RELEASE SAVEPOINT sp_inventory;
+    Exec SQL COMMIT;   // Commit the full batch
+EndIf;
+
+*InLR = *On;
+</pre>
+
+<h2>Commitment Control Error Handling</h2>
+
+<p>The most important commitment control error messages are <code>CPF8351</code> (commitment definition does not exist — STRCMTCTL was not called), <code>CPF8350</code> (file not under commitment control — file was not journaled before STRCMTCTL), and <code>CPF8352</code> (commitment control already active for job). Always use <code>MONMSG</code> around commitment control commands in CL.</p>
+
+<pre>
+/* CL: safe commitment control startup with error trapping */
+PGM
+
+DCL VAR(&STATUS) TYPE(*CHAR) LEN(10)
+
+/* Attempt to start commitment control */
+STRCMTCTL LCKLVL(*CHG)
+MONMSG MSGID(CPF8352) EXEC(DO)
+    /* Already active — that is acceptable, continue */
+    RCVMSG MSGTYPE(*LAST) RMV(*YES)
+ENDDO
+MONMSG MSGID(CPF8350) EXEC(DO)
+    /* A file is not journaled — this is a configuration error */
+    SNDPGMMSG MSG('Commitment control failed: file not under journaling') +
+              MSGTYPE(*ESCAPE)
+    RETURN
+ENDDO
+
+/* Do work... */
+
+/* End commitment control — ENDCMTCTL commits any open UOW */
+ENDCMTCTL
+MONMSG MSGID(CPF8351) EXEC(DO)
+    /* Commitment control was not active — harmless, ignore */
+    RCVMSG MSGTYPE(*LAST) RMV(*YES)
+ENDDO
+
+ENDPGM
+
+/* RPG: handle commitment control errors using on-error */
+// In the file declaration, commitment control errors raise data exception
+// Trap with MONITOR / ON-ERROR in the update section:
+Monitor;
+    Write OrdHdrRec;
+    Write OrdLinRec;
+    Commit;
+On-Error;
+    Rolbk;
+    // Log the error and send escape message
+EndMon;
+</pre>
+
+<h2>Multi-File Update Patterns</h2>
+
+<p>The reliable pattern for any multi-file update on IBM i is: start commitment control once at job initialisation, issue COMMIT after each logically complete UOW, and issue ROLLBACK in every error branch. Never let a program exit normally without either committing or rolling back an open UOW — if a job ends abnormally with an open UOW, IBM i performs an automatic ROLLBACK, but relying on that instead of explicit error handling makes the code fragile.</p>
+
+<pre>
+/* Pattern: CL wrapper that manages commitment control lifetime */
+/* This pattern is used when the same job processes many transactions */
+
+PGM
+
+STRCMTCTL LCKLVL(*CHG)
+MONMSG MSGID(CPF8352)   /* Already active */
+
+/* Main processing loop — each iteration is one atomic transaction */
+CALL PGM(ORDLIB/PRCORDRS)   /* This program does COMMIT/ROLLBACK internally */
+MONMSG MSGID(CPF0000) EXEC(DO)
+    ROLLBACK
+    /* Log and notify, then decide whether to continue or abort */
+ENDDO
+
+ENDCMTCTL
+
+ENDPGM
+
+/* Pattern: commitment control scope in service programs */
+/* Service program procedures should NOT call STRCMTCTL — */
+/* the calling program owns the commitment definition. */
+/* Service program procedures call COMMIT/ROLLBACK or */
+/* use Exec SQL COMMIT/ROLLBACK within the caller's UOW. */
+</pre>
+
+<em>Next post: DB2 for i triggers — creating BEFORE and AFTER triggers with CREATE TRIGGER, FOR EACH ROW and FOR EACH STATEMENT granularity, accessing OLD and NEW transition variables for changed data, building audit logging triggers, cascading business rules across tables, creating INSTEAD OF triggers on views, and trigger best practices on IBM i in 2026.</em>

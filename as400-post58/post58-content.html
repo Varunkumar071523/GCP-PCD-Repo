@@ -1,0 +1,248 @@
+<p>The previous post covered DB2 for i query optimization — the SQE and CQE query engines, Visual Explain in ACS for analyzing query plans, index design strategies including encoded vector indexes, STRDBMON for capturing optimizer data, reading the SQL plan cache with QSYS2 catalog views, and collecting statistics to prevent stale optimizer decisions. This post covers OAuth 2.0 and JWT authentication from IBM i: implementing the client credentials flow from ILE RPG, managing Bearer tokens, calling OAuth-protected REST APIs using DB2 HTTP functions and HTTPAPI, understanding JWT structure, and managing SSL certificates in the IBM i digital certificate store in 2026.</p>
+
+<h2>OAuth 2.0 Flows and IBM i Use Cases</h2>
+
+<p>OAuth 2.0 is the industry-standard protocol for delegated API authorization. Most modern REST APIs — Salesforce, Microsoft 365, ServiceNow, Workday, SAP, AWS — require OAuth 2.0 Bearer tokens rather than basic username/password authentication. IBM i programs that call external REST APIs must implement OAuth 2.0 to authenticate.</p>
+
+<p>The two OAuth 2.0 flows relevant to IBM i server-to-server integrations:</p>
+
+<ul>
+  <li><strong>Client Credentials</strong> — the IBM i application authenticates directly as itself using a client ID and client secret. No user interaction. This is the correct flow for batch jobs, RPG service programs, and CL programs that call external APIs on behalf of the system (not on behalf of an individual user). Used with: Salesforce Connected Apps, Microsoft Entra app registrations, Google Service Accounts.</li>
+  <li><strong>Authorization Code + PKCE</strong> — requires a browser redirect and user login. This flow is not applicable to IBM i batch/RPG programs directly; it is used when building web applications that run on IBM i (Node.js/Python in PASE) that authenticate real users.</li>
+</ul>
+
+<h2>HTTPS from IBM i — Options</h2>
+
+<p>Before implementing OAuth, you need a mechanism for making HTTPS POST and GET requests from IBM i. There are three main options in 2026:</p>
+
+<ul>
+  <li><strong>HTTPAPI</strong> — an open-source ILE C service program by Scott Klement; callable from RPG. Supports HTTPS, POST with body, custom headers. The most commonly used option for RPG-based HTTP calls. Requires installation from the HTTPAPI project.</li>
+  <li><strong>DB2 for i HTTP functions</strong> (SYSTOOLS.HTTPGETCLOB, SYSTOOLS.HTTPPOSTCLOB) — SQL table functions built into DB2 for i 7.3+. No additional software needed. Callable from any SQL context: embedded SQL in RPG, SQL scripts, stored procedures. Limited compared to HTTPAPI but sufficient for many OAuth use cases.</li>
+  <li><strong>PASE curl / Python requests / Node.js axios</strong> — PASE-based HTTP clients. Full-featured, support all OAuth flows, but require the program logic to be in PASE (Python/Node.js) rather than ILE RPG.</li>
+</ul>
+
+<h2>Client Credentials Flow Using DB2 HTTP Functions</h2>
+
+<p>The simplest approach for many shops: use DB2 for i's built-in HTTP functions to get an OAuth token and call APIs, entirely from SQL embedded in RPG:</p>
+
+<pre>
+**FREE
+// APPLIB/SFTOKEN — Get Salesforce OAuth token using client credentials
+// Requires: IBM i 7.3+, SYSTOOLS HTTP functions
+
+ctl-opt dftactgrp(*no) actgrp('SFGRP');
+
+dcl-s wTokenResp  varchar(4096);
+dcl-s wAccessTok  varchar(2048);
+dcl-s wTokenType  varchar(50);
+dcl-s wExpiresIn  int(10);
+
+dcl-c SF_TOKEN_URL  'https://login.salesforce.com/services/oauth2/token';
+dcl-c SF_CLIENT_ID  'your_connected_app_client_id';
+dcl-c SF_CLIENT_SEC 'your_connected_app_client_secret';
+
+// Step 1: POST to the token endpoint using SYSTOOLS.HTTPPOSTCLOB
+exec sql
+  SET :wTokenResp = SYSTOOLS.HTTPPOSTCLOB(
+    :SF_TOKEN_URL,
+    'Content-Type: application/x-www-form-urlencoded',
+    'grant_type=client_credentials' ||
+    '&client_id=' || :SF_CLIENT_ID ||
+    '&client_secret=' || :SF_CLIENT_SEC
+  );
+
+if sqlcode <> 0;
+  // Handle HTTP call failure
+  dsply 'Token request failed';
+  *inlr = *on;
+  return;
+endif;
+
+// Step 2: Parse the JSON response to extract the access_token
+// Response format: {"access_token":"...","token_type":"Bearer","expires_in":7200}
+exec sql
+  SET :wAccessTok = JSON_VALUE(:wTokenResp, '$.access_token');
+
+exec sql
+  SET :wTokenType = JSON_VALUE(:wTokenResp, '$.token_type');
+
+// Step 3: Store the token in a DB2 table for reuse by other programs
+exec sql
+  MERGE INTO APPLIB.OAUTHTOK AS T
+  USING (VALUES('SALESFORCE', :wAccessTok, :wTokenType,
+                CURRENT_TIMESTAMP + 115 MINUTES))  -- 7200s - buffer
+        AS S(SVC_NAME, ACCESS_TOKEN, TOKEN_TYPE, EXPIRES_AT)
+  ON T.SVC_NAME = S.SVC_NAME
+  WHEN MATCHED THEN UPDATE SET
+    ACCESS_TOKEN = S.ACCESS_TOKEN,
+    TOKEN_TYPE   = S.TOKEN_TYPE,
+    EXPIRES_AT   = S.EXPIRES_AT
+  WHEN NOT MATCHED THEN INSERT VALUES
+    (S.SVC_NAME, S.ACCESS_TOKEN, S.TOKEN_TYPE, S.EXPIRES_AT);
+
+exec sql COMMIT;
+
+*inlr = *on;
+</pre>
+
+<h2>Token Storage Table Design</h2>
+
+<p>Storing tokens in a DB2 table enables all programs in the activation group (or all jobs) to share a valid token without each one obtaining its own. This reduces API rate-limit consumption and speeds up batch jobs:</p>
+
+<pre>
+-- Token storage table
+CREATE TABLE APPLIB.OAUTHTOK (
+  SVC_NAME      VARCHAR(50)    NOT NULL,   -- e.g., 'SALESFORCE', 'M365', 'SVCNOW'
+  ACCESS_TOKEN  VARCHAR(4096)  NOT NULL,
+  TOKEN_TYPE    VARCHAR(50)    NOT NULL DEFAULT 'Bearer',
+  EXPIRES_AT    TIMESTAMP      NOT NULL,
+  REFRESH_TOKEN VARCHAR(4096),             -- Only for Authorization Code flow
+  CREATED_AT    TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT PK_OAUTHTOK PRIMARY KEY (SVC_NAME)
+);
+</pre>
+
+<p>Retrieving and refreshing a token in RPG:</p>
+
+<pre>
+**FREE
+
+dcl-s wToken      varchar(4096);
+dcl-s wExpires    timestamp;
+dcl-s wNeedNew    ind inz(*off);
+
+// Check if we have a valid token that has not expired
+exec sql
+  SELECT ACCESS_TOKEN, EXPIRES_AT
+  INTO   :wToken, :wExpires
+  FROM   APPLIB.OAUTHTOK
+  WHERE  SVC_NAME = 'SALESFORCE'
+  AND    EXPIRES_AT > CURRENT_TIMESTAMP + 5 MINUTES; -- 5-minute buffer
+
+if sqlcode = 100;             // No row found — token missing or expired
+  wNeedNew = *on;
+elseif sqlcode <> 0;
+  // DB error handling
+  wNeedNew = *on;
+endif;
+
+if wNeedNew;
+  // Call the token-fetch program
+  CALLP GetSalesforceToken();
+  // Re-read the fresh token
+  exec sql
+    SELECT ACCESS_TOKEN INTO :wToken
+    FROM APPLIB.OAUTHTOK
+    WHERE SVC_NAME = 'SALESFORCE';
+endif;
+
+// Now use wToken as the Bearer token for API calls
+</pre>
+
+<h2>Calling an OAuth-Protected API</h2>
+
+<p>Once you have a Bearer token, attach it as the Authorization header on each API call:</p>
+
+<pre>
+**FREE
+
+dcl-s wBearerHdr   varchar(4200);
+dcl-s wApiUrl      varchar(500);
+dcl-s wResponse    varchar(32766);
+dcl-s wRecordId    varchar(20);
+
+// Build the Authorization header
+wBearerHdr = 'Authorization: Bearer ' + %trimr(wToken) +
+             CRLF + 'Content-Type: application/json' +
+             CRLF + 'Accept: application/json';
+
+// Build the API endpoint URL
+wApiUrl = 'https://myorg.salesforce.com/services/data/v59.0/query/?q=' +
+          'SELECT+Id,Name,AccountNumber+FROM+Account+WHERE+AccountNumber=''12345''';
+
+// Call the API using DB2 HTTP function
+exec sql
+  SET :wResponse = SYSTOOLS.HTTPGETCLOB(
+    :wApiUrl,
+    :wBearerHdr
+  );
+
+if sqlcode <> 0;
+  dsply 'API call failed';
+  return;
+endif;
+
+// Parse the response — extract the first record ID
+exec sql
+  SET :wRecordId = JSON_VALUE(:wResponse, '$.records[0].Id');
+</pre>
+
+<h2>JWT Structure and Validation</h2>
+
+<p>A JSON Web Token (JWT) is a compact, self-contained token used as a Bearer token in many OAuth systems. A JWT has three Base64URL-encoded parts separated by dots:</p>
+
+<pre>
+header.payload.signature
+
+// Header (decoded):
+{
+  "alg": "RS256",
+  "typ": "JWT",
+  "kid": "key-id-from-jwks-endpoint"
+}
+
+// Payload (decoded) — claims:
+{
+  "iss": "https://login.salesforce.com",
+  "sub": "https://login.salesforce.com/id/00D.../005...",
+  "aud": "https://login.salesforce.com",
+  "exp": 1751500800,   // Unix timestamp — token expires at this time
+  "iat": 1751497200,   // Issued at
+  "jti": "unique-token-id"
+}
+
+// Signature: RS256 digital signature of header.payload using the issuer's private key
+</pre>
+
+<p>To validate a JWT on the IBM i side (when IBM i is the resource server receiving tokens from an external client), you need to:</p>
+<ol>
+  <li>Split the token on the dots</li>
+  <li>Base64URL-decode the header and payload</li>
+  <li>Parse the payload JSON to extract claims (exp, iss, sub, aud)</li>
+  <li>Check that <code>exp</code> is in the future (<code>exp > CURRENT_TIMESTAMP</code> after converting Unix timestamp)</li>
+  <li>Verify the signature using the issuer's public key from the JWKS endpoint</li>
+</ol>
+
+<p>For IBM i acting as an API consumer (not a token issuer), step 5 is typically handled by the OAuth provider — you just use the token as given and check the expiry from your stored <code>EXPIRES_AT</code> column.</p>
+
+<h2>Certificate Management on IBM i</h2>
+
+<p>Making HTTPS calls from IBM i requires that the server's TLS certificate is trusted. The trust is established through the IBM i <strong>Digital Certificate Manager (DCM)</strong>, which manages the system's certificate stores.</p>
+
+<pre>
+/* Check if the HTTPS endpoint's certificate is trusted */
+/* From a PASE terminal — use curl to test the HTTPS connection */
+curl -v https://login.salesforce.com/services/oauth2/token 2>&1 | head -30
+# If you see "SSL certificate verify failed" — the cert is not in the IBM i trust store
+
+/* Option 1: Use the *SYSTEM certificate store (recommended) */
+/* In DCM: add the CA certificate for the target server to *SYSTEM */
+/* DCM is accessed via a browser: https://my-ibm-i:2001/QIBM/ICSS/Cert/Admin/certmgr.html */
+
+/* Option 2: Use SYSTOOLS HTTP functions with SSL disabled (dev/test only — NOT production) */
+exec sql
+  SET :wResp = SYSTOOLS.HTTPPOSTCLOB(
+    :wUrl,
+    'Content-Type: application/x-www-form-urlencoded' ||
+    CRLF || 'IBM-SSLCHECK: N',   -- Disables SSL validation — DO NOT use in production
+    :wBody
+  );
+
+/* Option 3: Use QSH/PASE to install well-known CA certificates */
+/* yum install ca-certificates-mozilla */
+/* This installs Mozilla's trusted CA bundle into /QOpenSys/pkgs/share/ca-certificates */
+</pre>
+
+<p>For production systems, always use Option 1: add the CA certificate for any external HTTPS endpoint to the IBM i *SYSTEM certificate store via DCM. This is a one-time administrative step per endpoint domain.</p>
+
+<em>Next post: AI-Assisted RPG Modernization on IBM i in 2026 — converting fixed-format RPG to free-format using CVTRPGSRC and IBM Merlin, using LLMs like watsonx Code Assistant and GitHub Copilot to explain and refactor legacy RPG code, AI-generated unit tests for service programs, and the practical modernization workflow.</em>

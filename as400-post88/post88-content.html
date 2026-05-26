@@ -1,0 +1,272 @@
+<p>The previous post covered DB2 for i stored procedures — creating SQL procedures with CREATE PROCEDURE, defining IN, OUT, and INOUT parameters, using local variables and cursors for row-by-row processing, returning result sets to callers, handling errors with DECLARE HANDLER and SQLSTATE, calling procedures from RPG embedded SQL and CL with RUNSQL, and building reusable encapsulated database logic on IBM i. This post covers IBM i message queues and CL error handling: the IBM i message architecture, creating message files with CRTMSGF and ADDMSGD, sending informational and escape messages with SNDPGMMSG, handling exceptions with MONMSG, receiving messages with RCVMSG, sending interactive prompts with SNDUSRMSG, monitoring the operator console with SNDBRKMSG, building structured CL error routines, and managing message queue housekeeping on IBM i in 2026.</p>
+
+<h2>IBM i Message Architecture</h2>
+
+<p>IBM i uses a message-passing model for all inter-program communication, operator notification, and error handling. Every job has a <strong>program message queue stack</strong> — each call level adds an entry. Messages travel up the call stack: a program sends an escape message, the caller catches it with MONMSG, and the exception is handled without abnormal termination.</p>
+
+<table>
+  <tr>
+    <th>Message type</th>
+    <th>MSGTYPE keyword</th>
+    <th>Purpose</th>
+  </tr>
+  <tr>
+    <td>Informational</td>
+    <td><code>*INFO</code></td>
+    <td>Status updates, progress messages — no response required</td>
+  </tr>
+  <tr>
+    <td>Completion</td>
+    <td><code>*COMP</code></td>
+    <td>Indicates successful completion of an operation</td>
+  </tr>
+  <tr>
+    <td>Escape</td>
+    <td><code>*ESCAPE</code></td>
+    <td>Signals an error — causes abnormal end of the sending program unless caught</td>
+  </tr>
+  <tr>
+    <td>Status</td>
+    <td><code>*STATUS</code></td>
+    <td>Displayed on the 5250 status line; does not interrupt processing</td>
+  </tr>
+  <tr>
+    <td>Inquiry</td>
+    <td><code>*INQ</code></td>
+    <td>Prompts the user for a reply (G, C, D, I, R, or custom)</td>
+  </tr>
+  <tr>
+    <td>Notify</td>
+    <td><code>*NOTIFY</code></td>
+    <td>Informs the caller of a condition; caller can handle or ignore</td>
+  </tr>
+</table>
+
+<h2>Creating Message Files and Message Descriptions</h2>
+
+<p>A <strong>message file</strong> (<code>*MSGF</code>) is a repository of pre-defined message descriptions with message IDs. Using message IDs rather than literal text in SNDPGMMSG makes messages translatable, consistent, and auditable. The convention is a 7-character ID: 3-letter prefix (application code) + 4-digit number.</p>
+
+<pre>
+/* Create a message file for the order processing application */
+CRTMSGF MSGF(APPLIB/ORDMSG) +
+        TEXT('Order processing application messages')
+
+/* Add message descriptions */
+/* Severity 00 = informational, 30 = error, 40 = severe error */
+
+/* Informational: order processed */
+ADDMSGD MSGID(ORD0001) MSGF(APPLIB/ORDMSG) +
+        MSG('Order &1 processed successfully for customer &2.') +
+        SECLVL('Order number &1 was accepted and assigned to batch &3.') +
+        SEV(00) FMT((*CHAR 10) (*CHAR 8) (*CHAR 10))
+
+/* Error: customer not found */
+ADDMSGD MSGID(ORD0010) MSGF(APPLIB/ORDMSG) +
+        MSG('Customer &1 not found in customer master.') +
+        SECLVL('The customer number &1 was not found in SALESLIB/CUSTMST. +
+                Verify the customer number and try again.') +
+        SEV(30) FMT((*CHAR 8))
+
+/* Severe: inventory file locked */
+ADDMSGD MSGID(ORD0020) MSGF(APPLIB/ORDMSG) +
+        MSG('Inventory file is locked — order &1 cannot be processed.') +
+        SEV(40) FMT((*CHAR 10))
+
+/* Display message descriptions */
+DSPMSGD RANGE(ORD0001 ORD0099) MSGF(APPLIB/ORDMSG)
+
+/* Change a message description */
+CHGMSGD MSGID(ORD0001) MSGF(APPLIB/ORDMSG) +
+        MSG('Order &1 processed successfully for customer &2 on &4.')
+
+/* Remove a message description */
+RMVMSGD MSGID(ORD0020) MSGF(APPLIB/ORDMSG)
+</pre>
+
+<h2>Sending Messages: SNDPGMMSG</h2>
+
+<pre>
+/* Send an informational message to the external message queue (job log) */
+SNDPGMMSG MSG('Processing order ORD0012345') TOPGMQ(*EXT) MSGTYPE(*INFO)
+
+/* Send a completion message */
+SNDPGMMSG MSGID(ORD0001) MSGF(APPLIB/ORDMSG) +
+          MSGDTA('ORD0012345' || 'C0001234  ' || 'BATCH001  ') +
+          TOPGMQ(*EXT) MSGTYPE(*COMP)
+
+/* Send an escape message — causes abnormal end of current program */
+/* The calling program must catch this with MONMSG or the job will end */
+SNDPGMMSG MSGID(ORD0010) MSGF(APPLIB/ORDMSG) +
+          MSGDTA('C0001234') +
+          TOPGMQ(*PGMBDY) +    /* Send to the current program's caller */
+          MSGTYPE(*ESCAPE)
+
+/* Send a literal escape message (no message file required) */
+SNDPGMMSG MSG('Customer C0001234 not found') +
+          TOPGMQ(*PGMBDY) MSGTYPE(*ESCAPE)
+
+/* Send a status message displayed on the 5250 screen status line */
+SNDPGMMSG MSG('Loading customer data — please wait...') +
+          TOPGMQ(*EXT) MSGTYPE(*STATUS)
+
+/* Send a message to the system operator console */
+SNDPGMMSG MSG('Nightly batch EODBATCH completed successfully') +
+          TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+
+/* Send a message to a specific user message queue */
+SNDPGMMSG MSG('Your report is ready in output queue APPRINTS') +
+          TOMSGQ(DEVUSER) MSGTYPE(*INFO)
+</pre>
+
+<h2>Handling Exceptions: MONMSG</h2>
+
+<p><code>MONMSG</code> intercepts escape messages before they cause abnormal program termination. It can monitor for a specific message ID, a message ID prefix (e.g., all CPF messages), or the catch-all <code>CPF0000</code>. The <code>EXEC(DO...ENDDO)</code> block contains the error handler.</p>
+
+<pre>
+/* Monitor for a specific message ID */
+CALL PGM(ORDLIB/PRCORDER) PARM(&ORDNO)
+MONMSG MSGID(ORD0010) EXEC(DO)
+    /* Customer not found — handle gracefully */
+    SNDPGMMSG MSG('Skipping order ' *CAT &ORDNO *CAT ': customer not found') +
+              TOMSGQ(QSYSOPR)
+    GOTO CMDLBL(NEXTORDER)
+ENDDO
+
+/* Monitor for any CPF (system) error */
+CALL PGM(INVLIB/UPDSTOCK) PARM(&PRODNO &QTY)
+MONMSG MSGID(CPF0000) EXEC(DO)
+    ROLLBACK
+    SNDPGMMSG MSG('Inventory update failed for product ' *CAT &PRODNO) +
+              MSGTYPE(*ESCAPE)   /* Re-raise as escape to caller */
+ENDDO
+
+/* Global MONMSG at the top of a CL program — catches all unhandled escapes */
+/* Place immediately after the PGM statement */
+PGM PARM(&ORDNO)
+MONMSG MSGID(CPF0000) EXEC(GOTO CMDLBL(ERRORHANDLER))
+
+/* ... main logic ... */
+
+GOTO CMDLBL(ENDPGM)
+
+ERRORHANDLER:
+    RCVMSG MSGTYPE(*LAST) MSG(&ERRMSG) MSGID(&MSGID)
+    SNDPGMMSG MSG('PRCORDER failed on order ' *CAT &ORDNO *CAT ': ' *CAT &ERRMSG) +
+              TOMSGQ(QSYSOPR)
+    ROLLBACK
+
+ENDPGM:
+ENDPGM
+</pre>
+
+<h2>Receiving Messages: RCVMSG</h2>
+
+<pre>
+/* Receive the most recent message from the current program's queue */
+PGM
+
+DCL VAR(&MSGID)   TYPE(*CHAR) LEN(7)
+DCL VAR(&MSGDTA)  TYPE(*CHAR) LEN(256)
+DCL VAR(&MSGTEXT) TYPE(*CHAR) LEN(512)
+DCL VAR(&MSGSEV)  TYPE(*DEC)  LEN(2 0)
+
+MONMSG MSGID(CPF0000) EXEC(DO)
+    /* Receive the escape message that was thrown */
+    RCVMSG MSGTYPE(*LAST) +
+           MSGID(&MSGID) +
+           MSGDTA(&MSGDTA) +
+           MSG(&MSGTEXT) +
+           MSGSEV(&MSGSEV) +
+           RMV(*YES)    /* Remove from queue after receiving */
+
+    SNDPGMMSG MSG('Error ' *CAT &MSGID *CAT ': ' *CAT &MSGTEXT) +
+              TOMSGQ(QSYSOPR)
+ENDDO
+
+/* Work with the call: if error was severity 40+, notify management */
+IF COND(&MSGSEV *GE 40) THEN(DO)
+    SNDPGMMSG MSG('SEVERE ERROR in batch job: ' *CAT &MSGTEXT) +
+              TOMSGQ(QSYSOPR) MSGTYPE(*INQ) +
+              RPYMSGQ(*EXT)    /* Wait for operator reply */
+ENDDO
+
+ENDPGM
+</pre>
+
+<h2>Interactive Prompts: SNDUSRMSG</h2>
+
+<pre>
+/* Send an inquiry message and wait for the user's reply */
+/* Used in interactive CL programs to confirm a destructive action */
+PGM PARM(&CUSTNO)
+
+DCL VAR(&CUSTNO) TYPE(*CHAR) LEN(8)
+DCL VAR(&REPLY)  TYPE(*CHAR) LEN(1)
+
+/* Prompt the user: G=Go, C=Cancel */
+SNDUSRMSG MSG('Delete all orders for customer ' *CAT &CUSTNO *CAT '? (G=Go C=Cancel)') +
+          VALUES(G C) DFT(C) +
+          MSGTYPE(*INQ) +
+          RPYMSGQ(*EXT) RTNRPY(&REPLY)
+
+IF COND(&REPLY *EQ 'G') THEN(DO)
+    CALL PGM(ORDLIB/DLTCUSTORD) PARM(&CUSTNO)
+ENDDO
+ELSE DO
+    SNDPGMMSG MSG('Deletion cancelled by operator') TOPGMQ(*EXT)
+ENDDO
+
+ENDPGM
+</pre>
+
+<h2>Operator Notification: SNDBRKMSG</h2>
+
+<pre>
+/* Send a break message to all interactive users signed on */
+SNDBRKMSG MSG('System maintenance in 30 minutes. Please save your work and sign off.') +
+          TOMSGQ(*ALLWS)   /* All workstations */
+
+/* Send a break message to a specific workstation */
+SNDBRKMSG MSG('Your batch job INVJOB has completed — check APPRINTS output queue.') +
+          TOMSGQ(DSP01)
+
+/* Send a break message to a specific user wherever they are signed on */
+SNDBRKMSG MSG('Urgent: payroll file PAYMST is locked. Contact the DBA.') +
+          TOMSGQ(DEVUSER)
+</pre>
+
+<h2>Message Queue Housekeeping</h2>
+
+<pre>
+/* Create a dedicated message queue for a batch job */
+CRTMSGQ MSGQ(APPLIB/BATCHMSGQ) +
+        TEXT('Batch job notification message queue') +
+        DLVRY(*BREAK)    /* *NOTIFY, *HOLD, *BREAK, *DFT */
+
+/* Display all messages in a message queue */
+DSPMSGQ MSGQ(QSYSOPR)
+
+/* Clear a message queue — removes all messages */
+CLRMSGQ MSGQ(APPLIB/BATCHMSGQ)
+CLRMSGQ MSGQ(QSYSOPR)    /* Clear the operator console message queue */
+
+/* Retrieve a message text from a message file into a CL variable */
+DCL VAR(&MSGTEXT) TYPE(*CHAR) LEN(256)
+RTVMSG MSGID(ORD0001) MSGF(APPLIB/ORDMSG) +
+       MSG(&MSGTEXT) +
+       MSGDTA('ORD0012345' || 'C0001234  ' || 'BATCH001  ')
+/* &MSGTEXT now contains the formatted message with substitution values */
+
+/* Query message queue contents using SQL */
+SELECT MESSAGE_ID, MESSAGE_TEXT, MESSAGE_TIMESTAMP,
+       FROM_JOB, SEVERITY
+FROM TABLE(QSYS2.MESSAGE_QUEUE_INFO(
+    MESSAGE_QUEUE_LIBRARY => 'QSYS',
+    MESSAGE_QUEUE_NAME    => 'QSYSOPR'
+)) A
+WHERE SEVERITY >= 30
+  AND MESSAGE_TIMESTAMP > CURRENT TIMESTAMP - 1 HOUR
+ORDER BY MESSAGE_TIMESTAMP DESC;
+</pre>
+
+<em>Next post: IBM i work management and system performance analysis — monitoring system activity with WRKACTJOB, WRKSYSSTS, and WRKDSKSTS, using QSYS2.SYSTEM_STATUS_INFO and QSYS2.ACTIVE_JOB_INFO SQL views for real-time performance data, memory pool tuning with CHGSHRPOOL, identifying CPU and disk bottlenecks, collecting performance data with the IBM i Performance Tools (PT1) product, and diagnosing batch and interactive workload performance problems on IBM i in 2026.</em>

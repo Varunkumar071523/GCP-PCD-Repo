@@ -1,0 +1,290 @@
+﻿<p>The previous post covered IFS stream file I/O from ILE RPG on IBM i — using Qp0lOpen, Qp0lRead, Qp0lWrite, and Qp0lClose UNIX-type APIs, setting open flags for create, truncate, and append modes, handling CCSID encoding for UTF-8 text exchange, generating CSV export files from DB2 for i query results, and parsing INI-style configuration files at runtime in RPG programs. This post covers building a REST API server on IBM i with Node.js and Express in PASE: installing Node.js and the Express framework, connecting to DB2 for i using the odbc package, defining route handlers and URL parameters, adding API key authentication middleware, returning paginated JSON responses, centralised error handling, and running the Node.js server as a persistent IBM i batch job submitted via SBMJOB in 2026.</p>
+
+<h2>Why Node.js and Express on IBM i?</h2>
+
+<p>Node.js runs in IBM i PASE — the POSIX-compatible environment that hosts a near-complete Linux ABI on IBM Power. Express is the de facto lightweight framework for REST APIs: routing, middleware composition, and request/response handling without a full MVC framework. The combination is ideal for IBM i shops that need to:</p>
+<ul>
+  <li><strong>Expose DB2 for i data</strong> as a JSON REST API consumed by Angular, React, or mobile applications</li>
+  <li><strong>Provide an HTTP gateway</strong> in front of existing RPG programs called via XMLSERVICE</li>
+  <li><strong>Build webhook receivers</strong> that translate HTTP payloads into data queue entries for downstream RPG batch jobs</li>
+  <li><strong>Replace green-screen flows</strong> with a browser-based UI without rewriting the RPG business logic layer</li>
+</ul>
+
+<h2>Installing Node.js and Express in PASE</h2>
+
+<pre>
+# From an IBM i PASE SSH session (or QP2TERM)
+
+# Install Node.js LTS via IBM i open-source package manager
+yum install nodejs20
+
+# Verify
+node --version      # v20.x.x
+npm --version       # 10.x.x
+
+# Create a project directory in the IFS
+mkdir -p /app/ordapi
+cd /app/ordapi
+
+# Initialise the npm project
+npm init -y
+
+# Install Express and the IBM i DB2 ODBC driver
+npm install express
+npm install odbc
+
+# Install supporting packages
+npm install helmet    # Security response headers
+npm install morgan    # HTTP request logging
+npm install dotenv    # Environment variables from .env file
+</pre>
+
+<h2>Project Structure</h2>
+
+<pre>
+/app/ordapi/
+  package.json
+  server.js              Entry point: creates Express app and starts HTTP listener
+  db.js                  DB2 for i connection pool (odbc)
+  middleware/
+    auth.js              API key authentication middleware
+    errorHandler.js      Centralised error handler
+  routes/
+    orders.js            /api/orders route handlers
+    customers.js         /api/customers route handlers
+  .env                   PORT, API_KEY — not committed to source control
+</pre>
+
+<h2>DB2 for i Connection Pool: db.js</h2>
+
+<p>The odbc package connects to DB2 for i via an ODBC DSN configured in <code>/etc/odbc.ini</code>. A connection pool allows route handlers to share connections without opening a new DB2 connection per request:</p>
+
+<pre>
+// db.js
+'use strict';
+
+const odbc = require('odbc');
+let pool   = null;
+
+async function getPool() {
+  if (pool) return pool;
+  pool = await odbc.pool({
+    connectionString: 'DSN=IBMI;',
+    initialSize: 2,
+    incrementSize: 1,
+    maxSize: 10,
+    shrink: true
+  });
+  return pool;
+}
+
+async function query(sql, params = []) {
+  const p    = await getPool();
+  const conn = await p.connect();
+  try {
+    return await conn.query(sql, params);
+  } finally {
+    await conn.close();
+  }
+}
+
+module.exports = { query };
+</pre>
+
+<pre>
+# /etc/odbc.ini — DSN for local DB2 for i
+[IBMI]
+Driver      = IBM i Access ODBC Driver
+System      = localhost
+UserID      = APIUSER
+Password    = ChangeMe1!
+Naming      = 0
+DefaultLibs = ORDLIB,SALESLIB,APPLIB
+</pre>
+
+<h2>Authentication Middleware</h2>
+
+<pre>
+// middleware/auth.js
+'use strict';
+
+function requireApiKey(req, res, next) {
+  const key = req.headers['x-api-key'];
+  if (!key || key !== process.env.API_KEY) {
+    return res.status(401).json({
+      error:   'Unauthorized',
+      message: 'Valid X-Api-Key header required'
+    });
+  }
+  next();
+}
+
+module.exports = requireApiKey;
+</pre>
+
+<h2>Orders Route Handler: routes/orders.js</h2>
+
+<pre>
+// routes/orders.js
+'use strict';
+
+const express = require('express');
+const router  = express.Router();
+const db      = require('../db');
+
+// GET /api/orders?page=1&limit=50&custId=10042
+router.get('/', async (req, res, next) => {
+  try {
+    const page   = Math.max(parseInt(req.query.page  || '1',  10), 1);
+    const limit  = Math.min(parseInt(req.query.limit || '50', 10), 200);
+    const offset = (page - 1) * limit;
+    const custId = req.query.custId ? parseInt(req.query.custId, 10) : null;
+
+    let sql    = 'SELECT ORDER_NO, CUST_ID, ORDER_DATE, ORDER_AMT, STATUS_CODE FROM ORDLIB.ORDERS';
+    const params = [];
+    if (custId) { sql += ' WHERE CUST_ID = ?'; params.push(custId); }
+    sql += ' ORDER BY ORDER_DATE DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
+
+    const rows  = await db.query(sql, params);
+
+    let cntSql    = 'SELECT COUNT(*) AS TOTAL FROM ORDLIB.ORDERS';
+    if (custId)   cntSql += ' WHERE CUST_ID = ?';
+    const total   = (await db.query(cntSql, custId ? [custId] : []))[0].TOTAL;
+
+    res.json({ data: rows, pagination: { page, limit, total, pages: Math.ceil(total / limit) } });
+  } catch (err) { next(err); }
+});
+
+// GET /api/orders/:orderNo
+router.get('/:orderNo', async (req, res, next) => {
+  try {
+    const rows = await db.query(
+      `SELECT o.ORDER_NO, o.CUST_ID, o.ORDER_DATE, o.ORDER_AMT, o.STATUS_CODE,
+              c.CUST_NAME, c.CUST_EMAIL
+       FROM   ORDLIB.ORDERS o
+       JOIN   APPLIB.CUSTOMERS c ON c.CUST_ID = o.CUST_ID
+       WHERE  o.ORDER_NO = ?`,
+      [req.params.orderNo]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+
+    const lines = await db.query(
+      `SELECT PROD_CODE, PROD_DESC, QTY, UNIT_PRICE, LINE_AMT
+       FROM   ORDLIB.ORDERLINES WHERE ORDER_NO = ? ORDER BY LINE_NO`,
+      [req.params.orderNo]
+    );
+    res.json({ ...rows[0], lines });
+  } catch (err) { next(err); }
+});
+
+// POST /api/orders
+router.post('/', async (req, res, next) => {
+  try {
+    const { custId, lines } = req.body;
+    if (!custId || !Array.isArray(lines) || lines.length === 0)
+      return res.status(400).json({ error: 'custId and lines[] are required' });
+
+    const orderAmt = lines.reduce((s, l) => s + (l.qty * l.unitPrice), 0);
+    await db.query(
+      `INSERT INTO ORDLIB.ORDERS (CUST_ID, ORDER_DATE, ORDER_AMT, STATUS_CODE)
+       VALUES (?, CURRENT DATE, ?, 'NEW')`,
+      [custId, orderAmt]
+    );
+    const newOrd = await db.query(
+      `SELECT ORDER_NO FROM ORDLIB.ORDERS WHERE CUST_ID = ?
+       ORDER BY ORDER_DATE DESC FETCH FIRST 1 ROW ONLY`,
+      [custId]
+    );
+    res.status(201).json({ orderNo: newOrd[0].ORDER_NO, orderAmt });
+  } catch (err) { next(err); }
+});
+
+module.exports = router;
+</pre>
+
+<h2>Main Server Entry Point: server.js</h2>
+
+<pre>
+// server.js
+'use strict';
+
+require('dotenv').config();
+
+const express         = require('express');
+const helmet          = require('helmet');
+const morgan          = require('morgan');
+const requireApiKey   = require('./middleware/auth');
+const errorHandler    = require('./middleware/errorHandler');
+const ordersRouter    = require('./routes/orders');
+const customersRouter = require('./routes/customers');
+
+const app  = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(helmet());
+app.use(morgan('combined'));
+app.use(express.json({ limit: '1mb' }));
+
+// Health check (no auth)
+app.get('/health', (req, res) =>
+  res.json({ status: 'ok', server: 'IBM i Order API', ts: new Date().toISOString() }));
+
+// All /api routes require API key
+app.use('/api', requireApiKey);
+app.use('/api/orders',    ordersRouter);
+app.use('/api/customers', customersRouter);
+
+// Centralised error handler — must be last middleware
+app.use(errorHandler);
+
+app.listen(PORT, () => console.log(`IBM i Order API listening on port ${PORT}`));
+</pre>
+
+<h2>Error Handler Middleware</h2>
+
+<pre>
+// middleware/errorHandler.js
+'use strict';
+
+function errorHandler(err, req, res, next) {
+  console.error(`[${new Date().toISOString()}] ${req.method} ${req.path}`, err.message);
+  const status = err.status || 500;
+  res.status(status).json({
+    error:  status === 500 ? 'Internal Server Error' : err.message,
+    path:   req.path,
+    method: req.method
+  });
+}
+
+module.exports = errorHandler;
+</pre>
+
+<h2>Running the Server as a Persistent IBM i Batch Job</h2>
+
+<p>Submit the Node.js server as an IBM i batch job under a dedicated user profile so it survives when the PASE terminal session ends. Use ADDAJE to auto-start it at every IPL:</p>
+
+<pre>
+/* Submit the Node.js REST API server as a persistent PASE batch job */
+SBMJOB CMD(STRPASEPRCSS CMD('/QOpenSys/pkgs/bin/node /app/ordapi/server.js')) +
+       JOB(ORDAPISRV) +
+       JOBQ(QSYSWRK) +
+       USER(APIUSER) +
+       LOG(4 00 *SECLVL) +
+       JOBMSGQFL(*WRAP)
+
+/* Monitor the running server */
+WRKACTJOB JOB(ORDAPISRV)
+
+/* Test the API from PASE curl */
+/* curl -s -H "X-Api-Key: mysecretkey" http://localhost:3000/health */
+/* curl -s -H "X-Api-Key: mysecretkey" "http://localhost:3000/api/orders?limit=5" */
+
+/* Add autostart job entry so server starts after every IPL */
+ADDAJE SBSD(QSYSWRK) +
+       JOB(ORDAPISRV) +
+       JOBD(APIUSER/ORDAPISRV) +
+       RQSDTA('STRPASEPRCSS CMD(''/QOpenSys/pkgs/bin/node /app/ordapi/server.js'')')
+</pre>
+
+<em>Next post: the strangler fig pattern for IBM i application modernization — identifying seams in monolithic RPG applications, building a REST facade over legacy RPG program calls, routing traffic incrementally from old to new implementations using an API gateway, maintaining DB2 for i as the shared data layer during coexistence, and planning a full cutover strategy in 2026.</em>

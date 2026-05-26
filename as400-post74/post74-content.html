@@ -1,0 +1,235 @@
+﻿<p>The previous post covered the strangler fig pattern for IBM i application modernization — identifying functional seams in monolithic RPG applications, building a REST facade with Node.js over legacy RPG program calls, routing traffic incrementally via feature flags and Nginx percentage splits, maintaining DB2 for i as the shared data layer during coexistence, and executing a phased seam-by-seam migration strategy. This post covers IBM i TCP/IP configuration and troubleshooting: the CFGTCP menu structure, adding and removing TCP/IP interfaces with ADDTCPIFC and RMVTCPIFC, configuring DNS host resolution with CHGTCPDMN and CFGTCPDMN, adding static routes, diagnosing connectivity with NETSTAT, PING, and TRACEROUTE, setting up virtual Ethernet between LPARs for inter-partition communication, and managing Ethernet line descriptions on IBM i in 2026.</p>
+
+<h2>IBM i TCP/IP Architecture Overview</h2>
+
+<p>IBM i TCP/IP is built on top of the operating system's I/O infrastructure. The key objects and concepts are:</p>
+
+<ul>
+  <li><strong>Line description (*LIND)</strong> — defines the physical or virtual network adapter. For Ethernet, this is an *ETHLIN object (created with CRTLINETH). For virtual Ethernet between LPARs on the same Power server, it is a *VRTETH or *ETHLIN over a virtual Ethernet port defined in the HMC.</li>
+  <li><strong>TCP/IP interface</strong> — binds an IP address and subnet mask to a line description. Created with ADDTCPIFC. A single line description can have multiple interfaces (multiple IP addresses on the same adapter).</li>
+  <li><strong>Route</strong> — tells IBM i where to send traffic destined for a network not directly connected. Managed with ADDTCPRTE and RMVTCPRTE.</li>
+  <li><strong>Domain name resolution</strong> — configured with CHGTCPDMN: domain name, search list, DNS server IP addresses.</li>
+</ul>
+
+<h2>The CFGTCP Menu</h2>
+
+<p>CFGTCP is the central configuration menu for TCP/IP on IBM i. Type CFGTCP at a command line and press Enter. The menu options map to the key management tasks:</p>
+
+<pre>
+/* Access the TCP/IP configuration menu */
+CFGTCP
+
+/* Menu option summary */
+/* Option 1  — Work with TCP/IP interfaces (WRKTCPIFC equivalent)        */
+/* Option 2  — Work with TCP/IP routes (WRKTCPRTE equivalent)            */
+/* Option 3  — Change TCP/IP domain (CHGTCPDMN)                          */
+/* Option 4  — Work with TCP/IP port restrictions                        */
+/* Option 5  — Change TCP/IP attributes (CHGTCPA)                        */
+/* Option 10 — Work with IPv6 interfaces                                 */
+/* Option 12 — Change TCP/IP domain search list                          */
+/* Option 20 — Configure TCP/IP applications (FTP, Telnet, HTTP etc.)   */
+</pre>
+
+<h2>Adding and Removing TCP/IP Interfaces: ADDTCPIFC and RMVTCPIFC</h2>
+
+<pre>
+/* Add a TCP/IP interface: IP address, subnet mask, and line description */
+ADDTCPIFC INTNETADR('192.168.10.51') +
+          LIND(ETHLINE1) +
+          SUBNETMASK('255.255.255.0') +
+          LCLIFC(*NO) +
+          AUTOSTART(*YES) +
+          TEXT('Primary production Ethernet interface')
+
+/* Add a second interface on the same line (aliased IP) */
+ADDTCPIFC INTNETADR('192.168.10.52') +
+          LIND(ETHLINE1) +
+          SUBNETMASK('255.255.255.0') +
+          TEXT('Secondary interface for batch job isolation')
+
+/* Start a specific interface */
+STRTCPIFC INTNETADR('192.168.10.51')
+
+/* End (deactivate) an interface */
+ENDTCPIFC INTNETADR('192.168.10.52')
+
+/* Remove an interface permanently */
+RMVTCPIFC INTNETADR('192.168.10.52')
+
+/* Work with all TCP/IP interfaces — shows status, line, and IP */
+WRKTCPIFC
+
+/* Change an existing interface (e.g. change subnet mask) */
+CHGTCPIFC INTNETADR('192.168.10.51') +
+          SUBNETMASK('255.255.252.0')
+</pre>
+
+<h2>Starting and Stopping TCP/IP</h2>
+
+<pre>
+/* Start all TCP/IP interfaces that have AUTOSTART(*YES) */
+STRTCP
+
+/* Start TCP/IP with specific options */
+STRTCP STRSVR(*YES)         /* Also start TCP/IP server jobs (FTP, Telnet etc.) */
+
+/* End all TCP/IP interfaces and server jobs */
+ENDTCP OPTION(*IMMED)       /* Immediate end — drops all connections */
+ENDTCP OPTION(*CNTRLD) DELAY(60)  /* Controlled end — 60-second warning */
+
+/* Check TCP/IP stack status */
+WRKTCPSTS
+</pre>
+
+<h2>Configuring DNS: CHGTCPDMN</h2>
+
+<p>CHGTCPDMN configures how IBM i resolves host names. Specify the local domain name, search list (appended when resolving short names), and up to three DNS server IP addresses. Changes take effect immediately without restarting TCP/IP:</p>
+
+<pre>
+/* Set DNS servers and local domain */
+CHGTCPDMN DMNNAME('corp.example.com') +
+          HOSTSCHPTY(*REMOTE) +       /* Check DNS before /etc/hosts */
+          INETADDR('8.8.8.8'          /* Primary DNS   (Google public) */
+                   '8.8.4.4'          /* Secondary DNS (Google public) */
+                   '192.168.10.1') +  /* Tertiary DNS  (internal)      */
+          SRCHLIST('corp.example.com' 'example.com')
+
+/* Verify DNS resolution from IBM i */
+/* Option 1: PING with a hostname */
+PING RMTSYS('smtp.corp.example.com')
+
+/* Option 2: CFGTCPDMN menu option to display current settings */
+CFGTCP  /* then option 3 */
+
+/* Option 3: PASE nslookup */
+QSH CMD('nslookup smtp.corp.example.com')
+</pre>
+
+<h2>Static Routes: ADDTCPRTE and WRKTCPRTE</h2>
+
+<pre>
+/* Add a static route: traffic to 10.20.0.0/16 goes via gateway 192.168.10.1 */
+ADDTCPRTE RTEDEST('10.20.0.0') +
+          SUBNETMASK('255.255.0.0') +
+          NEXTHOP('192.168.10.1') +
+          TEXT('Route to corporate data centre network')
+
+/* Add default route (0.0.0.0/0 = all traffic not matched by other routes) */
+ADDTCPRTE RTEDEST('*DFTROUTE') +
+          NEXTHOP('192.168.10.254') +      /* Default gateway */
+          TEXT('Default gateway')
+
+/* Display current routes */
+WRKTCPRTE
+
+/* Remove a route */
+RMVTCPRTE RTEDEST('10.20.0.0') SUBNETMASK('255.255.0.0')
+</pre>
+
+<h2>NETSTAT: Diagnosing Connections and Interfaces</h2>
+
+<p>NETSTAT on IBM i is a full-screen interactive display of TCP/IP state. The most useful options are *IFC (interfaces), *CNN (active connections), and *RTE (routing table):</p>
+
+<pre>
+/* Display all TCP/IP interfaces and their status */
+NETSTAT OPTION(*IFC)
+
+/* Display all active TCP and UDP connections */
+NETSTAT OPTION(*CNN)
+
+/* Filter connections to a specific local port */
+NETSTAT OPTION(*CNN)    /* Then use F14=Display port numbers, F17=Subset by port */
+
+/* Display the routing table */
+NETSTAT OPTION(*RTE)
+
+/* Useful NETSTAT column interpretation:
+   *IFC columns:
+     Internet address  — the IP address bound to this interface
+     Line description  — the *LIND object (e.g. ETHLINE1)
+     Active            — *YES = interface is active and can route traffic
+
+   *CNN columns:
+     Local address:port     — IBM i side of the connection
+     Remote address:port    — the client/server at the other end
+     State                  — ESTABLISHED, LISTEN, TIME_WAIT, CLOSE_WAIT etc.
+     Idle time              — seconds since last data on this connection
+*/
+</pre>
+
+<h2>PING and TRACEROUTE</h2>
+
+<pre>
+/* Basic PING — tests reachability and measures round-trip time */
+PING RMTSYS('192.168.10.1')
+
+/* PING with options */
+PING RMTSYS('192.168.10.50') +
+     NBRPKT(10) +               /* Send 10 packets (default 5) */
+     PKTLEN(1400) +             /* Test with larger packet size (MTU check) */
+     WAITTIME(5)                /* Wait 5 seconds for each reply */
+
+/* PING a hostname */
+PING RMTSYS('smtp.corp.example.com')
+
+/* TRACEROUTE from PASE (IBM i does not have a native TRACROUTE CL command) */
+QSH CMD('traceroute 192.168.10.1')
+QSH CMD('traceroute -m 20 smtp.corp.example.com')
+
+/* PATH MTU test using PASE ping */
+QSH CMD('ping -c 4 -M do -s 1472 192.168.10.50')
+/* If this fails and smaller sizes succeed, there is a path MTU problem */
+</pre>
+
+<h2>Virtual Ethernet Between LPARs</h2>
+
+<p>When IBM i and another LPAR (Linux, AIX, or another IBM i) run on the same IBM Power server, virtual Ethernet provides high-bandwidth, low-latency inter-partition communication without using a physical network switch. The path never leaves the Power chassis:</p>
+
+<pre>
+/* Step 1: Define virtual Ethernet ports in the HMC for both LPARs
+   (done via HMC GUI or REST API — not a CL command)
+   HMC: Manage System > Logical Partition > (select LPAR) >
+        Virtual I/O Adapters > Add Virtual Ethernet Adapter
+   Virtual LAN ID: 10  (both LPARs must share the same VLAN ID)
+*/
+
+/* Step 2: On IBM i — create a line description for the virtual Ethernet port */
+CRTLINETH LIND(VETHLINE1) +
+          RSRCNAME(CMN01) +       /* Virtual Ethernet resource name from WRKHDWRSC */
+          LINESPEED(*AUTO) +
+          DUPLEX(*AUTO) +
+          TEXT('Virtual Ethernet to Linux LPAR - VLAN 10')
+
+/* Step 3: Vary on the line */
+VRYCFG CFGOBJ(VETHLINE1) CFGTYPE(*LIN) STATUS(*ON)
+
+/* Step 4: Add a TCP/IP interface on the virtual Ethernet line */
+ADDTCPIFC INTNETADR('10.0.1.1') +
+          LIND(VETHLINE1) +
+          SUBNETMASK('255.255.255.0') +
+          TEXT('Virtual Ethernet interface - IBM i side')
+
+/* Linux LPAR: assign IP 10.0.1.2/24 to its virtual Ethernet adapter */
+/* IBM i and Linux can now communicate at 10.0.1.0/24 without a physical switch */
+
+/* Verify: PING from IBM i to Linux LPAR */
+PING RMTSYS('10.0.1.2')
+</pre>
+
+<h2>Common TCP/IP Troubleshooting Scenarios</h2>
+
+<table>
+  <thead>
+    <tr><th>Symptom</th><th>First Check</th><th>Command</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Cannot PING a remote host</td><td>Is the local interface active?</td><td>NETSTAT OPTION(*IFC)</td></tr>
+    <tr><td>PING works but FTP fails</td><td>Is the FTP server started?</td><td>WRKACTJOB SBS(QSYSWRK) — look for QTFTP* jobs</td></tr>
+    <tr><td>Hostname does not resolve</td><td>Is DNS configured correctly?</td><td>CHGTCPDMN; QSH CMD('nslookup host')</td></tr>
+    <tr><td>Connection reset immediately</td><td>Is the port restricted?</td><td>CFGTCP option 4 — work with port restrictions</td></tr>
+    <tr><td>Large file transfers fail</td><td>MTU mismatch on path?</td><td>QSH CMD('ping -M do -s 1472 remote')</td></tr>
+    <tr><td>Node.js API unreachable externally</td><td>Is the port open on IBM i firewall?</td><td>CFGTCP option 4; NETSTAT *CNN on the port</td></tr>
+  </tbody>
+</table>
+
+<em>Next post: DB2 for i temporal tables and time travel queries — creating system-period temporal tables with SYSTEM_TIME periods, querying historical data with FOR SYSTEM_TIME AS OF and BETWEEN, using application-period temporal tables for business-effective dating, and implementing bi-temporal table patterns for audit-compliant data history on IBM i in 2026.</em>

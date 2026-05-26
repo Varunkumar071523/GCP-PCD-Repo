@@ -1,0 +1,179 @@
+﻿<p>The previous post covered building a REST API server on IBM i with Node.js and Express — installing Node.js in PASE, connecting to DB2 for i with the odbc package, defining route handlers, adding API key authentication middleware, returning paginated JSON responses, centralised error handling, and running the Node.js server as a persistent IBM i batch job submitted via SBMJOB. This post covers the strangler fig pattern for IBM i application modernization: what the pattern is and why it suits IBM i, identifying functional seams in monolithic RPG applications, building a REST facade over legacy RPG program calls using Node.js or Nginx, routing traffic incrementally from the legacy system to the new implementation, maintaining DB2 for i as the shared data layer during coexistence, and planning a phased full-cutover strategy in 2026.</p>
+
+<h2>What Is the Strangler Fig Pattern?</h2>
+
+<p>The strangler fig is a software modernization pattern named after the tropical fig tree that grows around a host tree, gradually taking over its structure until the original tree dies and the fig stands independently. Applied to software, it means:</p>
+
+<ol>
+  <li><strong>Do not rewrite the entire system at once.</strong> A "big bang" rewrite has a poor track record — years of effort, high risk, and a freeze on new features during the migration period.</li>
+  <li><strong>Identify a seam</strong> — a discrete function or module that can be replaced independently without breaking the rest of the system.</li>
+  <li><strong>Build the replacement</strong> alongside the legacy system, not instead of it.</li>
+  <li><strong>Route traffic</strong> for that function to the new implementation via a facade or API gateway.</li>
+  <li><strong>Retire the legacy code</strong> for that seam once the new path is proven in production.</li>
+  <li><strong>Repeat</strong> seam by seam until the legacy system is fully replaced.</li>
+</ol>
+
+<p>For IBM i, the pattern is particularly well-suited because the legacy RPG programs are extremely stable and continue running correctly during migration — there is no need to freeze features or accept increased defect rates during a lengthy rewrite.</p>
+
+<h2>Identifying Seams in a Monolithic RPG Application</h2>
+
+<p>A seam is a boundary where you can separate behaviour without changing the surrounding code. Good seam candidates on IBM i:</p>
+
+<ul>
+  <li><strong>Outbound data feeds</strong> — if an RPG program produces a flat file or calls SNDDST to email a report, replace that output step with a REST call to a new microservice. The RPG business logic stays unchanged.</li>
+  <li><strong>Lookup / reference data queries</strong> — pricing lookups, product catalogue reads, and currency conversion are stateless queries with no side effects. These are the easiest first seams.</li>
+  <li><strong>External integrations</strong> — EDI translation, bank file formatting, and logistics provider APIs are already at the system boundary. Replace them one at a time.</li>
+  <li><strong>Screen-specific logic</strong> — a specific 5250 screen that handles one business function (e.g., customer credit limit check) can be replaced with a browser-based form backed by a new service, while all other screens continue to use the legacy RPG path.</li>
+</ul>
+
+<pre>
+/* Original monolith: ORDLIB/ORDENTRY calls ORDLIB/CREDITCK inline */
+/* Seam identified: credit limit check — stateless, DB2-read-only, high-volume */
+
+/* Step 1: Extract CREDITCK into a service program with a clean interface */
+/* Step 2: Build a new REST microservice that implements the same logic */
+/* Step 3: Route credit check calls to the new service via facade */
+/* Step 4: Retire ORDLIB/CREDITCK once new service is proven */
+</pre>
+
+<h2>Building a REST Facade Over Legacy RPG: The Facade Layer</h2>
+
+<p>The facade is a thin HTTP layer that sits in front of both the legacy RPG path and the new service. Clients (5250 screens, batch jobs, or new browser UIs) call the facade URL. The facade decides which backend to route to based on a feature flag, a percentage split, or a simple cutover switch:</p>
+
+<pre>
+// facade/routes/creditCheck.js — Node.js facade on IBM i PASE
+'use strict';
+
+const express  = require('express');
+const router   = express.Router();
+const db       = require('../db');
+const rpgCall  = require('../lib/rpgCall');   // XMLSERVICE wrapper
+
+// Feature flag: read from APPLIB/FEATUREFLAGS data area or DB2 table
+async function useNewCreditService() {
+  const rows = await db.query(
+    `SELECT FLAG_VALUE FROM APPLIB.FEATURE_FLAGS WHERE FLAG_NAME = 'NEW_CREDIT_SVC'`
+  );
+  return rows.length > 0 && rows[0].FLAG_VALUE === '1';
+}
+
+// POST /api/credit-check  { custId, orderAmt }
+router.post('/', async (req, res, next) => {
+  try {
+    const { custId, orderAmt } = req.body;
+
+    if (await useNewCreditService()) {
+      // New implementation: direct DB2 query
+      const rows = await db.query(
+        `SELECT CREDIT_LIMIT, OUTSTANDING_BAL,
+                CREDIT_LIMIT - OUTSTANDING_BAL AS AVAILABLE_CREDIT
+         FROM   APPLIB.CUSTOMERS
+         WHERE  CUST_ID = ?`,
+        [custId]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'Customer not found' });
+      const { CREDIT_LIMIT, OUTSTANDING_BAL, AVAILABLE_CREDIT } = rows[0];
+      const approved = orderAmt <= AVAILABLE_CREDIT;
+      return res.json({ approved, availableCredit: AVAILABLE_CREDIT, reason: approved ? 'OK' : 'LIMIT_EXCEEDED' });
+    }
+
+    // Legacy path: call RPG CREDITCK via XMLSERVICE
+    const result = await rpgCall('ORDLIB', 'CREDITCK', [
+      { name: 'CUSTID',   type: '7p0', value: custId   },
+      { name: 'ORDAMT',   type: '13p2', value: orderAmt },
+      { name: 'APPROVED', type: '1a',  inout: 'out'    },
+      { name: 'REASON',   type: '10a', inout: 'out'    }
+    ]);
+    res.json({ approved: result.APPROVED === '1', reason: result.REASON.trim() });
+  } catch (err) { next(err); }
+});
+
+module.exports = router;
+</pre>
+
+<h2>Feature Flag Table for Incremental Traffic Routing</h2>
+
+<p>A DB2 table of feature flags allows operations to switch individual seams without a deployment. The facade reads the flag at request time — no restart required:</p>
+
+<pre>
+-- Create the feature flags table
+CREATE TABLE APPLIB.FEATURE_FLAGS (
+  FLAG_NAME    CHAR(30)     NOT NULL,
+  FLAG_VALUE   CHAR(1)      NOT NULL DEFAULT '0',   -- '0'=legacy, '1'=new
+  DESCRIPTION  VARCHAR(100),
+  UPDATED_BY   CHAR(10),
+  UPDATED_TS   TIMESTAMP    NOT NULL DEFAULT CURRENT TIMESTAMP,
+  CONSTRAINT PK_FEATUREFLAGS PRIMARY KEY (FLAG_NAME)
+);
+
+-- Initial values: all flags off (all traffic to legacy)
+INSERT INTO APPLIB.FEATURE_FLAGS (FLAG_NAME, FLAG_VALUE, DESCRIPTION)
+VALUES
+  ('NEW_CREDIT_SVC',   '0', 'Credit limit check: 0=RPG CREDITCK, 1=new DB2 service'),
+  ('NEW_PRICING_SVC',  '0', 'Pricing lookup: 0=RPG PRICECALC, 1=new REST service'),
+  ('NEW_INVENTORY_SVC','0', 'Stock check: 0=RPG STCKCHK, 1=new DB2 service');
+
+-- Enable new credit service (flip the switch — no deployment needed)
+UPDATE APPLIB.FEATURE_FLAGS
+SET    FLAG_VALUE = '1', UPDATED_BY = 'DEVUSER', UPDATED_TS = CURRENT TIMESTAMP
+WHERE  FLAG_NAME  = 'NEW_CREDIT_SVC';
+</pre>
+
+<h2>Nginx as an API Gateway for Percentage-Based Traffic Splitting</h2>
+
+<p>When the new service is ready for gradual rollout, Nginx (running in PASE) can split traffic by percentage between the legacy facade and the new service. Start at 5%, monitor error rates, and increase to 100% over days or weeks:</p>
+
+<pre>
+# /etc/nginx/conf.d/ordapi.conf — Nginx upstream split
+
+upstream credit_check_backend {
+    # 95% to legacy Node.js facade (calls RPG CREDITCK)
+    server 127.0.0.1:3000 weight=95;
+    # 5% to new credit microservice
+    server 127.0.0.1:3100 weight=5;
+}
+
+server {
+    listen 8080;
+
+    location /api/credit-check {
+        proxy_pass         http://credit_check_backend;
+        proxy_set_header   X-Forwarded-For  $remote_addr;
+        proxy_set_header   Host             $host;
+        proxy_read_timeout 30s;
+    }
+
+    # All other /api routes go to the main facade
+    location /api/ {
+        proxy_pass  http://127.0.0.1:3000;
+    }
+}
+</pre>
+
+<h2>DB2 for i as the Shared Data Layer During Coexistence</h2>
+
+<p>The key to strangler fig on IBM i is keeping DB2 for i as the single source of truth throughout the migration. Both the legacy RPG programs and the new microservices read from and write to the same DB2 tables. This eliminates data synchronisation complexity — there is no two-phase commit or event sourcing required during the migration phase:</p>
+
+<ul>
+  <li><strong>Legacy RPG programs</strong> continue to use native I/O (CHAIN, READ, WRITE) or embedded SQL to DB2 tables in ORDLIB, APPLIB, etc.</li>
+  <li><strong>New microservices</strong> use the odbc package (Node.js) or psycopg2-ibm-db (Python) to connect to the same DB2 tables.</li>
+  <li><strong>Schema changes</strong> are coordinated: add nullable columns for the new service, keep existing columns for legacy programs, and deprecate legacy columns only after legacy programs are retired for that table.</li>
+</ul>
+
+<h2>Seam Migration Checklist</h2>
+
+<table>
+  <thead>
+    <tr><th>Phase</th><th>Activity</th><th>Success Criterion</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1. Extract</td><td>Identify seam, document RPG program interface (parameters, DB2 tables)</td><td>Interface specification signed off</td></tr>
+    <tr><td>2. Build</td><td>Implement new service, write automated tests against shared DB2 data</td><td>All tests pass; parity with legacy output confirmed</td></tr>
+    <tr><td>3. Facade</td><td>Deploy facade, route 0% to new service (feature flag OFF)</td><td>All traffic via legacy; no regressions</td></tr>
+    <tr><td>4. Canary</td><td>Route 5% of traffic to new service, compare results</td><td>Error rate and latency within tolerance</td></tr>
+    <tr><td>5. Ramp</td><td>Increase to 25%, 50%, 100% over successive deployments</td><td>Zero escalated incidents at each step</td></tr>
+    <tr><td>6. Retire</td><td>Delete legacy RPG program and feature flag entry</td><td>Legacy program absent from production library</td></tr>
+  </tbody>
+</table>
+
+<em>Next post: IBM i TCP/IP configuration and troubleshooting — using the CFGTCP menu, adding and removing IP interfaces with ADDTCPIFC and RMVTCPIFC, configuring DNS with CHGTCPDMN, diagnosing network connectivity with NETSTAT, PING, and TRACEROUTE, setting up virtual Ethernet between LPARs, and managing Ethernet line descriptions on IBM i in 2026.</em>

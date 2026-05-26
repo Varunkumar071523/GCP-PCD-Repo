@@ -1,0 +1,307 @@
+<p>The previous post covered DB2 for i CTEs and recursive SQL — the WITH clause for readable multi-step queries, chaining multiple CTEs, using CTEs in UPDATE and DELETE statements, traversing hierarchical data with WITH RECURSIVE, BOM explosion, organisational hierarchy queries, cycle detection, and CTE performance considerations on IBM i. This post covers IBM i job scheduling: adding and managing job schedule entries with ADDJOBSCDE and WRKJOBSCDE, scheduling frequency patterns, failure notification via message queues, the IBM Advanced Job Scheduler (5770-JS1) for dependency-aware job chains, and querying schedule status and history using QSYS2.SCHEDULED_JOB_INFO in 2026.</p>
+
+<h2>IBM i Job Scheduling Overview</h2>
+
+<p>IBM i provides two levels of job scheduling capability out of the box:</p>
+<ul>
+  <li><strong>IBM i Job Scheduler (built-in)</strong> — the base job scheduler built into OS/400 and IBM i since V3R6. It uses <em>job schedule entries</em> (managed with ADDJOBSCDE, WRKJOBSCDE, CHGJOBSCDE, RMVJOBSCDE) to define when and how jobs run. Simple, reliable, and sufficient for most batch automation needs.</li>
+  <li><strong>IBM Advanced Job Scheduler (5770-JS1)</strong> — a separately licensed IBM product that adds job dependency chains (job A runs only after job B completes), calendar-based scheduling, holiday exclusions, escalation rules, and a full graphical job schedule dashboard. Required for complex production batch scheduling in larger IBM i shops.</li>
+</ul>
+
+<p>Both schedulers submit jobs to IBM i job queues (JOBQ) for execution. The scheduler daemon (QWCJBSCD subsystem) runs continuously and evaluates schedule entries each minute, submitting any jobs whose scheduled time has arrived.</p>
+
+<h2>ADDJOBSCDE — Adding a Job Schedule Entry</h2>
+
+<p><code>ADDJOBSCDE</code> (Add Job Schedule Entry) creates a named schedule entry that runs a CL command at a specified time on a specified frequency. The command being scheduled is typically a SBMJOB call, a CL program, or a single CL command like STRPJ or CALL.</p>
+
+<pre>
+/* Schedule a nightly order batch run at 22:00 every weekday */
+ADDJOBSCDE JOB(ORDNIGHT) +
+           CMD(SBMJOB JOB(ORDNIGHT) JOBQ(APPLIB/APPJOBQ) +
+               CMD(CALL PGM(APPLIB/ORDNGTPRC)) +
+               JOBD(APPLIB/APPJOBD) JOBPTY(5)) +
+           FRQCYC(*WEEKLY) +
+           SCDDAY(*MON *TUE *WED *THU *FRI) +
+           SCDTIME('220000') +
+           OMITDAY(*NONE) +
+           RCYACN(*NOSBM) +         /* Do not auto-retry if missed */
+           TEXT('Nightly order processing batch run')
+
+/* Schedule a monthly statement generation on the last day of the month */
+/* IBM i does not natively support "last day of month" so use day 28 */
+/* and add logic inside the program to check for end-of-month */
+ADDJOBSCDE JOB(MTHSTMT) +
+           CMD(SBMJOB JOB(MTHSTMT) JOBQ(APPLIB/APPJOBQ) +
+               CMD(CALL PGM(APPLIB/MTHSTMTPRC)) +
+               JOBD(APPLIB/APPJOBD)) +
+           FRQCYC(*MONTHLY) +
+           SCDDATE(*MONTHEND) +     /* Submit on last day of each month */
+           SCDTIME('010000') +      /* 1:00 AM */
+           TEXT('Monthly customer statement generation')
+
+/* One-time job: run a data migration on a specific date */
+ADDJOBSCDE JOB(DATAMIG) +
+           CMD(SBMJOB JOB(DATAMIG) JOBQ(APPLIB/APPJOBQ) +
+               CMD(CALL PGM(APPLIB/MIGPRC))) +
+           FRQCYC(*ONCE) +
+           SCDDATE('2026-08-01') +
+           SCDTIME('020000') +
+           TEXT('One-time data migration to new schema')
+</pre>
+
+<h2>ADDJOBSCDE Schedule Frequency Parameters</h2>
+
+<table>
+  <thead>
+    <tr><th>FRQCYC Value</th><th>SCDDAY / SCDDATE</th><th>Typical Use</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>*WEEKLY</td><td>SCDDAY(*MON *WED *FRI)</td><td>Jobs that run on specific days of the week</td></tr>
+    <tr><td>*MONTHLY</td><td>SCDDATE(1) or (*MONTHEND)</td><td>Month-start or month-end processing</td></tr>
+    <tr><td>*ONCE</td><td>SCDDATE('2026-09-01')</td><td>One-time jobs: migrations, retrofits</td></tr>
+    <tr><td>*DAILY</td><td>n/a</td><td>Every calendar day including weekends</td></tr>
+    <tr><td>*WEEKLY with all 7 days</td><td>SCDDAY(*ALL)</td><td>Equivalent to *DAILY but excludes specific days more easily</td></tr>
+  </tbody>
+</table>
+
+<pre>
+/* Daily backup job — every day at 23:30 */
+ADDJOBSCDE JOB(DLYBACKUP) +
+           CMD(SBMJOB JOB(DLYBACKUP) JOBQ(QSYSNOMAX) +
+               CMD(CALL PGM(APPLIB/BAKPRC)) +
+               JOBD(APPLIB/APPJOBD)) +
+           FRQCYC(*DAILY) +
+           SCDTIME('233000') +
+           TEXT('Daily incremental backup')
+
+/* Weekly purge job — every Sunday at 03:00 */
+ADDJOBSCDE JOB(WKLYPURGE) +
+           CMD(SBMJOB JOB(WKLYPURGE) JOBQ(APPLIB/APPJOBQ) +
+               CMD(CALL PGM(APPLIB/PURGEPRC))) +
+           FRQCYC(*WEEKLY) +
+           SCDDAY(*SUN) +
+           SCDTIME('030000') +
+           TEXT('Weekly purge of old transaction records')
+
+/* First of month accounts receivable aging */
+ADDJOBSCDE JOB(MTHAGING) +
+           CMD(SBMJOB JOB(MTHAGING) JOBQ(APPLIB/APPJOBQ) +
+               CMD(CALL PGM(APPLIB/ARAGING))) +
+           FRQCYC(*MONTHLY) +
+           SCDDATE(1) +             /* Day 1 of each month */
+           SCDTIME('060000') +
+           TEXT('Monthly AR aging run')
+</pre>
+
+<h2>WRKJOBSCDE — Managing Job Schedule Entries</h2>
+
+<p><code>WRKJOBSCDE</code> (Work with Job Schedule Entries) displays all defined job schedule entries and their current status. From the Work with screen, operators can hold, release, change, delete, and manually submit schedule entries.</p>
+
+<pre>
+/* Display all job schedule entries */
+WRKJOBSCDE
+
+/* Display entries for a specific job name */
+WRKJOBSCDE JOB(ORDNIGHT)
+
+/* Hold a job schedule entry temporarily (stops it from submitting) */
+HLDJOBSCDE JOB(ORDNIGHT)
+
+/* Release a held entry */
+RLSJOBSCDE JOB(ORDNIGHT)
+
+/* Change the run time of an existing entry */
+CHGJOBSCDE JOB(ORDNIGHT) +
+           SCDTIME('210000') +     /* Change from 22:00 to 21:00 */
+           TEXT('Nightly order processing - moved to 21:00')
+
+/* Remove a job schedule entry permanently */
+RMVJOBSCDE JOB(DATAMIG)
+
+/* Manually submit a scheduled job immediately (for testing) */
+/* Use SBMJOBSCDE to run the job now regardless of its schedule */
+SBMJOBSCDE JOB(ORDNIGHT)
+</pre>
+
+<h2>Failure Notification via Message Queues</h2>
+
+<p>When a scheduled job fails, IBM i sends a message to the job's MSGQ parameter. Configuring a monitored message queue for schedule failures is essential for production operations. The standard pattern is to have the CL program that runs as the scheduled job send an error notification to a designated operations message queue if it encounters an error.</p>
+
+<pre>
+/* CL program pattern: scheduled batch job with failure notification */
+/* APPLIB/ORDNGTPRC — Nightly order processing CL */
+PGM
+
+DCL VAR(&ERRFLAG)  TYPE(*LGL)  VALUE('0')
+DCL VAR(&ERRMSG)   TYPE(*CHAR) LEN(100)
+
+MONMSG MSGID(CPF0000 MCH0000) EXEC(GOTO CMDLBL(ERROR))
+
+/* === Main Processing === */
+CALL PGM(APPLIB/ORDVALID)    /* Validate open orders */
+CALL PGM(APPLIB/ORDBATCH)    /* Process batch orders */
+CALL PGM(APPLIB/ORDINVGEN)   /* Generate invoices */
+CALL PGM(APPLIB/ORDSHIPUPD)  /* Update shipment status */
+
+/* Send success notification */
+SNDMSG MSG('ORDNIGHT completed successfully') +
+       TOUSR(OPSNOTIFY)
+
+GOTO CMDLBL(ENDJOB)
+
+ERROR:
+  CHGVAR VAR(&ERRFLAG) VALUE('1')
+  RCVMSG MSGTYPE(*EXCP) MSG(&ERRMSG)
+
+  /* Send failure alert to operations message queue */
+  SNDMSG MSG('ORDNIGHT FAILED: ' *CAT &ERRMSG) +
+       TOUSR(OPSNOTIFY) MSGTYPE(*INQ)
+
+  /* Also log to the system operator message queue */
+  SNDPGMMSG MSGID(CPF9898) MSGF(QCPFMSG) +
+       MSGDTA('ORDNIGHT FAILED - check JOBLOG for details') +
+       TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+
+ENDJOB:
+  ENDPGM
+</pre>
+
+<p>For email-based alerts, the notification CL can call an email-sending program (covered in the next post) rather than — or in addition to — sending a message to a message queue. Many IBM i operations teams use both: message queue alerts for on-call operators watching the green screen, and email/SMS alerts for escalation.</p>
+
+<h2>Querying Schedule Status with QSYS2.SCHEDULED_JOB_INFO</h2>
+
+<p>The QSYS2.SCHEDULED_JOB_INFO SQL view (IBM i 7.3+) provides SQL access to all job schedule entries without requiring screen interaction. This enables automated monitoring, dashboards, and reporting on the current schedule state:</p>
+
+<pre>
+-- List all active job schedule entries with their next run time
+SELECT
+    JOB_NAME,
+    JOB_SCHEDULE_STATUS,
+    NEXT_SUBMISSION_DATE,
+    NEXT_SUBMISSION_TIME,
+    LAST_SUBMISSION_DATE,
+    LAST_SUBMISSION_TIME,
+    LAST_COMPLETION_STATUS,
+    SCHEDULE_FREQUENCY,
+    SCHEDULE_DAYS,
+    COMMAND_TO_RUN
+FROM QSYS2.SCHEDULED_JOB_INFO
+ORDER BY NEXT_SUBMISSION_DATE, NEXT_SUBMISSION_TIME;
+
+-- Find any held schedule entries (may indicate a problem)
+SELECT
+    JOB_NAME,
+    JOB_SCHEDULE_STATUS,
+    LAST_COMPLETION_STATUS,
+    LAST_SUBMISSION_DATE
+FROM QSYS2.SCHEDULED_JOB_INFO
+WHERE JOB_SCHEDULE_STATUS = '*HLD'
+ORDER BY JOB_NAME;
+
+-- Jobs that ran in the last 24 hours — useful for morning operations check
+SELECT
+    JOB_NAME,
+    LAST_SUBMISSION_DATE,
+    LAST_SUBMISSION_TIME,
+    LAST_COMPLETION_STATUS,
+    NEXT_SUBMISSION_DATE,
+    NEXT_SUBMISSION_TIME
+FROM QSYS2.SCHEDULED_JOB_INFO
+WHERE LAST_SUBMISSION_DATE = CURRENT DATE
+   OR (LAST_SUBMISSION_DATE = CURRENT DATE - 1 DAY
+       AND LAST_SUBMISSION_TIME >= '220000')
+ORDER BY LAST_SUBMISSION_DATE, LAST_SUBMISSION_TIME;
+</pre>
+
+<h2>The IBM Advanced Job Scheduler (5770-JS1)</h2>
+
+<p>The IBM Advanced Job Scheduler (AJS, product 5770-JS1) extends the base scheduler with capabilities that the built-in ADDJOBSCDE cannot provide:</p>
+<ul>
+  <li><strong>Job dependencies</strong> — Job B runs only after Job A has completed successfully; entire job chains can be defined with predecessor/successor relationships</li>
+  <li><strong>Calendar-based scheduling</strong> — define named calendars (fiscal calendars, holiday calendars, working-day calendars) and assign them to job entries; the scheduler automatically skips non-working days and reschedules to the next eligible date</li>
+  <li><strong>Escalation and notification</strong> — configurable alerts when a job takes longer than expected, when a job fails, or when a job does not start within a tolerance window</li>
+  <li><strong>Job groups</strong> — a group of jobs that run sequentially in order, with each job starting only after the previous one completes</li>
+  <li><strong>Activity log and history</strong> — a persistent log of every job submission, completion, and failure with job log attachment</li>
+</ul>
+
+<pre>
+/* AJS uses different commands from the base scheduler */
+/* These examples assume 5770-JS1 is installed */
+
+/* Add an AJS job */
+ADDJOBJS JOB(ORDNIGHT) +
+         CMD(SBMJOB JOB(ORDNIGHT) JOBQ(APPLIB/APPJOBQ) +
+             CMD(CALL PGM(APPLIB/ORDNGTPRC))) +
+         SCDCDE(*WEEKLY) +
+         SCDDAY(*MON *TUE *WED *THU *FRI) +
+         STRTIME('220000') +
+         MSGQ(APPLIB/OPSNOTIFY) +
+         RCYACN(*NOSBM)
+
+/* Define a dependency: ORDINVGEN runs after ORDNIGHT */
+ADDJOBDEP PJOB(ORDNIGHT)        /* Predecessor job */
+          DJOB(ORDINVGEN)        /* Dependent job */
+          CNDTYPE(*COMPLETE)     /* Only if predecessor completed successfully */
+
+/* View job schedule and dependencies graphically */
+/* Use the AJS graphical interface: GO WRKJOBJS */
+WRKJOBJS
+
+/* Display AJS history log for a specific job */
+DSPJSHLOG JOB(ORDNIGHT) PERIOD((*AVAIL) (*CURRENT)) OUTPUT(*PRINT)
+</pre>
+
+<h2>CL Script to Build a Full Nightly Schedule</h2>
+
+<pre>
+/* CL: Set up the complete nightly batch schedule for APPLIB */
+/* Run once during initial environment configuration */
+
+/* Remove any existing entries first */
+RMVJOBSCDE JOB(ORDNIGHT)  /* Ignore errors if they don't exist */
+RMVJOBSCDE JOB(INVNIGHT)
+RMVJOBSCDE JOB(GLNIGHT)
+RMVJOBSCDE JOB(DLYBACKUP)
+MONMSG MSGID(CPF1634)     /* Entry not found — ignore */
+
+/* Add the schedule entries in order */
+ADDJOBSCDE JOB(ORDNIGHT) +
+           CMD(SBMJOB JOB(ORDNIGHT) JOBQ(APPLIB/APPJOBQ) +
+               CMD(CALL PGM(APPLIB/ORDNGTPRC))) +
+           FRQCYC(*WEEKLY) SCDDAY(*MON *TUE *WED *THU *FRI) +
+           SCDTIME('200000') TEXT('Order nightly close')
+
+ADDJOBSCDE JOB(INVNIGHT) +
+           CMD(SBMJOB JOB(INVNIGHT) JOBQ(APPLIB/APPJOBQ) +
+               CMD(CALL PGM(APPLIB/INVNGTPRC))) +
+           FRQCYC(*WEEKLY) SCDDAY(*MON *TUE *WED *THU *FRI) +
+           SCDTIME('210000') TEXT('Inventory nightly update')
+
+ADDJOBSCDE JOB(GLNIGHT) +
+           CMD(SBMJOB JOB(GLNIGHT) JOBQ(APPLIB/APPJOBQ) +
+               CMD(CALL PGM(APPLIB/GLNGTPRC))) +
+           FRQCYC(*WEEKLY) SCDDAY(*MON *TUE *WED *THU *FRI) +
+           SCDTIME('220000') TEXT('GL nightly posting')
+
+ADDJOBSCDE JOB(DLYBACKUP) +
+           CMD(SBMJOB JOB(DLYBACKUP) JOBQ(QSYSNOMAX) +
+               CMD(CALL PGM(APPLIB/BAKPRC))) +
+           FRQCYC(*DAILY) SCDTIME('233000') +
+           TEXT('Daily incremental backup')
+
+SNDMSG MSG('APPLIB job schedule configured') TOUSR(QSYSOPR)
+</pre>
+
+<h2>Job Scheduling Best Practices for 2026</h2>
+
+<ul>
+  <li><strong>Use QSYSNOMAX as the job queue for backup jobs</strong> — backup jobs must not be blocked by a full application job queue; QSYSNOMAX has no maximum active job limit</li>
+  <li><strong>Set RCYACN(*NOSBM) for jobs that should not auto-retry</strong> — if a financial close job misses its window, auto-retrying could cause double-processing; always default to *NOSBM and handle retries manually</li>
+  <li><strong>Monitor QSYS2.SCHEDULED_JOB_INFO daily</strong> — build a simple SQL script that checks for held entries and jobs with LAST_COMPLETION_STATUS &lt;&gt; 'NORMAL'; run it as the first item in the morning operations checklist</li>
+  <li><strong>Stagger job start times by at least 10 minutes</strong> — multiple jobs starting simultaneously compete for CPU, I/O, and job queue slots; spread nightly jobs across a 3-4 hour window</li>
+  <li><strong>Always include SNDMSG success/failure notifications in batch CL programs</strong> — the scheduler submits the job and forgets it; without an explicit notification, a silent failure is invisible until a downstream job fails or a user notices missing data the next morning</li>
+  <li><strong>Document the schedule in a shared location</strong> — job dependencies, expected run times, and recovery procedures belong in a runbook accessible to the operations team, not just in CL comments</li>
+  <li><strong>Use AJS for any chain with three or more dependent jobs</strong> — managing sequential dependencies manually with hardcoded start times is fragile; if one job runs long, all downstream times must be manually adjusted</li>
+</ul>
+
+<em>Next post: IBM i Outbound Email — configuring SMTP on IBM i with CHGSMTPA, sending plain-text alerts via SNDDST and SNDSMTPEMM from CL, building multipart HTML email directly from RPG using MIME formatting, sending notifications from PASE with Python smtplib, email attachments, and a reusable CL email alert wrapper for batch job failures.</em>

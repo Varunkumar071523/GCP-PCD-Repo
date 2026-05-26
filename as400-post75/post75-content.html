@@ -1,0 +1,457 @@
+<p>The previous post covered IBM i TCP/IP configuration and troubleshooting — the CFGTCP menu, adding and removing TCP/IP interfaces with ADDTCPIFC and RMVTCPIFC, configuring DNS with CHGTCPDMN, managing static routes, diagnosing connectivity with NETSTAT, PING, and TRACEROUTE, setting up virtual Ethernet for LPAR communication, and managing Ethernet line descriptions on IBM i. This post covers ILE RPG string handling in depth: the %SCAN, %SUBST, %REPLACE, %TRIM, %TRIMR, and %TRIML built-in functions, declaring VARCHAR and VARYING fields for variable-length data, concatenating and splitting strings, building and parsing delimited strings (CSV, pipe-delimited), CCSID-safe string operations, and converting between character, numeric, and date types with %CHAR, %INT, %DEC, and %DATE on IBM i in 2026.</p>
+
+<h2>Character Field Types: CHAR vs. VARCHAR vs. VARYING</h2>
+
+<p>Before diving into string functions, it is important to understand the three ways RPG declares character data — each with different storage and behaviour implications.</p>
+
+<table>
+  <tr>
+    <th>Declaration</th>
+    <th>Length</th>
+    <th>Stored as</th>
+    <th>%LEN returns</th>
+    <th>Best for</th>
+  </tr>
+  <tr>
+    <td><code>Dcl-S x Char(50)</code></td>
+    <td>Fixed 50 bytes</td>
+    <td>50 bytes, right-padded with spaces</td>
+    <td>Always 50</td>
+    <td>Fixed-length codes, keys, legacy F-spec fields</td>
+  </tr>
+  <tr>
+    <td><code>Dcl-S x Varchar(200)</code></td>
+    <td>Variable 0–200 bytes</td>
+    <td>2-byte length prefix + content bytes</td>
+    <td>Current content length</td>
+    <td>Names, addresses, descriptions, JSON fragments</td>
+  </tr>
+  <tr>
+    <td><code>Dcl-S x Char(200) Varying</code></td>
+    <td>Variable 0–200 bytes</td>
+    <td>Same as Varchar — 2-byte prefix + content</td>
+    <td>Current content length</td>
+    <td>Equivalent to Varchar — Varying is the older keyword</td>
+  </tr>
+</table>
+
+<pre>
+**FREE
+// Fixed-length char — always 50 bytes; comparisons include trailing spaces
+Dcl-S  ProdCode    Char(50);
+Dcl-S  CustName    Varchar(100);    // Variable length — no trailing spaces
+Dcl-S  Description Varchar(500);
+
+// Assign values
+ProdCode    = 'WIDGET-A1';          // Padded to 50 chars with spaces
+CustName    = 'Acme Manufacturing'; // Stored as 18 chars (no padding)
+Description = 'Standard widget, 10mm diameter, stainless steel';
+
+// %LEN: returns current length of a VARCHAR field, max length of CHAR
+Dcl-S  NameLen  Int(10);
+NameLen = %Len(CustName);      // 18
+NameLen = %Len(ProdCode);      // Always 50 — max length, not content length
+
+// %TrimR: trims trailing spaces — turns CHAR into effective VARCHAR
+Dcl-S  Trimmed  Varchar(50);
+Trimmed = %TrimR(ProdCode);    // 'WIDGET-A1' — 9 chars, no trailing spaces
+
+// For CHAR fields, always %TrimR before comparing or concatenating
+If %TrimR(ProdCode) = 'WIDGET-A1';
+  // This works correctly regardless of padding
+EndIf;
+</pre>
+
+<h2>%SCAN: Finding a Substring or Character</h2>
+
+<p><code>%SCAN(searcharg : base : start)</code> searches for <code>searcharg</code> within <code>base</code>, starting at position <code>start</code> (default 1). Returns the position of the first match, or 0 if not found. Positions are 1-based in RPG.</p>
+
+<pre>
+**FREE
+Dcl-S  FullPath    Varchar(500);
+Dcl-S  FileName    Varchar(256);
+Dcl-S  SlashPos    Int(10);
+Dcl-S  LastSlash   Int(10);
+Dcl-S  CsvLine     Varchar(2000);
+Dcl-S  CommaPos    Int(10);
+Dcl-S  Field1      Varchar(100);
+
+// Find the last slash in a path to extract the filename
+FullPath  = '/home/batch/exports/custlist_20260718.csv';
+LastSlash = 0;
+SlashPos  = %Scan('/' : FullPath);
+
+DoW SlashPos > 0;
+  LastSlash = SlashPos;
+  SlashPos  = %Scan('/' : FullPath : LastSlash + 1);
+EndDo;
+
+If LastSlash > 0;
+  FileName = %SubSt(FullPath : LastSlash + 1);  // 'custlist_20260718.csv'
+EndIf;
+
+// Find the first comma in a CSV field
+CsvLine  = 'CUST001,"Acme Manufacturing",Toronto,ON,15000.00';
+CommaPos = %Scan(',' : CsvLine);      // Returns 8
+
+// Find a multi-character substring
+Dcl-S  HtmlText    Varchar(5000);
+Dcl-S  TagStart    Int(10);
+HtmlText = '<div class="order-total">$1,234.56</div>';
+TagStart = %Scan('<div' : HtmlText);  // Returns 1
+
+// %SCAN is case-sensitive — 'div' <> 'DIV'
+// For case-insensitive search, convert both to same case first:
+TagStart = %Scan(%Upper('<div') : %Upper(HtmlText));
+
+// Count occurrences of a character in a string
+Dcl-S  PipeStr   Varchar(500);
+Dcl-S  PipeCount Int(10);
+Dcl-S  SrchPos   Int(10);
+
+PipeStr   = 'A|BB|CCC|DDDD|E';
+PipeCount = 0;
+SrchPos   = %Scan('|' : PipeStr);
+DoW SrchPos > 0;
+  PipeCount += 1;
+  SrchPos    = %Scan('|' : PipeStr : SrchPos + 1);
+EndDo;
+// PipeCount = 4
+</pre>
+
+<h2>%SUBST: Extracting and Replacing Substrings</h2>
+
+<p><code>%SUBST(string : start : length)</code> extracts a portion of a string. When used on the left side of an assignment, it replaces that portion in place. The <code>length</code> parameter is optional — omitting it extracts from <code>start</code> to the end of the string.</p>
+
+<pre>
+**FREE
+Dcl-S  OrderNo    Char(10);
+Dcl-S  YearPart   Char(4);
+Dcl-S  SeqPart    Char(6);
+Dcl-S  PipeData   Varchar(500);
+Dcl-S  Fields     Varchar(100)  Dim(20);
+Dcl-S  FieldCount Int(10);
+Dcl-S  CurrPos    Int(10);
+Dcl-S  DelimPos   Int(10);
+Dcl-S  FldLen     Int(10);
+
+// Extract year and sequence from order number 'ORD2026001234'
+OrderNo  = 'ORD2026001234';
+YearPart = %SubSt(OrderNo : 4 : 4);   // '2026'
+SeqPart  = %SubSt(OrderNo : 8);       // '001234' (to end)
+
+// Parse pipe-delimited string into an array
+PipeData   = 'CUST001|Acme Manufacturing|Toronto|ON|15000.00';
+FieldCount = 0;
+CurrPos    = 1;
+
+DoU CurrPos > %Len(PipeData);
+  DelimPos = %Scan('|' : PipeData : CurrPos);
+
+  If DelimPos > 0;
+    FldLen = DelimPos - CurrPos;
+  Else;
+    FldLen = %Len(PipeData) - CurrPos + 1;
+  EndIf;
+
+  If FldLen > 0;
+    FieldCount        += 1;
+    Fields(FieldCount) = %SubSt(PipeData : CurrPos : FldLen);
+  EndIf;
+
+  If DelimPos > 0;
+    CurrPos = DelimPos + 1;
+  Else;
+    Leave;
+  EndIf;
+EndDo;
+// Fields(1) = 'CUST001', Fields(2) = 'Acme Manufacturing', etc.
+
+// %SUBST on the left side — in-place replacement
+Dcl-S  MaskCard   Char(19);
+MaskCard = '4532 1234 5678 9012';
+%SubSt(MaskCard : 6 : 9) = 'XXXX XXXX';  // '4532 XXXX XXXX 9012'
+</pre>
+
+<h2>%REPLACE: Substituting Substrings</h2>
+
+<p><code>%REPLACE(replacement : original : start : length)</code> returns a new string with the portion from <code>start</code> for <code>length</code> characters replaced by <code>replacement</code>. Unlike <code>%SUBST</code> on the left, it works on the right side and returns a new value without modifying the original.</p>
+
+<pre>
+**FREE
+Dcl-S  Template   Varchar(500);
+Dcl-S  Result     Varchar(500);
+Dcl-S  CustName   Varchar(100);
+Dcl-S  InvNo      Char(10);
+Dcl-S  PlaceholderPos Int(10);
+
+// Simple token replacement in a message template
+Template  = 'Dear {CUSTNAME}, your invoice {INVNO} is ready.';
+CustName  = 'Acme Manufacturing';
+InvNo     = 'INV0012345';
+
+// Replace {CUSTNAME}
+PlaceholderPos = %Scan('{CUSTNAME}' : Template);
+If PlaceholderPos > 0;
+  Result = %Replace(CustName : Template : PlaceholderPos : 10);
+EndIf;
+
+// Replace {INVNO} in the updated string
+PlaceholderPos = %Scan('{INVNO}' : Result);
+If PlaceholderPos > 0;
+  Result = %Replace(%TrimR(InvNo) : Result : PlaceholderPos : 7);
+EndIf;
+// Result = 'Dear Acme Manufacturing, your invoice INV0012345 is ready.'
+
+// Replace all occurrences of a character (e.g., replace commas with tabs)
+Dcl-S  CsvLine    Varchar(2000);
+Dcl-S  TabLine    Varchar(2000);
+Dcl-S  CommaPos   Int(10);
+
+CsvLine  = 'CUST001,Acme,Toronto,ON';
+TabLine  = CsvLine;
+CommaPos = %Scan(',' : TabLine);
+
+DoW CommaPos > 0;
+  TabLine  = %Replace(X'05' : TabLine : CommaPos : 1);  // X'05' = tab in EBCDIC
+  CommaPos = %Scan(',' : TabLine : CommaPos + 1);
+EndDo;
+</pre>
+
+<h2>%TRIM, %TRIMR, %TRIML: Removing Whitespace</h2>
+
+<p>The trim built-ins remove leading, trailing, or both ends of whitespace (or a specified set of characters) from a string. They are essential when working with fixed-length CHAR fields that arrive padded with trailing spaces.</p>
+
+<pre>
+**FREE
+Dcl-S  PaddedName   Char(50);
+Dcl-S  CleanName    Varchar(50);
+Dcl-S  PaddedCode   Char(10);
+
+PaddedName = 'Acme Manufacturing';   // 50 chars: 18 content + 32 trailing spaces
+PaddedCode = '  ORD0001  ';         // Leading and trailing spaces
+
+// %TRIMR: remove trailing spaces (most common — converts padded CHAR to clean string)
+CleanName = %TrimR(PaddedName);    // 'Acme Manufacturing' — 18 chars
+
+// %TRIML: remove leading characters
+Dcl-S  Stripped  Varchar(10);
+Stripped = %TrimL(PaddedCode);    // 'ORD0001  ' — still has trailing spaces
+
+// %TRIM: remove both leading and trailing spaces
+Stripped = %Trim(PaddedCode);     // 'ORD0001'
+
+// Trim a specific character (not just spaces) — new in IBM i 7.4+
+// %Trim(string : characters) — characters is a list of chars to trim
+Dcl-S  WithSlashes  Varchar(50);
+Dcl-S  NoSlashes    Varchar(50);
+WithSlashes = '///path/to/file///';
+NoSlashes   = %Trim(WithSlashes : '/');  // 'path/to/file'
+
+// Practical pattern: build a clean concatenated key
+Dcl-S  CustNo      Char(7);
+Dcl-S  BranchCode  Char(3);
+Dcl-S  CompositeKey Varchar(20);
+
+CustNo     = 'C001234';
+BranchCode = 'TOR';
+CompositeKey = %TrimR(CustNo) + '-' + %TrimR(BranchCode);  // 'C001234-TOR'
+</pre>
+
+<h2>String Concatenation: + Operator and %CAT / %TCAT</h2>
+
+<p>In free-format RPG, the <code>+</code> operator concatenates strings. For CHAR fields, <code>+</code> preserves trailing spaces — use <code>%TrimR</code> to strip them first. The older <code>%CAT</code> and <code>%TCAT</code> built-ins are still valid but largely replaced by <code>+</code> with explicit trimming in modern free-format RPG.</p>
+
+<pre>
+**FREE
+Dcl-S  FirstName   Char(30);
+Dcl-S  LastName    Char(30);
+Dcl-S  FullName    Varchar(62);
+Dcl-S  CsvLine     Varchar(2000);
+Dcl-S  OrderNo     Char(10);
+Dcl-S  Amount      Packed(11:2);
+Dcl-S  DateStr     Char(10);
+
+FirstName = 'John';
+LastName  = 'Smith';
+
+// Without trimming — includes 26 trailing spaces from FirstName
+FullName  = FirstName + ' ' + LastName;  // 'John                          Smith'
+
+// With trimming — correct
+FullName  = %TrimR(FirstName) + ' ' + %TrimR(LastName);  // 'John Smith'
+
+// Build a CSV detail line
+OrderNo = 'ORD0012345';
+Amount  = 2450.75;
+DateStr = %Char(%Date() : *ISO);
+
+CsvLine = %TrimR(OrderNo) + ',' +
+          %Char(Amount)   + ',' +
+          DateStr         + X'0D25';  // CRLF in EBCDIC
+
+// Build a JSON fragment (for simple cases — use a JSON library for production)
+Dcl-S  CustNo    Char(7);
+Dcl-S  JsonFrag  Varchar(200);
+CustNo   = 'C001234';
+JsonFrag = '{"custNo":"' + %TrimR(CustNo) + '",' +
+           '"amount":'   + %Char(Amount)  + ',' +
+           '"date":"'    + DateStr        + '"}';
+</pre>
+
+<h2>Type Conversion: %CHAR, %INT, %DEC, %FLOAT</h2>
+
+<p>RPG built-in functions convert between numeric, date/time, and character types. These are safe — they do not use MI instructions or MOVE operations and work correctly with all CCSID settings.</p>
+
+<pre>
+**FREE
+Dcl-S  NumericVal   Packed(9:2);
+Dcl-S  IntVal       Int(10);
+Dcl-S  CharVal      Varchar(20);
+Dcl-S  DateVal      Date(*ISO);
+Dcl-S  ParsedNum    Packed(9:2);
+
+NumericVal = 1234.56;
+IntVal     = 42;
+DateVal    = %Date();
+
+// Numeric to character
+CharVal = %Char(NumericVal);      // '1234.56'
+CharVal = %Char(IntVal);          // '42'
+CharVal = %Char(DateVal : *ISO);  // '2026-07-18'
+CharVal = %Char(DateVal : *USA);  // '07/18/2026'
+
+// Character to numeric — %INT, %DEC, %FLOAT
+Dcl-S  StrNum     Varchar(20);
+Dcl-S  AsInt      Int(10);
+Dcl-S  AsPacked   Packed(11:2);
+
+StrNum  = '9876';
+AsInt   = %Int(StrNum);           // 9876  (truncates decimals)
+AsInt   = %IntH(StrNum);          // 9876  (rounds half-up)
+
+StrNum  = '1234.56';
+AsPacked = %Dec(StrNum : 9 : 2);  // 1234.56
+
+// Check for valid numeric before converting — avoid MCH1202 decimal error
+Dcl-S  IsNum  Ind;
+IsNum = %Check('0123456789.' : %Trim(StrNum)) = 0;
+If IsNum;
+  AsPacked = %Dec(StrNum : 11 : 2);
+EndIf;
+
+// Convert edit code format ('1,234.56') to numeric
+// Strip the comma first
+Dcl-S  EditStr   Varchar(20);
+EditStr  = '1,234.56';
+DoW %Scan(',' : EditStr) > 0;
+  EditStr = %Replace('' : EditStr : %Scan(',' : EditStr) : 1);
+EndDo;
+AsPacked = %Dec(EditStr : 11 : 2);   // 1234.56
+</pre>
+
+<h2>CCSID-Safe String Operations</h2>
+
+<p>IBM i uses EBCDIC (typically CCSID 37 in North America) for program data, but IFS stream files, REST APIs, and modern integrations often use UTF-8 (CCSID 1208). Understanding how CCSID affects string operations prevents subtle encoding bugs.</p>
+
+<pre>
+**FREE
+// CCSID declaration on a variable — tells RPG the encoding of this string
+Dcl-S  EbcdicStr  Varchar(200) CCSID(*HEX);  // Treat as raw bytes, no conversion
+Dcl-S  Utf8Str    Varchar(200) CCSID(1208);  // UTF-8 string
+Dcl-S  NativeStr  Varchar(200);               // Job CCSID (default — e.g., CCSID 37)
+
+// Convert between CCSID using %FROMUTF8 and %TOUTF8 (IBM i 7.4+)
+// Or use embedded SQL CAST for reliable conversion
+Dcl-S  AsNative  Varchar(200);
+Exec SQL
+  SET :AsNative = CAST(:Utf8Str AS VARCHAR(200) CCSID 37);
+
+// Convert native EBCDIC to UTF-8 for IFS file or REST response
+Exec SQL
+  SET :Utf8Str = CAST(:NativeStr AS VARCHAR(200) CCSID 1208);
+
+// CCSID 65535 (*HEX) — bypass all CCSID conversion (raw bytes)
+// Useful when working with binary data that must not be translated
+Dcl-S  RawBytes  Char(1024) CCSID(65535);
+
+// Multi-byte CCSID: CCSID 935 (Simplified Chinese), 939 (Japanese)
+// %SCAN, %SUBST, %REPLACE all work on byte positions, not character positions
+// For DBCS safety, use SQL LOCATE, SUBSTRING, REPLACE which are character-aware
+Dcl-S  JapaneseName  Varchar(100) CCSID(939);
+Dcl-S  CharPos       Int(10);
+
+Exec SQL
+  SET :CharPos = LOCATE('検索' , :JapaneseName);  // Character-position search
+</pre>
+
+<h2>Practical Pattern: Building a Pipe-Delimited Output File</h2>
+
+<p>This complete example reads customer orders from DB2, builds a pipe-delimited line for each order using the string built-ins covered above, and writes the output to an IFS stream file — a common IBM i integration pattern for downstream systems.</p>
+
+<pre>
+**FREE
+Ctl-Opt DftActGrp(*No) ActGrp('EXPGRP');
+
+Dcl-S  Fd         Int(10);
+Dcl-S  PathStr    Varchar(256);
+Dcl-S  PathPtr    Pointer;
+Dcl-S  OutLine    Varchar(2000);
+Dcl-S  NewLine    Char(2)       Inz(X'0D25');
+Dcl-S  SqlCode    Int(10);
+
+// Field variables for cursor fetch
+Dcl-S  OrdNo      Char(10);
+Dcl-S  CustNo     Char(7);
+Dcl-S  CustName   Varchar(50);
+Dcl-S  OrdDt      Date(*ISO);
+Dcl-S  OrdAmt     Packed(11:2);
+Dcl-S  Status     Char(2);
+
+PathStr = '/home/batch/exports/daily_orders_' +
+          %Char(%Date() : *ISO0) + '.txt' + X'00';
+PathPtr = %Addr(PathStr) + 2;
+
+// Open IFS file (see post 71 for Qp0lOpen prototype)
+Fd = Qp0lOpen(PathPtr : 10 : 438 : 1208);  // O_WRONLY+O_CREAT+O_TRUNC, UTF-8
+
+// Header line
+OutLine  = 'OrderNo|CustNo|CustName|OrderDate|Amount|Status' + NewLine;
+Qp0lWrite(Fd : OutLine : %Len(%TrimR(OutLine)));
+
+// Data cursor
+Exec SQL
+  DECLARE C_EXP CURSOR FOR
+    SELECT o.ORDER_NO, o.CUST_NO, c.CUST_NAME,
+           o.ORDER_DATE, o.ORDER_AMOUNT, o.STATUS
+    FROM ORDLIB.ORDMST o
+    JOIN SALESLIB.CUSTMST c ON c.CUST_NO = o.CUST_NO
+    WHERE o.ORDER_DATE = CURRENT_DATE
+    ORDER BY o.ORDER_NO;
+
+Exec SQL OPEN C_EXP;
+
+DoU SqlCode = 100;
+  Exec SQL
+    FETCH NEXT FROM C_EXP
+    INTO :OrdNo, :CustNo, :CustName, :OrdDt, :OrdAmt, :Status;
+  SqlCode = SQLCODE;
+
+  If SqlCode = 0;
+    // Build pipe-delimited line — trim all CHAR fields
+    OutLine = %TrimR(OrdNo)    + '|' +
+              %TrimR(CustNo)   + '|' +
+              %TrimR(CustName) + '|' +
+              %Char(OrdDt : *ISO) + '|' +
+              %Char(OrdAmt)    + '|' +
+              %TrimR(Status)   + NewLine;
+    Qp0lWrite(Fd : OutLine : %Len(%TrimR(OutLine)));
+  EndIf;
+EndDo;
+
+Exec SQL CLOSE C_EXP;
+Qp0lClose(Fd);
+*InLR = *On;
+</pre>
+
+<em>Next post: DB2 for i common table expressions (CTEs) and recursive SQL — the WITH clause for non-recursive CTEs, chaining multiple CTEs, recursive CTEs with anchor and recursive members, traversing bill-of-materials hierarchies, building organisational tree queries, and detecting cycles in self-referencing data on IBM i in 2026.</em>

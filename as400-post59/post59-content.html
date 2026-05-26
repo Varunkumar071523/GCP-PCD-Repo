@@ -1,0 +1,233 @@
+<p>The previous post covered OAuth 2.0 and JWT authentication from IBM i — the client credentials flow using DB2 HTTP functions and HTTPAPI, storing and refreshing Bearer tokens in DB2 for i, calling OAuth-protected REST APIs from ILE RPG, JWT structure and validation, and managing SSL certificates in the IBM i digital certificate store. This post covers AI-assisted RPG modernization in 2026: converting fixed-format RPG to free-format using CVTRPGSRC and IBM Merlin's converter, using large language models like watsonx Code Assistant and GitHub Copilot to explain and refactor legacy RPG code, AI-generated unit tests for service programs, and the practical step-by-step workflow for modernising a fixed-format RPG application.</p>
+
+<h2>The Fixed-Format RPG Legacy Problem</h2>
+
+<p>The majority of IBM i RPG code in production today was written in fixed-format RPG III or fixed-format RPG IV. Fixed-format RPG uses column-position-dependent syntax: the operation code occupies columns 26–35, factor 1 columns 12–25, factor 2 columns 36–49, and the result field columns 50–63 (in RPG IV). Every line of code is 80 columns wide and the meaning of each position is defined by the specification type (C, D, F, H, I, O, P).</p>
+
+<p>This syntax is inaccessible to modern developers, unreadable by LLMs trained predominantly on modern languages, and a barrier to onboarding. The business logic is sound — these programs have run for 20–30 years and are thoroughly tested by production — but the code is difficult to read, maintain, and extend.</p>
+
+<p>The modernization goal is to convert this code to free-format RPG IV (introduced in V5R1, fully unrestricted since IBM i 7.1 TR7) which reads like a modern structured language, works with VS Code's Code for IBM i extension for syntax highlighting, and is comprehensible to LLMs.</p>
+
+<h2>CVTRPGSRC — IBM's Conversion Command</h2>
+
+<p><code>CVTRPGSRC</code> (Convert RPG Source) is IBM's built-in command for converting fixed-format RPG IV source to free-format. It converts the D-specs (data definitions), C-specs (calculations), and H-spec (header) to their free-format equivalents. It does not convert RPG III programs (those must be converted to RPG IV first, or rewritten).</p>
+
+<pre>
+/* Convert a single source member from fixed-format to free-format */
+CVTRPGSRC FROMFILE(APPLIB/QRPGLESRC) FROMMFR(ORDPRC) +
+          TOFILE(APPLIB/QRPGFREE) TOMBR(ORDPRC) +
+          EXPCPY(*YES)    /* Expand /COPY members inline */
+          CVTCNT(*YES)    /* Convert continuation lines */
+
+/* Convert all members in a source physical file */
+CVTRPGSRC FROMFILE(APPLIB/QRPGLESRC) FROMMFR(*ALL) +
+          TOFILE(APPLIB/QRPGFREE) TOMBR(*FROMMBR)
+</pre>
+
+<p>Limitations of CVTRPGSRC:</p>
+<ul>
+  <li>The output compiles and runs, but is not idiomatic free-format RPG — it is a mechanical translation that preserves the original logic structure, including patterns that would be written differently in native free-format</li>
+  <li>Does not convert RPG III code (RPGLE must be specified as the member type)</li>
+  <li>Does not convert old-style I-specs (input specs) for externally described files — these become DCL-F statements but may need manual cleanup</li>
+  <li>GOTO statements are preserved; they should be manually refactored to structured constructs (IF/ENDFOR/EXSR)</li>
+  <li>Indicators (like *IN01, *INLR) are preserved but should be replaced with named boolean variables in modern free-format style</li>
+</ul>
+
+<h2>IBM Merlin's Free-Format Converter</h2>
+
+<p>IBM Merlin (browser-based IDE deployed on OpenShift or Docker) includes a more intelligent free-format converter than CVTRPGSRC. The Merlin converter:</p>
+<ul>
+  <li>Produces cleaner free-format output — removes unnecessary indicator handling and replaces EXSR with direct procedure calls in many cases</li>
+  <li>Provides a side-by-side diff view showing original and converted code with differences highlighted</li>
+  <li>Flags constructs it could not automatically convert with inline comments, so the developer knows exactly what needs manual attention</li>
+  <li>Is available from the VS Code command palette in the Merlin environment: right-click a fixed-format RPGLE member → Convert to Free Format</li>
+</ul>
+
+<p>The Merlin converter is the preferred tool for shops that have access to IBM Merlin. For shops without Merlin, CVTRPGSRC followed by manual cleanup and LLM-assisted review is the practical workflow.</p>
+
+<h2>Using LLMs for RPG Code Explanation</h2>
+
+<p>After conversion to free-format (or even on the original fixed-format), large language models can explain what RPG code does. This is valuable during modernization audits where the original developers are no longer available.</p>
+
+<p>Effective prompting strategy for LLM RPG explanation:</p>
+
+<pre>
+/* Prompt template for LLM RPG code explanation */
+
+System: You are an IBM i RPG IV expert. Explain IBM i RPG programs precisely.
+        When you see /FREE or dcl-proc, this is free-format RPG IV.
+        RPG uses SQLCODE for embedded SQL status, *ON/*OFF for booleans,
+        %TRIM for string trimming, and DCL-DS for data structures.
+
+User: Explain what this RPG procedure does. Be specific about:
+      1. What business function it performs
+      2. What data it reads and writes
+      3. What it returns and under what conditions it returns each value
+      4. Any important edge cases or side effects
+
+[paste RPG procedure here]
+</pre>
+
+<p>Practical tips for LLM-assisted RPG explanation:</p>
+<ul>
+  <li>Free-format RPG produces much better LLM explanations than fixed-format — convert first, then explain</li>
+  <li>Paste one procedure at a time, not entire programs — LLMs handle focused, specific input better than 500-line dumps</li>
+  <li>Include the DCL-DS definitions used by the procedure if they are defined externally — the LLM needs full type context</li>
+  <li>Ask the LLM to generate a one-paragraph business summary plus a technical summary — the business summary is useful for documentation; the technical summary for code review</li>
+  <li>Always review LLM output — models confuse indicator semantics, misread packed decimal precision, and sometimes invert conditional logic</li>
+</ul>
+
+<h2>AI-Assisted Refactoring Patterns</h2>
+
+<p>LLMs are useful for suggesting refactoring patterns that CVTRPGSRC does not perform automatically. Common refactoring targets:</p>
+
+<p><strong>GOTO elimination:</strong></p>
+
+<pre>
+/* Before — GOTO-based error routing (from CVTRPGSRC output) */
+if wRtnCode &lt;&gt; 'OK';
+  goto ERRHDL;
+endif;
+// ... processing ...
+goto END;
+
+ERRHDL:
+  wErrMsg = 'Processing failed';
+  return *off;
+
+END:
+  return *on;
+
+/* After — structured refactoring (LLM suggestion: use monitor block) */
+monitor;
+  // ... processing ...
+  return *on;
+on-error;
+  wErrMsg = 'Processing failed';
+  return *off;
+endmon;
+</pre>
+
+<p><strong>Indicator replacement:</strong></p>
+
+<pre>
+/* Before — legacy indicators preserved by CVTRPGSRC */
+chain (wCustNo) CUSTMST;
+if *in88;     // Indicator 88 set on CHAIN not-found
+  wFound = *off;
+else;
+  wFound = *on;
+endif;
+
+/* After — modern free-format (LLM-suggested refactoring) */
+chain (wCustNo) CUSTMST;
+wFound = %found(CUSTMST);
+</pre>
+
+<p><strong>Subroutine to procedure conversion:</strong></p>
+
+<pre>
+/* Before — EXSR-based subroutine (common in converted code) */
+dcl-s wCalcResult packed(13:2);
+// ... code calls EXSR CALCTAX ...
+begsr CALCTAX;
+  wCalcResult = wOrderAmt * 0.08;
+  // modifies global variables
+endsr;
+
+/* After — proper procedure (LLM-suggested modernization) */
+dcl-proc CalcTax;
+  dcl-pi *n packed(13:2);
+    pOrderAmt packed(13:2) const;
+  end-pi;
+  return pOrderAmt * 0.08;
+end-proc;
+</pre>
+
+<h2>AI-Assisted Test Generation for RPG</h2>
+
+<p>Once a procedure is in clean free-format, LLMs can generate RPGUnit test cases. RPGUnit is the standard unit testing framework for IBM i (see post 41). The LLM needs the procedure prototype and a description of expected behaviours:</p>
+
+<pre>
+/* Prompt to generate an RPGUnit test for ValidateOrder */
+
+User: Generate RPGUnit test cases for this RPG procedure.
+      The test program should be a *MODULE compiled with RPGUnit.
+      Include test cases for:
+      - Valid order (all fields populated, positive amount, active customer)
+      - Zero order amount (should return *OFF with error message)
+      - Zero customer number (should return *OFF with error message)
+      - Order amount below minimum (should return *OFF)
+
+[paste ValidateOrder procedure and its dcl-ds definitions]
+</pre>
+
+<p>A typical LLM-generated RPGUnit test skeleton (review and adjust before compiling):</p>
+
+<pre>
+**FREE
+ctl-opt nomain thread(*concurrent);
+
+/include RPGUNIT/QINCLUDE,TESTCASE
+
+dcl-ds t_Order qualified template;
+  OrderNo  packed(9:0);
+  CustNo   packed(9:0);
+  OrderAmt packed(13:2);
+  OrderSts char(2);
+end-ds;
+
+dcl-pr ValidateOrder ind extproc('ValidateOrder');
+  pOrder  likeds(t_Order) const;
+  pErrMsg varchar(200);
+end-pr;
+
+dcl-proc test_ValidOrderPassesValidation export;
+  dcl-ds order likeds(t_Order);
+  dcl-s  msg   varchar(200);
+  order.OrderNo  = 1;
+  order.CustNo   = 100001;
+  order.OrderAmt = 500.00;
+  iEqual(*on: ValidateOrder(order: msg): 'Valid order should return *ON');
+end-proc;
+
+dcl-proc test_ZeroAmountFails export;
+  dcl-ds order likeds(t_Order);
+  dcl-s  msg   varchar(200);
+  order.OrderNo  = 2;
+  order.CustNo   = 100001;
+  order.OrderAmt = 0;
+  iEqual(*off: ValidateOrder(order: msg): 'Zero amount should return *OFF');
+  iNotEqual('': msg: 'Error message should be populated');
+end-proc;
+</pre>
+
+<h2>The Practical Modernization Workflow</h2>
+
+<p>A realistic step-by-step workflow for modernising a fixed-format RPG application:</p>
+
+<ol>
+  <li><strong>Inventory</strong> — list all source members in the application. Use ACS Run SQL to query QSYS2.SYSROUTINES and the source PF member list to map programs to their source. Identify which are RPG III (need rewrite) vs RPG IV (can use CVTRPGSRC).</li>
+  <li><strong>Move to IFS stream files</strong> — copy source members to IFS using CPYTOSTMF. Store under Git in PASE. This enables VS Code editing and LLM tooling.</li>
+  <li><strong>Convert to free-format</strong> — run CVTRPGSRC or Merlin's converter on each member. Commit the converted version to a separate Git branch.</li>
+  <li><strong>LLM explanation pass</strong> — for each procedure with no existing comments, run the explanation prompt and save the output as a comment block or a separate documentation file.</li>
+  <li><strong>Clean up GOTO and indicators</strong> — use LLM suggestions to refactor GOTOs and indicator-based logic to structured free-format constructs. Commit incrementally.</li>
+  <li><strong>Generate RPGUnit tests</strong> — use LLM-generated test stubs as a starting point. Compile and run; fix failures; commit green tests.</li>
+  <li><strong>Extract procedures</strong> — identify large subroutines and convert them to named procedures in service programs (see the ILE binding post). This is the highest-value modernization step for long-term maintainability.</li>
+  <li><strong>Compile and regression test</strong> — compile all members from IFS using SRCSTMF, run the full test suite, compare output to the original program's known-good output.</li>
+</ol>
+
+<h2>What AI Gets Wrong About RPG</h2>
+
+<p>LLMs make characteristic mistakes with RPG that you must watch for in every review:</p>
+<ul>
+  <li><strong>Indicator semantics</strong> — LLMs sometimes invert indicator logic (confusing when an indicator is ON vs OFF) or conflate different types of indicators (data structure indicators, error indicators, response indicators)</li>
+  <li><strong>Packed decimal precision</strong> — LLMs may ignore the scale portion of packed decimal fields, especially in arithmetic with intermediate results</li>
+  <li><strong>SQLCODE interpretation</strong> — LLMs sometimes confuse SQLCODE=100 (not found) with SQLCODE&lt;0 (error), getting the not-found vs error branches backwards</li>
+  <li><strong>ILE activation group scope</strong> — LLMs rarely understand IBM i activation groups and may suggest patterns that work in the default activation group but fail in named groups</li>
+  <li><strong>%FOUND scope</strong> — LLMs sometimes misuse %FOUND without specifying the file name parameter, which refers to the last I/O operation rather than a specific file</li>
+</ul>
+
+<p>Treat all LLM-generated RPG code as a first draft that requires a senior IBM i developer review before compilation. The LLM accelerates the work; the developer ensures correctness.</p>
+
+<em>Next post: IBM i Journal Management — journaling architecture, creating journals and journal receivers, STRJRNOBJ and ENDJRNOBJ for object journaling, journal receiver chain management, DSPJRN for reading entries, SQL access to journal data via DISPLAY_JOURNAL, remote journaling for high availability, and the QAUDJRN security audit journal for compliance.</em>

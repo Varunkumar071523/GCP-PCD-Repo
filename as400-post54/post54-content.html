@@ -1,0 +1,267 @@
+<p>The previous post covered the modern IBM i developer workstation — VS Code with the Code for IBM i extension, IBM Merlin, Git integration with IFS stream files, custom compile actions, Bob for automated builds, and GitHub Copilot and watsonx Code Assistant for RPG and CL source editing. This post covers the IBM i PASE runtime in depth: what PASE is, how it differs from QShell, AIX binary compatibility, environment variable handling, PASE process management, shared library loading, yum package management, and how PASE integrates with the IBM i job structure and ILE activation groups in 2026.</p>
+
+<h2>What Is PASE?</h2>
+
+<p>PASE (Portable Application Solutions Environment) is a runtime environment built into IBM i that provides an AIX-compatible execution layer on top of the IBM i operating system. PASE allows AIX and Linux binaries — compiled for the PowerPC architecture — to run directly on IBM i without recompilation. It ships as part of 5770-SS1 option 33 (PASE for i) and is installed on most modern IBM i systems.</p>
+
+<p>PASE is not a virtual machine and it is not emulation. It is a true operating system personality layer — PASE processes run natively on the IBM i POWER processor alongside ILE programs, sharing the same hardware resources. A PASE process has a full POSIX process environment: file descriptors, signals, environment variables, a stack, and a heap. From the PASE process perspective, the system looks like AIX 7.1.</p>
+
+<p>PASE is what makes the IBM i open-source ecosystem possible. Node.js, Python, Ruby, PHP, Perl, Git, curl, yum, and hundreds of other open-source tools run on IBM i because they are either compiled AIX binaries or open-source software compiled for PASE using the IBM i open-source build infrastructure maintained by the IBM i Open Source team.</p>
+
+<h2>PASE vs QShell (QSH)</h2>
+
+<p>IBM i provides two POSIX-like shell environments: PASE and QShell. They serve different purposes and have important differences:</p>
+
+<table>
+  <thead><tr><th>Feature</th><th>PASE</th><th>QShell (QSH)</th></tr></thead>
+  <tbody>
+    <tr><td>Shell binary</td><td>bash, ksh, sh (AIX shells)</td><td>qsh (IBM's Korn shell variant)</td></tr>
+    <tr><td>Binary compatibility</td><td>AIX/PASE binaries (.so, executables)</td><td>Only QShell built-in commands and ILE programs via qsh</td></tr>
+    <tr><td>Open-source tools</td><td>Full open-source ecosystem via yum</td><td>Limited — only what IBM ships</td></tr>
+    <tr><td>Process model</td><td>POSIX fork/exec; full signal support</td><td>Runs inside an IBM i ILE job</td></tr>
+    <tr><td>Start from CL</td><td>CALL QSYS/QP2SHELL or QP2TERM</td><td>STRQSH or QSH command</td></tr>
+    <tr><td>Environment variables</td><td>Inherited POSIX env vars; full PATH</td><td>Limited environment variable support</td></tr>
+    <tr><td>Use case</td><td>Running open-source tools, scripts, servers</td><td>Simple IBM i shell scripting, IFS file operations</td></tr>
+  </tbody>
+</table>
+
+<p>For any serious scripting, open-source use, or running Node.js and Python, use PASE. QShell is useful for simple IFS operations and calling IBM i commands from a shell context, but it cannot run PASE binaries.</p>
+
+<h2>Starting a PASE Session</h2>
+
+<p>There are several ways to start a PASE environment:</p>
+
+<p><strong>SSH</strong> — the most common method for interactive and automated PASE sessions. When a user SSHs into IBM i, the SSH daemon (SSHD) starts a PASE shell process. The default shell is bash if bash is installed:</p>
+
+<pre>
+# From a developer's workstation
+ssh devuser@my-ibm-i.company.com
+# The SSH daemon starts a bash session in PASE
+</pre>
+
+<p><strong>CALL QP2TERM</strong> — starts an interactive PASE terminal session from a 5250 green-screen job. The terminal runs in the current IBM i job's PASE layer:</p>
+
+<pre>
+/* From a CL command line or 5250 session */
+CALL QP2TERM
+/* Opens a PASE ksh session in the 5250 window */
+</pre>
+
+<p><strong>QP2SHELL / QP2SHELL2</strong> — runs a single PASE command from a CL program or SBMJOB without an interactive session:</p>
+
+<pre>
+/* Run a PASE shell command from CL */
+CALL PGM(QP2SHELL) PARM('/QOpenSys/usr/bin/bash'
+                         '-c'
+                         'cd /home/devuser/project && git pull')
+
+/* QP2SHELL2 — uses the PASE environment of the calling job */
+CALL PGM(QP2SHELL2) PARM('/QOpenSys/usr/bin/python3'
+                          '/home/scripts/process_orders.py')
+</pre>
+
+<p><strong>STRPASE (PASE terminal)</strong> — a legacy method that opens a full PASE terminal in a 5250 window. Similar to QP2TERM. Less commonly used since SSH became standard.</p>
+
+<h2>AIX Binary Compatibility</h2>
+
+<p>PASE implements a compatibility layer for AIX 7.1 on POWER. This means that a binary compiled on AIX 7.1 for POWER (64-bit or 32-bit) can be copied to IBM i and run in PASE without modification, provided all shared library dependencies are satisfied.</p>
+
+<p>The compatibility includes:</p>
+<ul>
+  <li><strong>System calls</strong> — POSIX system calls (open, read, write, fork, exec, mmap, socket, etc.) are implemented in PASE and map to IBM i equivalents</li>
+  <li><strong>C runtime library</strong> — libc.a / libc.so (the AIX C library) is provided by PASE</li>
+  <li><strong>POSIX threads (pthreads)</strong> — libpthreads.a is available; PASE threads map to IBM i threads within the PASE job</li>
+  <li><strong>Berkeley sockets</strong> — TCP/IP socket programming works identically to AIX; the IBM i TCP/IP stack is used underneath</li>
+  <li><strong>Signals</strong> — SIGTERM, SIGKILL, SIGHUP, SIGUSR1, etc. are supported</li>
+</ul>
+
+<p>What PASE does <em>not</em> support from AIX:</p>
+<ul>
+  <li>AIX kernel extensions (LKMs)</li>
+  <li>SMIT (AIX system management interface)</li>
+  <li>AIX-specific subsystems like SRC (System Resource Controller)</li>
+  <li>Direct access to IBM i objects outside of the IFS — PASE sees the IFS as its filesystem root</li>
+</ul>
+
+<h2>Environment Variables in PASE</h2>
+
+<p>PASE maintains its own environment variable space, separate from IBM i job-level environment variables (set with ADDENVVAR/CHGENVVAR in CL). Environment variables set in a CL job do <em>not</em> automatically appear in a PASE process started from that job — and vice versa.</p>
+
+<p>The critical PASE environment variables:</p>
+
+<pre>
+# View current PASE environment in a bash session
+env
+
+# Key variables explained:
+PATH=/QOpenSys/pkgs/bin:/QOpenSys/usr/bin:/usr/bin
+# Determines where bash looks for executables
+# /QOpenSys/pkgs/bin is where yum-installed tools go (Node.js, Python, git, etc.)
+# /QOpenSys/usr/bin is the base AIX PASE utilities
+
+HOME=/home/devuser
+# Home directory in the IFS
+
+LIBPATH=/QOpenSys/pkgs/lib:/QOpenSys/usr/lib
+# Shared library search path (AIX uses LIBPATH, not LD_LIBRARY_PATH)
+# Note: IBM i PASE uses LIBPATH (like AIX), not LD_LIBRARY_PATH (like Linux)
+
+JAVA_HOME=/QOpenSys/QIBM/ProdData/JavaVM/jdk80/64bit
+# JDK location if Java is needed
+
+QIBM_MULTI_THREADED=Y
+# Required for some PASE tools that need multi-threading to work correctly
+</pre>
+
+<p>Setting PASE environment variables persistently for a user's SSH sessions requires adding export statements to the user's PASE profile files:</p>
+
+<pre>
+# /home/devuser/.bash_profile — runs on interactive login
+export PATH=/QOpenSys/pkgs/bin:/QOpenSys/usr/bin:$PATH
+export LIBPATH=/QOpenSys/pkgs/lib:/QOpenSys/usr/lib:$LIBPATH
+export NODE_ENV=production
+export DB_HOST=my-ibm-i.company.com
+
+# /home/devuser/.bashrc — runs for every bash shell
+alias ll='ls -la'
+alias gs='git status'
+</pre>
+
+<p>For PASE processes started from CL via QP2SHELL, pass environment variables explicitly using the ADDENVVAR CL command before calling QP2SHELL, or construct the environment in the shell script itself:</p>
+
+<pre>
+/* Set PASE environment vars from CL before calling QP2SHELL */
+ADDENVVAR ENVVAR(NODE_ENV) VALUE(production) REPLACE(*YES)
+ADDENVVAR ENVVAR(APP_PORT) VALUE(3000) REPLACE(*YES)
+CALL PGM(QP2SHELL) PARM('/QOpenSys/pkgs/bin/node'
+                         '/home/app/server.js')
+</pre>
+
+<h2>PASE Process Management</h2>
+
+<p>PASE processes are standard POSIX processes. In a PASE bash session, standard Unix process management tools work as expected:</p>
+
+<pre>
+# List all PASE processes for the current user
+ps -ef | grep devuser
+
+# List all PASE processes system-wide
+ps -ef
+
+# Example output:
+# UID        PID   PPID  C STIME TTY          TIME CMD
+# devuser   1234      1  0 08:01 pts/0    00:00:00 bash
+# devuser   1235   1234  0 08:01 pts/0    00:00:02 node /home/app/server.js
+# devuser   1236   1234  0 08:02 pts/0    00:00:00 ps -ef
+
+# Send a signal to a PASE process
+kill -SIGTERM 1235   # Graceful shutdown request
+kill -SIGKILL 1235   # Force kill
+
+# Run a process in the background, detached from the terminal
+nohup node /home/app/server.js > /home/app/server.log 2>&1 &
+
+# View background jobs in the current shell
+jobs -l
+</pre>
+
+<p>From IBM i CL, PASE processes appear as IBM i jobs in WRKACTJOB. They show with a job type of <strong>ASJ</strong> (Asynchronous Job) or as part of the QBATCH or QSYSWRK subsystems depending on how they were started. Use WRKACTJOB SBS(*ALL) to see them, or:</p>
+
+<pre>
+/* From a CL command line — find active PASE jobs */
+WRKACTJOB SBS(QSYSWRK) OUTPUT(*PRINT)
+/* Look for jobs with PGM of QP2SHELL or with a PASE-related job name */
+</pre>
+
+<p>To end a PASE process from IBM i CL (when you cannot SSH in), find the job name in WRKACTJOB and use ENDJOB:</p>
+
+<pre>
+/* End a PASE job cleanly from CL */
+ENDJOB JOB(123456/DEVUSER/QPADEV0001) OPTION(*CNTRLD) DELAY(30)
+</pre>
+
+<h2>Shared Libraries in PASE</h2>
+
+<p>PASE uses the AIX shared library model. Shared libraries have the extension <code>.a</code> (archive, containing shared members) or <code>.so</code> (shared object, Linux-style naming used by newer packages). The library search path is controlled by the <strong>LIBPATH</strong> environment variable (not LD_LIBRARY_PATH as on Linux — a common source of confusion).</p>
+
+<pre>
+# Check which shared libraries a PASE binary depends on
+dump -X64 -H /QOpenSys/pkgs/bin/node | grep NEEDED
+
+# Example output:
+# [0]   NEEDED          libpthreads.a(shr_xpg5_64.o)
+# [1]   NEEDED          libc.a(shr_64.o)
+# [2]   NEEDED          libdl.a(shr_64.o)
+
+# Check the current LIBPATH
+echo $LIBPATH
+
+# Add a custom library path for a session
+export LIBPATH=/home/devuser/mylib:$LIBPATH
+
+# Or pass it inline for a single command
+LIBPATH=/home/devuser/mylib:/QOpenSys/pkgs/lib node server.js
+</pre>
+
+<p>The IBM i open-source packages installed via yum place their shared libraries in <code>/QOpenSys/pkgs/lib</code>. This directory must be in LIBPATH for yum-installed tools to find their dependencies. If you see errors like <code>Could not load program ... : No such file or directory</code>, it almost always means a missing LIBPATH entry.</p>
+
+<h2>yum Package Management</h2>
+
+<p>Since IBM i 7.3 TR7 (and 7.4+), the IBM i open-source team provides a yum-based package manager for PASE. Hundreds of packages are available in the IBM i open-source RPM repository: Node.js, Python 3, git, curl, wget, OpenSSL, SQLite, nginx, and many more.</p>
+
+<pre>
+# Bootstrap yum (first-time setup if ACS bootstrap was not used)
+# Download bootstrap from: https://public.dhe.ibm.com/software/ibmi/products/pase/rpms/bootstrap.sh
+/QOpenSys/usr/bin/bash bootstrap.sh
+
+# Update the package index
+yum update
+
+# Search for a package
+yum search nodejs
+
+# Install a package
+yum install nodejs20
+
+# Install Python 3
+yum install python39 python39-pip
+
+# List installed packages
+yum list installed
+
+# Remove a package
+yum remove nodejs18
+
+# Show package details
+yum info git
+</pre>
+
+<p>All yum-installed packages go into <code>/QOpenSys/pkgs/</code>. Binaries are in <code>/QOpenSys/pkgs/bin</code>, libraries in <code>/QOpenSys/pkgs/lib</code>, and headers in <code>/QOpenSys/pkgs/include</code>. Always include <code>/QOpenSys/pkgs/bin</code> at the front of PATH so yum-installed tools take precedence over the older base PASE tools in <code>/QOpenSys/usr/bin</code>.</p>
+
+<h2>PASE and ILE Integration</h2>
+
+<p>PASE and ILE run in the same IBM i job. A PASE process and an ILE program can share the same job and communicate through several mechanisms:</p>
+
+<p><strong>Data queues and message queues</strong> — an ILE RPG program can write to a data queue that a PASE Python or Node.js script reads, and vice versa. This is the most common integration pattern for decoupling ILE batch from PASE-based event processing.</p>
+
+<p><strong>DB2 for i (shared database)</strong> — both PASE and ILE programs connect to the same DB2 for i database. A PASE Python script can insert rows that an RPG program reads, or an RPG program can update a status column that a Node.js process monitors.</p>
+
+<p><strong>IFS stream files</strong> — ILE programs can write to IFS stream files using the QSYS2.IFS_WRITE_UTF8 SQL function or the open()/write() IFS APIs; PASE processes read those files. Similarly, PASE scripts write output files that ILE programs consume.</p>
+
+<p><strong>Sockets</strong> — a PASE server (Node.js REST API, Python socket server) and an ILE RPG client can communicate over TCP/IP loopback sockets. The RPG program calls the PASE server using IBM i socket APIs or HTTPAPI.</p>
+
+<p><strong>PASE service programs called from ILE</strong> — advanced use case: a PASE shared library (.so) can be called from ILE C or RPG using the ILECALLABLE wrapper. This allows using AIX C libraries from ILE programs.</p>
+
+<pre>
+/* Call a PASE script from CL and wait for it to complete */
+CALL PGM(QP2SHELL) PARM('/QOpenSys/pkgs/bin/python3'
+                         '/home/scripts/sync_customers.py'
+                         '--env=production')
+
+/* The CL program waits until the Python script exits */
+/* Check the job log for any output the script printed to stdout/stderr */
+</pre>
+
+<p>PASE processes started from CL via QP2SHELL run inside the calling IBM i job's PASE environment. They share the same job name and authority. PASE processes started via SSH get their own IBM i job, created by the SSHD daemon.</p>
+
+<em>Next post: RPG Data Structures in Depth — dcl-ds syntax, qualified data structures with dot notation, LIKEDS for cloning a structure, template data structures, data structure arrays, external DB2 data structures using EXTNAME and LIKEREC, nested data structures, and passing DS to subprocedures by reference and by value.</em>

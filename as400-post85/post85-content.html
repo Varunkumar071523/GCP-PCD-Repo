@@ -1,0 +1,239 @@
+<p>The previous post covered IBM i save and restore operations — saving and restoring individual objects with SAVOBJ and RSTOBJ, saving entire libraries with SAVLIB and RSTLIB, incremental saves with SAVCHGOBJ, save files with CRTSAVF, IFS backup with SAV, full system saves with SAVSYS and GO SAVE, and verifying restores. This post covers ILE RPG service programs and binding directories: the ILE module model, compiling RPG modules with CRTRPGMOD, creating service programs with CRTSRVPGM, exporting and importing procedures, writing NOMAIN service program source, building and using binding directories with CRTBNDDIR and ADDBNDDIRE, the BNDDIR keyword in RPG source, managing activation groups, and building reusable shared procedure libraries on IBM i in 2026.</p>
+
+<h2>The ILE Module Model</h2>
+
+<p>ILE (Integrated Language Environment) introduces a three-level build model that separates compilation from binding. Understanding this model is essential before working with service programs.</p>
+
+<ol>
+  <li><strong>Module</strong> (<code>*MODULE</code>) — a compiled but not yet runnable translation unit. Created with <code>CRTRPGMOD</code>, <code>CRTCMOD</code>, or <code>CRTCLMOD</code>. Modules contain exported procedure names that other modules can import.</li>
+  <li><strong>Program</strong> (<code>*PGM</code>) — one or more modules bound together into a runnable program. Created with <code>CRTPGM</code> or the shortcut <code>CRTBNDRPG</code> (compile-and-bind in one step). A program can import procedures from service programs.</li>
+  <li><strong>Service program</strong> (<code>*SRVPGM</code>) — a collection of procedures compiled into a shared library that multiple programs can call. Created with <code>CRTSRVPGM</code>. Like a DLL on Windows or a shared object on Linux.</li>
+</ol>
+
+<pre>
+/* The build sequence for a service program */
+
+/* Step 1: Compile the RPG source to a module (not a program) */
+CRTRPGMOD MODULE(APPLIB/DATEUTIL) +
+          SRCFILE(APPLIB/QRPGLESRC) +
+          SRCMBR(DATEUTIL) +
+          DBGVIEW(*SOURCE)
+
+/* Step 2: Create the service program from the module */
+CRTSRVPGM SRVPGM(APPLIB/DATEUTIL) +
+          MODULE(APPLIB/DATEUTIL) +
+          EXPORT(*ALL) +           /* Export all procedures */
+          TEXT('Date utility service program')
+
+/* Step 3: Create a binding directory that includes the service program */
+CRTBNDDIR BNDDIR(APPLIB/APPBNDDIR)
+ADDBNDDIRE BNDDIR(APPLIB/APPBNDDIR) OBJ((APPLIB/DATEUTIL *SRVPGM))
+
+/* Step 4: Compile the calling program using CRTBNDRPG with the binding directory */
+CRTBNDRPG PGM(ORDLIB/PRCORDER) +
+          SRCFILE(ORDLIB/QRPGLESRC) +
+          SRCMBR(PRCORDER) +
+          BNDDIR(APPLIB/APPBNDDIR)   /* Resolves calls to DATEUTIL procedures */
+</pre>
+
+<h2>Writing a Service Program: NOMAIN Source</h2>
+
+<p>A service program source member uses <code>Ctl-Opt NoMain</code> (free-format) to indicate it has no main procedure — it is a library of procedures, not a program entry point. Each procedure the service program exposes to callers is declared with <code>Dcl-Proc</code> and an <code>Export</code> keyword.</p>
+
+<pre>
+**FREE
+// DATEUTIL — date utility service program source
+// Compile with CRTRPGMOD, then bind with CRTSRVPGM
+
+Ctl-Opt NoMain;
+
+// ── Procedure: FiscalPeriod ───────────────────────────────
+// Returns the fiscal period (YYYYPP) for a given calendar date
+// Fiscal year starts April 1
+Dcl-Proc FiscalPeriod Export;
+    Dcl-PI *N Char(6);
+        pDate Date(*ISO) Const;
+    End-PI;
+
+    Dcl-S  FY     Int(4);
+    Dcl-S  Period Packed(2:0);
+    Dcl-S  Month  Packed(2:0);
+
+    Month = %Month(pDate);
+    FY    = %Year(pDate);
+    If Month < 4;
+        FY -= 1;
+    EndIf;
+    Period = %Rem(Month + 8, 12) + 1;
+
+    Return %Char(FY) + %EditC(Period : 'X');
+End-Proc;
+
+// ── Procedure: WorkingDaysBetween ─────────────────────────
+// Returns the number of Monday-Friday working days between two dates
+Dcl-Proc WorkingDaysBetween Export;
+    Dcl-PI *N Packed(5:0);
+        pFrom Date(*ISO) Const;
+        pTo   Date(*ISO) Const;
+    End-PI;
+
+    Dcl-S  Current  Date(*ISO);
+    Dcl-S  Count    Packed(5:0)  Inz(0);
+    Dcl-S  DayOfWk  Packed(1:0);
+
+    Current = pFrom;
+    DoW Current <= pTo;
+        DayOfWk = %Rem(%Diff(Current : D'2026-01-05' : *DAYS), 7) + 1;
+        // Day 1 = Monday based on anchor date 2026-01-05 (a Monday)
+        If DayOfWk >= 1 And DayOfWk <= 5;
+            Count += 1;
+        EndIf;
+        Current = Current + %Years(0) + %Months(0) + %Days(1);
+    EndDo;
+
+    Return Count;
+End-Proc;
+
+// ── Procedure: FormatDateISO ──────────────────────────────
+// Returns a date formatted as YYYY-MM-DD string
+Dcl-Proc FormatDateISO Export;
+    Dcl-PI *N Varchar(10);
+        pDate Date(*ISO) Const;
+    End-PI;
+    Return %Char(pDate : *ISO);
+End-Proc;
+</pre>
+
+<h2>Calling Service Program Procedures from RPG</h2>
+
+<p>A calling program declares a prototype (<code>Dcl-PR</code>) matching each service program procedure it uses. When compiled with the binding directory that includes the service program, the linker resolves the procedure call at bind time — not at runtime. This is static binding and is faster than dynamic program calls.</p>
+
+<pre>
+**FREE
+Ctl-Opt DftActGrp(*No) ActGrp('ORDGRP') BndDir('APPLIB/APPBNDDIR');
+
+// ── Prototypes for DATEUTIL service program procedures ─────
+Dcl-PR FiscalPeriod Char(6) ExtProc('FiscalPeriod');
+    pDate Date(*ISO) Const;
+End-PR;
+
+Dcl-PR WorkingDaysBetween Packed(5:0) ExtProc('WorkingDaysBetween');
+    pFrom Date(*ISO) Const;
+    pTo   Date(*ISO) Const;
+End-PR;
+
+Dcl-PR FormatDateISO Varchar(10) ExtProc('FormatDateISO');
+    pDate Date(*ISO) Const;
+End-PR;
+
+// ── Main procedure ────────────────────────────────────────
+Dcl-S  OrderDate   Date(*ISO)  Inz(D'2026-07-28');
+Dcl-S  ShipDate    Date(*ISO)  Inz(D'2026-08-05');
+Dcl-S  FiscalPrd   Char(6);
+Dcl-S  LeadDays    Packed(5:0);
+Dcl-S  FmtDate     Varchar(10);
+
+FiscalPrd = FiscalPeriod(OrderDate);      // Returns '202604'
+LeadDays  = WorkingDaysBetween(OrderDate : ShipDate);  // Returns working days
+FmtDate   = FormatDateISO(OrderDate);     // Returns '2026-07-28'
+
+Dsply ('Fiscal period: ' + FiscalPrd);
+Dsply ('Lead days: ' + %Char(LeadDays));
+Dsply ('Order date: ' + FmtDate);
+
+*InLR = *On;
+</pre>
+
+<h2>Binding Directories: CRTBNDDIR and ADDBNDDIRE</h2>
+
+<p>A <strong>binding directory</strong> is a list of service programs (and modules) that the compiler searches when resolving procedure references. Instead of specifying each service program individually on CRTBNDRPG, you add all service programs to a binding directory and reference the directory with a single <code>BNDDIR</code> parameter.</p>
+
+<pre>
+/* Create the application binding directory */
+CRTBNDDIR BNDDIR(APPLIB/APPBNDDIR) +
+          TEXT('Application shared service programs')
+
+/* Add service programs to the binding directory */
+ADDBNDDIRE BNDDIR(APPLIB/APPBNDDIR) OBJ((APPLIB/DATEUTIL *SRVPGM))
+ADDBNDDIRE BNDDIR(APPLIB/APPBNDDIR) OBJ((APPLIB/STRUTIL  *SRVPGM))
+ADDBNDDIRE BNDDIR(APPLIB/APPBNDDIR) OBJ((APPLIB/NUMUTIL  *SRVPGM))
+ADDBNDDIRE BNDDIR(APPLIB/APPBNDDIR) OBJ((APPLIB/DBUTIL   *SRVPGM))
+
+/* Display the contents of a binding directory */
+DSPBNDDIR BNDDIR(APPLIB/APPBNDDIR)
+
+/* Remove a service program from a binding directory */
+RMVBNDDIRE BNDDIR(APPLIB/APPBNDDIR) OBJ((APPLIB/OLDUTIL *SRVPGM))
+
+/* Reference the binding directory in RPG source (Ctl-Opt) */
+// Ctl-Opt BndDir('APPLIB/APPBNDDIR');
+
+/* Reference via CRTBNDRPG parameter */
+CRTBNDRPG PGM(ORDLIB/PRCORDER) SRCMBR(PRCORDER) +
+          BNDDIR(APPLIB/APPBNDDIR)
+
+/* Multiple binding directories */
+CRTBNDRPG PGM(ORDLIB/PRCORDER) SRCMBR(PRCORDER) +
+          BNDDIR(APPLIB/APPBNDDIR QSYS/QC2LE)   /* Include IBM C runtime too */
+</pre>
+
+<h2>Activation Groups</h2>
+
+<p>An <strong>activation group</strong> is the runtime resource container for ILE programs — it holds storage, open files, and commitment definitions for a set of programs running together. Choosing the right activation group is critical for service programs.</p>
+
+<pre>
+/* Activation group options */
+
+/* *CALLER — the service program runs in the caller's activation group */
+/* Use for service programs that share the caller's commitment definition and open files */
+CRTSRVPGM SRVPGM(APPLIB/DATEUTIL) MODULE(APPLIB/DATEUTIL) +
+          ACTGRP(*CALLER)
+
+/* *NEW — each call creates a new activation group, destroyed when the program ends */
+/* Use for completely isolated programs; file opens and commits are independent */
+CRTSRVPGM SRVPGM(APPLIB/RPTGEN) MODULE(APPLIB/RPTGEN) +
+          ACTGRP(*NEW)
+
+/* Named activation group — multiple programs share one named group */
+/* All programs in 'ORDGRP' share the same commitment definition and file opens */
+CRTSRVPGM SRVPGM(APPLIB/ORDUTIL) MODULE(APPLIB/ORDUTIL) +
+          ACTGRP(ORDGRP)
+
+CRTBNDRPG PGM(ORDLIB/PRCORDER) SRCMBR(PRCORDER) +
+          ACTGRP(ORDGRP) BNDDIR(APPLIB/APPBNDDIR)
+
+/* Rule of thumb:
+   - Service programs: ACTGRP(*CALLER) — participate in caller's context
+   - Batch programs:   ACTGRP(*NEW) or named group for isolation
+   - Never use ACTGRP(*DFTACTGRP) for ILE programs — that is OPM compatibility mode */
+</pre>
+
+<h2>Service Program Versioning with Signature</h2>
+
+<pre>
+/* Service programs use a signature to detect interface mismatches */
+/* If you change the exported procedures, you must update the signature */
+/* or programs bound to the old signature will fail at runtime */
+
+/* Display the current signature */
+DSPSRVPGM SRVPGM(APPLIB/DATEUTIL) DETAIL(*PROCEXP)
+/* Look for: Signature . . . . . : XXXXXXXXXXXXXXXX */
+
+/* Re-create a service program with a new export list */
+/* After adding or changing exported procedures: */
+CRTRPGMOD MODULE(APPLIB/DATEUTIL) SRCMBR(DATEUTIL) DBGVIEW(*SOURCE)
+
+CRTSRVPGM SRVPGM(APPLIB/DATEUTIL) +
+          MODULE(APPLIB/DATEUTIL) +
+          EXPORT(*ALL) +
+          /* If adding new exports and keeping old ones, use a binder language
+             source to maintain signature compatibility */
+          BNDDIR(APPLIB/APPBNDDIR)
+
+/* Programs already bound to the old service program continue to work
+   as long as the procedures they use still exist with the same signatures */
+/* Run UPDPGM / UPDSRVPGM to rebind after a service program change */
+UPDSRVPGM SRVPGM(ORDLIB/PRCORDER)
+</pre>
+
+<em>Next post: IBM i HTTP client from RPG — calling external REST APIs with QSYS2.HTTP_GET and QSYS2.HTTP_POST SQL table functions, parsing JSON responses with JSON_VALUE and JSON_QUERY, consuming REST APIs from RPG embedded SQL cursors, handling OAuth token authentication, configuring the IBM i SSL certificate trust store for HTTPS connections, and integrating external web services with DB2 for i data on IBM i in 2026.</em>

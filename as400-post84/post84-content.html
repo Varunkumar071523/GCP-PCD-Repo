@@ -1,0 +1,259 @@
+<p>The previous post covered DB2 for i triggers — creating BEFORE and AFTER triggers with CREATE TRIGGER, FOR EACH ROW and FOR EACH STATEMENT granularity, OLD and NEW transition variables, audit logging patterns, cascading business rules, INSTEAD OF triggers on views, and trigger best practices on IBM i. This post covers IBM i save and restore operations: saving and restoring individual objects with SAVOBJ and RSTOBJ, saving entire libraries with SAVLIB and RSTLIB, performing full system saves with SAVSYS and GO SAVE, running incremental saves with SAVCHGOBJ, creating and using save files with CRTSAVF, saving IFS content with SAVSAVFDTA, verifying restores, and designing a robust IBM i backup strategy in 2026.</p>
+
+<h2>IBM i Save and Restore Architecture</h2>
+
+<p>IBM i save and restore operations use <strong>save files</strong> (<code>*SAVF</code>) or physical media (tape, virtual tape) as the save target. The save commands capture a consistent snapshot of objects, including all internal structures, authority information, and journaling configuration. Restoring from a save file recreates the object exactly as it was at save time — including the library it belongs to, the object type, and all attributes.</p>
+
+<table>
+  <tr>
+    <th>Command</th>
+    <th>Scope</th>
+    <th>Typical use</th>
+  </tr>
+  <tr>
+    <td>SAVOBJ</td>
+    <td>Individual objects</td>
+    <td>Save specific programs, files, or data areas before a change</td>
+  </tr>
+  <tr>
+    <td>SAVLIB</td>
+    <td>Entire library</td>
+    <td>Nightly library backup; pre-upgrade library snapshot</td>
+  </tr>
+  <tr>
+    <td>SAVCHGOBJ</td>
+    <td>Changed objects in a library</td>
+    <td>Incremental backup — only objects changed since last save</td>
+  </tr>
+  <tr>
+    <td>SAVSYS</td>
+    <td>System objects (QSYS, licensed programs)</td>
+    <td>Full system save — required for disaster recovery</td>
+  </tr>
+  <tr>
+    <td>SAVSAVFDTA</td>
+    <td>IFS stream files and directories</td>
+    <td>Backup of /home, /app, Node.js application directories</td>
+  </tr>
+  <tr>
+    <td>GO SAVE</td>
+    <td>Menu-driven full system save</td>
+    <td>Guided complete backup — option 21 saves everything</td>
+  </tr>
+</table>
+
+<h2>Save Files: CRTSAVF and Usage</h2>
+
+<p>A <strong>save file</strong> is an IBM i database object that holds the compressed, internal-format output of a save operation. Save files can be transferred between IBM i systems with FTP, stored on the IFS, or emailed as attachments — making them the standard distribution mechanism for IBM i software products and patches.</p>
+
+<pre>
+/* Create a save file in a library */
+CRTSAVF FILE(APPLIB/SAVF_ORDLIB) +
+        MAXRCDS(*NOMAX) +
+        TEXT('Save file for ORDLIB library backup')
+
+/* Save files hold binary IBM i data — they are not stream files */
+/* To copy a save file to the IFS for transfer: */
+CPYTOSTMF FROMMBR('/QSYS.LIB/APPLIB.LIB/SAVF_ORDLIB.FILE') +
+          TOSTMF('/home/batch/backups/ordlib_20260727.savf') +
+          STMFOPT(*REPLACE)
+
+/* To restore a save file from the IFS back into a library: */
+CPYFRMSTMF FROMSTMF('/home/batch/backups/ordlib_20260727.savf') +
+           TOMBR('/QSYS.LIB/APPLIB.LIB/SAVF_ORDLIB.FILE') +
+           MBROPT(*REPLACE)
+
+/* Display the contents of a save file (what objects are inside) */
+DSPSAVF FILE(APPLIB/SAVF_ORDLIB)
+
+/* Clear a save file before reusing it */
+CLRSAVF FILE(APPLIB/SAVF_ORDLIB)
+</pre>
+
+<h2>Saving Individual Objects: SAVOBJ</h2>
+
+<pre>
+/* Save a single program to a save file */
+SAVOBJ OBJ(PRCORDER) LIB(ORDLIB) +
+       OBJTYPE(*PGM) +
+       DEV(*SAVF) +
+       SAVF(APPLIB/SAVF_ORDLIB)
+
+/* Save multiple objects by name */
+SAVOBJ OBJ(PRCORDER VALORDER PRCINVOICE) LIB(ORDLIB) +
+       OBJTYPE(*PGM) +
+       DEV(*SAVF) SAVF(APPLIB/SAVF_ORDLIB)
+
+/* Save all objects of a type (all RPG programs in a library) */
+SAVOBJ OBJ(*ALL) LIB(ORDLIB) +
+       OBJTYPE(*PGM) +
+       DEV(*SAVF) SAVF(APPLIB/SAVF_ORDLIB)
+
+/* Save a physical file including its data */
+SAVOBJ OBJ(ORDMST) LIB(ORDLIB) +
+       OBJTYPE(*FILE) +
+       DEV(*SAVF) SAVF(APPLIB/SAVF_ORDLIB) +
+       DTACPR(*YES)    /* Compress data — significant space saving for large files */
+
+/* Save with access path included (logical files built over a PF) */
+SAVOBJ OBJ(ORDMST) LIB(ORDLIB) OBJTYPE(*FILE) +
+       DEV(*SAVF) SAVF(APPLIB/SAVF_ORDLIB) +
+       ACCPTH(*YES)    /* Save access paths — avoid rebuild time on restore */
+</pre>
+
+<h2>Restoring Individual Objects: RSTOBJ</h2>
+
+<pre>
+/* Restore a single program from a save file */
+RSTOBJ OBJ(PRCORDER) SAVLIB(ORDLIB) +
+       DEV(*SAVF) SAVF(APPLIB/SAVF_ORDLIB) +
+       RSTLIB(ORDLIB)
+
+/* Restore to a different library (useful for testing a restore) */
+RSTOBJ OBJ(ORDMST) SAVLIB(ORDLIB) +
+       DEV(*SAVF) SAVF(APPLIB/SAVF_ORDLIB) +
+       RSTLIB(TESTLIB)    /* Restore into TESTLIB instead of ORDLIB */
+
+/* Restore all objects from a save file */
+RSTOBJ OBJ(*ALL) SAVLIB(ORDLIB) +
+       DEV(*SAVF) SAVF(APPLIB/SAVF_ORDLIB) +
+       RSTLIB(ORDLIB)
+
+/* Force restore even if a newer version of the object already exists */
+RSTOBJ OBJ(PRCORDER) SAVLIB(ORDLIB) +
+       DEV(*SAVF) SAVF(APPLIB/SAVF_ORDLIB) +
+       RSTLIB(ORDLIB) +
+       MBROPT(*ALL) +     /* Replace existing members */
+       ALWOBJDIF(*ALL)    /* Allow object differences — version, owner, auth */
+</pre>
+
+<h2>Saving and Restoring Libraries: SAVLIB and RSTLIB</h2>
+
+<pre>
+/* Save an entire library to a save file */
+SAVLIB LIB(ORDLIB) +
+       DEV(*SAVF) SAVF(APPLIB/SAVF_ORDLIB_FULL) +
+       DTACPR(*YES) +
+       ACCPTH(*YES) +
+       TEXT('Full save of ORDLIB ' *CAT %CHAR(%DATE()))
+
+/* Save multiple libraries in one command */
+SAVLIB LIB(ORDLIB ARLIB GLLIB) +
+       DEV(*SAVF) SAVF(APPLIB/SAVF_APPLLIBS)
+
+/* Save all user libraries (excludes QSYS and IBM-supplied libraries) */
+SAVLIB LIB(*ALLUSR) +
+       DEV(*SAVF) SAVF(APPLIB/SAVF_ALLUSR) +
+       DTACPR(*YES)
+
+/* Restore an entire library from a save file */
+RSTLIB SAVLIB(ORDLIB) +
+       DEV(*SAVF) SAVF(APPLIB/SAVF_ORDLIB_FULL) +
+       RSTLIB(*SAVLIB)     /* Restore to same library name */
+
+/* Restore to a different library name */
+RSTLIB SAVLIB(ORDLIB) +
+       DEV(*SAVF) SAVF(APPLIB/SAVF_ORDLIB_FULL) +
+       RSTLIB(ORDLIB_BAK)  /* Creates ORDLIB_BAK as a copy of the saved ORDLIB */
+</pre>
+
+<h2>Incremental Backups: SAVCHGOBJ</h2>
+
+<p><code>SAVCHGOBJ</code> saves only those objects in a library that have been changed since a specified reference date and time — typically the date of the last full library save. This dramatically reduces nightly backup time for large libraries where only a fraction of objects change each day.</p>
+
+<pre>
+/* Save objects changed since a specific date and time */
+SAVCHGOBJ OBJ(*ALL) LIB(ORDLIB) +
+          DEV(*SAVF) SAVF(APPLIB/SAVF_ORDLIB_CHG) +
+          REFDATE('2026-07-20') REFTIME('200000') +
+          DTACPR(*YES)
+
+/* Automate the incremental backup using the last full save date */
+/* In a CL program: */
+PGM
+DCL VAR(&SAVDATE) TYPE(*CHAR) LEN(7)
+DCL VAR(&SAVTIME) TYPE(*CHAR) LEN(6)
+
+/* Retrieve the save date from a data area that records the last full save */
+RTVDTAARA DTAARA(APPLIB/LASTSAVDT) RTNVAR(&SAVDATE)
+RTVDTAARA DTAARA(APPLIB/LASTSAVTM) RTNVAR(&SAVTIME)
+
+CLRSAVF FILE(APPLIB/SAVF_ORDLIB_CHG)
+
+SAVCHGOBJ OBJ(*ALL) LIB(ORDLIB) +
+          DEV(*SAVF) SAVF(APPLIB/SAVF_ORDLIB_CHG) +
+          REFDATE(&SAVDATE) REFTIME(&SAVTIME) +
+          DTACPR(*YES)
+
+ENDPGM
+</pre>
+
+<h2>Saving the IFS: SAVSAVFDTA</h2>
+
+<p>The POSIX-style IFS directories (<code>/home</code>, <code>/app</code>, Node.js application trees, Python environments in <code>/QOpenSys</code>) are not captured by SAVLIB. Use <code>SAV</code> or <code>SAVSAVFDTA</code> to back up IFS content.</p>
+
+<pre>
+/* Save IFS directories to a save file */
+SAV DEV('/QSYS.LIB/APPLIB.LIB/SAVF_IFS.FILE') +
+    OBJ(('/home' *INCLUDE) ('/app' *INCLUDE)) +
+    DTACPR(*YES)
+
+/* Restore IFS content from the save file */
+RST DEV('/QSYS.LIB/APPLIB.LIB/SAVF_IFS.FILE') +
+    OBJ(('/home' *INCLUDE))
+
+/* Save a specific IFS directory tree */
+SAV DEV('/QSYS.LIB/APPLIB.LIB/SAVF_NODEAPP.FILE') +
+    OBJ(('/home/nodeapps/ordapi' *INCLUDE)) +
+    DTACPR(*YES)
+
+/* Save IFS to a stream file (for transfer to another system) */
+SAV DEV('/home/batch/backups/ifs_home_20260727.zip') +
+    OBJ(('/home/batch' *INCLUDE)) +
+    DTACPR(*YES)
+</pre>
+
+<h2>Full System Save: SAVSYS and GO SAVE</h2>
+
+<pre>
+/* GO SAVE option 21: complete system save — requires all users signed off */
+/* Interactive: */
+GO SAVE
+/* Select option 21 — saves QSYS, all user libraries, and all IFS data */
+
+/* SAVSYS: saves system objects, IBM i OS, and licensed programs */
+/* Requires the system to be in restricted state */
+ENDSBS SBS(*ALL) OPTION(*CNTRLD) DELAY(600)    /* End all subsystems */
+SAVSYS DEV(*SAVF) SAVF(APPLIB/SAVF_SYSTEM)
+STRSBS SBSD(QCTL)                               /* Restart the controlling subsystem */
+
+/* Check the job log after SAVSYS for save statistics */
+/* Look for message CPF3727 — objects saved count and any errors */
+</pre>
+
+<h2>Verifying a Restore</h2>
+
+<pre>
+/* Always verify a restore before relying on it */
+/* Step 1: Display save file contents to confirm what is inside */
+DSPSAVF FILE(APPLIB/SAVF_ORDLIB_FULL) OUTPUT(*PRINT)
+
+/* Step 2: Restore to a test library and verify object integrity */
+RSTLIB SAVLIB(ORDLIB) DEV(*SAVF) SAVF(APPLIB/SAVF_ORDLIB_FULL) +
+       RSTLIB(ORDLIB_VFY)
+
+/* Step 3: Check the object descriptions in the restored library */
+DSPLIB LIB(ORDLIB_VFY)
+CHKOBJITG OBJ(ORDLIB_VFY/*ALL) OBJTYPE(*ALL)    /* Check object integrity */
+
+/* Step 4: Confirm database file members restored with correct record count */
+SELECT TABLE_NAME, NUMBER_ROWS
+FROM QSYS2.SYSTABLESTAT
+WHERE TABLE_SCHEMA = 'ORDLIB_VFY'
+ORDER BY TABLE_NAME;
+
+/* Step 5: Clean up the verification library */
+DLTLIB LIB(ORDLIB_VFY)
+</pre>
+
+<em>Next post: ILE RPG service programs and binding directories — compiling RPG modules with CRTRPGMOD, creating service programs with CRTSRVPGM, exporting and importing procedures with NOMAIN source members, building and using binding directories with CRTBNDDIR and ADDBNDDIRE, managing activation groups, using the BNDDIR keyword in RPG source, and building reusable shared procedure libraries on IBM i in 2026.</em>

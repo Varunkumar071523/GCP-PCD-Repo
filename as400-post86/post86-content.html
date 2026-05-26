@@ -1,0 +1,314 @@
+<p>The previous post covered ILE RPG service programs and binding directories — compiling RPG modules with CRTRPGMOD, creating service programs with CRTSRVPGM, exporting and importing procedures with NOMAIN source, building and using binding directories with CRTBNDDIR and ADDBNDDIRE, managing activation groups, and building reusable shared procedure libraries on IBM i. This post covers calling external REST APIs from IBM i: using QSYS2.HTTP_GET and QSYS2.HTTP_POST SQL table functions to make HTTP and HTTPS requests, parsing JSON responses with JSON_VALUE and JSON_QUERY, consuming REST APIs from RPG embedded SQL, handling OAuth token authentication, configuring the IBM i SSL certificate trust store for HTTPS, and integrating external web services with DB2 for i data on IBM i in 2026.</p>
+
+<h2>QSYS2 HTTP Functions Overview</h2>
+
+<p>IBM i 7.4 (and 7.3 with PTFs) includes <code>QSYS2.HTTP_GET</code> and <code>QSYS2.HTTP_POST</code> SQL scalar and table functions that issue HTTP/HTTPS requests directly from DB2 SQL. No PASE scripting, no RPG C-API calls — a REST API call is a single SQL statement. The functions run synchronously and return the response body as a CLOB or VARCHAR.</p>
+
+<table>
+  <tr>
+    <th>Function</th>
+    <th>Type</th>
+    <th>Returns</th>
+    <th>Use case</th>
+  </tr>
+  <tr>
+    <td>QSYS2.HTTP_GET</td>
+    <td>Scalar</td>
+    <td>CLOB(10M)</td>
+    <td>Simple GET with no custom headers</td>
+  </tr>
+  <tr>
+    <td>QSYS2.HTTP_GET_VERBOSE</td>
+    <td>Table function</td>
+    <td>STATUS_CODE, RESPONSE_HEADER, RESPONSE_MESSAGE</td>
+    <td>GET with full response metadata</td>
+  </tr>
+  <tr>
+    <td>QSYS2.HTTP_POST</td>
+    <td>Scalar</td>
+    <td>CLOB(10M)</td>
+    <td>POST with JSON or XML body</td>
+  </tr>
+  <tr>
+    <td>QSYS2.HTTP_POST_VERBOSE</td>
+    <td>Table function</td>
+    <td>STATUS_CODE, RESPONSE_HEADER, RESPONSE_MESSAGE</td>
+    <td>POST with full response metadata including HTTP status code</td>
+  </tr>
+</table>
+
+<h2>Basic HTTP GET: Calling a REST API from SQL</h2>
+
+<pre>
+-- Simple GET request — returns the response body as CLOB
+SELECT QSYS2.HTTP_GET(
+    'https://api.exchangerate.host/latest?base=GBP&symbols=USD,EUR',
+    ''     -- empty options JSON
+) AS RESPONSE
+FROM SYSIBM.SYSDUMMY1;
+
+-- GET with verbose response: status code + headers + body
+SELECT STATUS_CODE, RESPONSE_MESSAGE
+FROM TABLE(QSYS2.HTTP_GET_VERBOSE(
+    'https://api.exchangerate.host/latest?base=GBP',
+    SYSTOOLS.JSON2BSON('{"header":{"Accept":"application/json"}}')
+)) A;
+/* STATUS_CODE = 200 on success */
+
+-- GET with custom headers (Authorization bearer token)
+SELECT STATUS_CODE, RESPONSE_MESSAGE
+FROM TABLE(QSYS2.HTTP_GET_VERBOSE(
+    'https://api.company.internal/v1/customers/C0001234',
+    SYSTOOLS.JSON2BSON('{
+        "header": {
+            "Authorization": "Bearer eyJhbGciOiJSUzI1NiJ9...",
+            "Accept": "application/json",
+            "X-Request-ID": "IBM-i-7624-20260729"
+        },
+        "sslTrustStoreFile": "/home/batch/ssl/company_trust.kdb",
+        "sslTrustStorePassword": "trustpass1"
+    }')
+)) A;
+</pre>
+
+<h2>Parsing JSON Responses: JSON_VALUE and JSON_QUERY</h2>
+
+<p>The response from an HTTP call is a JSON string. DB2 for i provides <code>JSON_VALUE</code> to extract a scalar value from a JSON path, <code>JSON_QUERY</code> to extract a JSON sub-object or array, and <code>SYSTOOLS.JSON2TABLE</code> to expand a JSON array into rows.</p>
+
+<pre>
+-- Extract scalar fields from a JSON response
+WITH API_RESPONSE AS (
+    SELECT QSYS2.HTTP_GET(
+        'https://api.exchangerate.host/latest?base=GBP',
+        ''
+    ) AS RESP
+    FROM SYSIBM.SYSDUMMY1
+)
+SELECT
+    JSON_VALUE(RESP, '$.base')              AS BASE_CURRENCY,
+    JSON_VALUE(RESP, '$.date')              AS RATE_DATE,
+    DECIMAL(JSON_VALUE(RESP, '$.rates.USD'), 10, 6) AS GBP_TO_USD,
+    DECIMAL(JSON_VALUE(RESP, '$.rates.EUR'), 10, 6) AS GBP_TO_EUR
+FROM API_RESPONSE;
+
+-- Extract an array element by index
+WITH API_RESPONSE AS (
+    SELECT QSYS2.HTTP_GET('https://api.company.internal/v1/orders?custNo=C0001234', '') AS RESP
+    FROM SYSIBM.SYSDUMMY1
+)
+SELECT
+    JSON_VALUE(RESP, '$.orders[0].orderNo')  AS FIRST_ORDER,
+    JSON_VALUE(RESP, '$.orders[0].amount')   AS FIRST_AMOUNT,
+    JSON_VALUE(RESP, '$.totalCount')         AS TOTAL_COUNT
+FROM API_RESPONSE;
+
+-- Expand a JSON array into rows using SYSTOOLS.JSON2TABLE
+WITH API_RESPONSE AS (
+    SELECT QSYS2.HTTP_GET('https://api.company.internal/v1/orders?custNo=C0001234', '') AS RESP
+    FROM SYSIBM.SYSDUMMY1
+),
+ORDERS_JSON AS (
+    SELECT JSON_QUERY(RESP, '$.orders') AS ORDERS_ARRAY
+    FROM API_RESPONSE
+)
+SELECT
+    JSON_VALUE(D.JSON_DATA, '$.orderNo')  AS ORDER_NO,
+    JSON_VALUE(D.JSON_DATA, '$.amount')   AS AMOUNT,
+    JSON_VALUE(D.JSON_DATA, '$.status')   AS STATUS
+FROM ORDERS_JSON,
+     LATERAL (SELECT * FROM TABLE(SYSTOOLS.JSON2TABLE(ORDERS_ARRAY))) D;
+</pre>
+
+<h2>HTTP POST: Sending JSON to a REST API</h2>
+
+<pre>
+-- POST a new order to an external REST API
+WITH NEW_ORDER AS (
+    SELECT '{"orderNo":"ORD0012346","custNo":"C0001234","amount":1875.50,"currency":"GBP"}'
+    AS PAYLOAD
+    FROM SYSIBM.SYSDUMMY1
+)
+SELECT STATUS_CODE, RESPONSE_MESSAGE
+FROM NEW_ORDER,
+     TABLE(QSYS2.HTTP_POST_VERBOSE(
+         'https://api.erp.internal/v1/orders',
+         PAYLOAD,
+         SYSTOOLS.JSON2BSON('{
+             "header": {
+                 "Content-Type": "application/json",
+                 "Authorization": "Bearer eyJhbGciOiJSUzI1NiJ9...",
+                 "Accept": "application/json"
+             }
+         }')
+     )) A;
+
+-- POST with dynamic payload built from DB2 data
+-- Build the JSON payload from a DB2 query, then POST it
+WITH ORDER_PAYLOAD AS (
+    SELECT JSON_OBJECT(
+               'orderNo'  VALUE TRIM(ORD_NO),
+               'custNo'   VALUE TRIM(CUST_NO),
+               'amount'   VALUE ORD_AMOUNT,
+               'currency' VALUE 'GBP',
+               'lines'    VALUE JSON_ARRAYAGG(
+                   JSON_OBJECT(
+                       'lineNo'  VALUE LINE_NO,
+                       'prodNo'  VALUE TRIM(PROD_NO),
+                       'qty'     VALUE QTY,
+                       'price'   VALUE UNIT_PRICE
+                   )
+               )
+           ) AS PAYLOAD
+    FROM ORDLIB.ORDMST O
+    JOIN ORDLIB.ORDLIN L ON L.ORD_NO = O.ORD_NO
+    WHERE O.ORD_NO = 'ORD0012346'
+    GROUP BY O.ORD_NO, O.CUST_NO, O.ORD_AMOUNT
+)
+SELECT STATUS_CODE,
+       JSON_VALUE(RESPONSE_MESSAGE, '$.id') AS EXTERNAL_ORDER_ID
+FROM ORDER_PAYLOAD,
+     TABLE(QSYS2.HTTP_POST_VERBOSE(
+         'https://api.erp.internal/v1/orders',
+         PAYLOAD,
+         SYSTOOLS.JSON2BSON('{"header":{"Content-Type":"application/json","Authorization":"Bearer TOKEN"}}')
+     )) A;
+</pre>
+
+<h2>OAuth Token Authentication</h2>
+
+<p>Most production REST APIs require an OAuth 2.0 Bearer token. The standard pattern on IBM i is to request the token with an HTTP POST to the token endpoint, extract the access token from the JSON response, cache it in a data area or DB2 table, and include it in the Authorization header of subsequent requests. Tokens typically expire after 3600 seconds.</p>
+
+<pre>
+-- Step 1: Request an OAuth token (client credentials grant)
+WITH TOKEN_RESPONSE AS (
+    SELECT STATUS_CODE, RESPONSE_MESSAGE
+    FROM TABLE(QSYS2.HTTP_POST_VERBOSE(
+        'https://auth.company.internal/oauth/token',
+        'grant_type=client_credentials&client_id=ibmi_svc&client_secret=s3cr3t',
+        SYSTOOLS.JSON2BSON('{
+            "header": {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json"
+            }
+        }')
+    )) A
+)
+SELECT
+    STATUS_CODE,
+    JSON_VALUE(RESPONSE_MESSAGE, '$.access_token')  AS ACCESS_TOKEN,
+    JSON_VALUE(RESPONSE_MESSAGE, '$.expires_in')    AS EXPIRES_IN,
+    JSON_VALUE(RESPONSE_MESSAGE, '$.token_type')    AS TOKEN_TYPE
+FROM TOKEN_RESPONSE;
+
+-- Step 2: Cache the token in a DB2 table for reuse across requests
+CREATE TABLE APPLIB.OAUTH_TOKEN_CACHE (
+    SERVICE_NAME  VARCHAR(50)    NOT NULL,
+    ACCESS_TOKEN  VARCHAR(4000)  NOT NULL,
+    EXPIRES_AT    TIMESTAMP      NOT NULL,
+    PRIMARY KEY (SERVICE_NAME)
+);
+
+-- Retrieve a valid cached token (refresh if expired)
+SELECT ACCESS_TOKEN
+FROM APPLIB.OAUTH_TOKEN_CACHE
+WHERE SERVICE_NAME = 'ERP_API'
+  AND EXPIRES_AT > CURRENT TIMESTAMP + 5 MINUTES;
+/* If no row returned, request a new token and INSERT/UPDATE the cache */
+</pre>
+
+<h2>Calling HTTP APIs from RPG Embedded SQL</h2>
+
+<pre>
+**FREE
+Ctl-Opt DftActGrp(*No) ActGrp('APIGRP');
+
+Dcl-S  AccessToken  Varchar(4000);
+Dcl-S  ApiResponse  Varchar(32000)  Ccsid(1208);
+Dcl-S  StatusCode   Int(10);
+Dcl-S  ExtOrderId   Varchar(50);
+Dcl-S  OrdNo        Char(10)  Inz('ORD0012346');
+
+// ── Step 1: Get cached OAuth token ────────────────────────
+Exec SQL
+    SELECT ACCESS_TOKEN
+    INTO :AccessToken
+    FROM APPLIB.OAUTH_TOKEN_CACHE
+    WHERE SERVICE_NAME = 'ERP_API'
+      AND EXPIRES_AT > CURRENT TIMESTAMP + 5 MINUTES
+    FETCH FIRST 1 ROW ONLY;
+
+If SQLCODE = 100;
+    // Token not found or expired — call token refresh procedure
+    // (calls the OAuth endpoint and updates the cache)
+    Exec SQL CALL APPLIB.REFRESH_OAUTH_TOKEN('ERP_API');
+
+    Exec SQL
+        SELECT ACCESS_TOKEN INTO :AccessToken
+        FROM APPLIB.OAUTH_TOKEN_CACHE
+        WHERE SERVICE_NAME = 'ERP_API'
+        FETCH FIRST 1 ROW ONLY;
+EndIf;
+
+// ── Step 2: POST the order to the external API ────────────
+Exec SQL
+    SELECT STATUS_CODE, RESPONSE_MESSAGE
+    INTO :StatusCode, :ApiResponse
+    FROM TABLE(QSYS2.HTTP_POST_VERBOSE(
+        'https://api.erp.internal/v1/orders',
+        '{"orderNo":"' || TRIM(:OrdNo) || '","custNo":"C0001234","amount":1875.50}',
+        SYSTOOLS.JSON2BSON('{"header":{"Content-Type":"application/json","Authorization":"Bearer ' || TRIM(:AccessToken) || '"}}')
+    )) A
+    FETCH FIRST 1 ROW ONLY;
+
+If StatusCode = 201;
+    // Extract the external order ID from the response
+    Exec SQL
+        SET :ExtOrderId = JSON_VALUE(:ApiResponse, '$.id');
+
+    // Update the local order record with the external reference
+    Exec SQL
+        UPDATE ORDLIB.ORDMST
+        SET EXT_ORD_REF = :ExtOrderId,
+            STATUS = 'S'
+        WHERE ORD_NO = :OrdNo;
+
+    Exec SQL COMMIT;
+Else;
+    Dsply ('API call failed, HTTP status: ' + %Char(StatusCode));
+    Exec SQL ROLLBACK;
+EndIf;
+
+*InLR = *On;
+</pre>
+
+<h2>Configuring the SSL Trust Store for HTTPS</h2>
+
+<pre>
+/* IBM i uses a DCM (Digital Certificate Manager) key database for SSL */
+/* For QSYS2 HTTP functions, specify the trust store path in the options JSON */
+
+/* Option 1: Use the system default trust store (*SYSTEM) */
+/* This works for certificates signed by well-known CAs (DigiCert, Let's Encrypt) */
+SELECT QSYS2.HTTP_GET(
+    'https://api.exchangerate.host/latest',
+    SYSTOOLS.JSON2BSON('{"sslTrustStoreType":"*SYSTEM"}')
+) FROM SYSIBM.SYSDUMMY1;
+
+/* Option 2: Point to a custom key database for internal CA certificates */
+SELECT QSYS2.HTTP_GET(
+    'https://api.internal.company.com/v1/data',
+    SYSTOOLS.JSON2BSON('{
+        "sslTrustStoreFile": "/home/batch/ssl/company_ca.kdb",
+        "sslTrustStorePassword": "kdbpassword",
+        "sslTrustStoreType": "CMS"
+    }')
+) FROM SYSIBM.SYSDUMMY1;
+
+/* To add a certificate to the system trust store using DCM: */
+/* 1. Open DCM at https://ibmi:2001/QIBM/ICSS/Cert/Admin/qycucm1.ndm/main0 */
+/* 2. Navigate to Certificate Store > *SYSTEM > Manage > Import Certificate */
+/* 3. Import the server's CA certificate in PEM or DER format */
+/* After import, HTTP_GET to that server will succeed without specifying a trust store file */
+</pre>
+
+<em>Next post: DB2 for i stored procedures — creating SQL procedures with CREATE PROCEDURE, defining IN, OUT, and INOUT parameters, using local variables and cursors for row-by-row processing, returning result sets to callers, handling errors with DECLARE HANDLER and SQLSTATE, calling procedures from RPG embedded SQL and CL with RUNSQL, and building reusable encapsulated database logic on IBM i in 2026.</em>

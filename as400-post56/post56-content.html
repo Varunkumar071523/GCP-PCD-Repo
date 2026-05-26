@@ -1,0 +1,287 @@
+<p>The previous post covered RPG data structures in depth — dcl-ds syntax, qualified data structures with dot notation, LIKEDS for cloning a structure, template data structures, data structure arrays with DIM, external data structures from DB2 file definitions using EXTNAME and LIKEREC, nested data structures, and passing data structures to subprocedures. This post covers CL error handling and exception management: IBM i message types, the MONMSG command, program message queues, SNDPGMMSG, RCVMSG, condition handlers in CL procedures, DMPJOB for diagnostic dumps, and patterns for building robust CL programs that handle failures gracefully in production.</p>
+
+<h2>IBM i Message Types</h2>
+
+<p>Every error, warning, and status notification on IBM i travels through the <strong>message handling system</strong> — a structured mechanism for communicating between programs. Before writing error-handling code in CL, you must understand the six IBM i message types:</p>
+
+<ul>
+  <li><strong>Escape (*ESCAPE)</strong> — a fatal error. The message is sent to the call stack entry that called the failing program. If not monitored, it percolates up the call stack until it reaches an interactive job's program message queue (causing the program to end with an error screen) or a batch job (causing the job to end abnormally). CPF and MCH message IDs are usually escape messages. For example, CPF0001 (Error found on command) is an escape message.</li>
+  <li><strong>Notify (*NOTIFY)</strong> — an error where the sending program expects a reply. Similar to escape but waits for a response from the caller before the sending program continues. Less common than escape messages.</li>
+  <li><strong>Status (*STATUS)</strong> — informational progress update; the caller can ignore it or monitor it. Often used by IBM i commands to report progress (e.g., SAVLIB sends status messages as objects are saved).</li>
+  <li><strong>Informational (*INFO)</strong> — informational message with no error implication. Sent to the job log or message queue for reference only.</li>
+  <li><strong>Completion (*COMP)</strong> — signals that a command or program completed successfully. Most IBM i commands send a completion message to the caller's program message queue on success (e.g., CPFB861: Library MYLIB created).</li>
+  <li><strong>Inquiry (*INQ)</strong> — interactive; requires a human response. Only meaningful in interactive jobs. CL programs that send inquiry messages in batch jobs will cause the batch job to wait for a response indefinitely unless the INQMSGRPY job attribute is set.</li>
+</ul>
+
+<h2>Program Message Queues</h2>
+
+<p>Every program call stack entry on IBM i has its own <strong>program message queue</strong>. When a program sends a message to <code>*PGMBDY</code>, it goes to the caller's program message queue. When a program sends to <code>*EXT</code>, it goes to the interactive user's external message queue (the bottom line of a 5250 screen).</p>
+
+<p>Message queues in the call stack:</p>
+<ul>
+  <li><code>*SAME</code> — the current program's own message queue</li>
+  <li><code>*PGMBDY</code> — the boundary program (the program that called the current procedure)</li>
+  <li><code>*PRV</code> — the next previous program entry in the call stack</li>
+  <li><code>*EXT</code> — the external (user-facing) message queue</li>
+  <li><code>*SYSOPR</code> — the system operator message queue (QSYSOPR)</li>
+</ul>
+
+<h2>MONMSG — Monitoring for Specific Exceptions</h2>
+
+<p>The <code>MONMSG</code> (Monitor Message) command is CL's primary exception handler. It intercepts escape messages by message ID, preventing them from propagating up the call stack. MONMSG can be placed at the program level (monitoring all messages for the whole program) or immediately after a specific command (monitoring only that command).</p>
+
+<pre>
+/* Program-level MONMSG — catches any unhandled escape message
+   and jumps to the ERROR subroutine */
+PGM
+  MONMSG MSGID(CPF0000 MCH0000) EXEC(GOTO CMDLBL(ERROR))
+
+  /* --- Normal processing starts here --- */
+  DLTF    FILE(QTEMP/TMPFILE)
+  CPYF    FROMFILE(APPLIB/CUSTMST) TOFILE(QTEMP/TMPFILE) +
+            MBROPT(*REPLACE) CRTFILE(*YES)
+  CALL    PGM(APPLIB/PRCCUST)
+
+  GOTO CMDLBL(END)
+
+  ERROR:
+    /* Send the escape message to our caller so it knows we failed */
+    SNDPGMMSG MSG('CUSTJOB failed — see job log for details') +
+              MSGTYPE(*ESCAPE)
+
+  END:
+ENDPGM
+</pre>
+
+<p>Command-level MONMSG — monitor a single command and continue if it fails:</p>
+
+<pre>
+PGM
+  /* Delete TMPFILE if it exists — ignore CPF2105 (object not found) */
+  DLTF FILE(QTEMP/TMPFILE)
+  MONMSG MSGID(CPF2105)          /* CPF2105: File TMPFILE not found */
+
+  /* Create the file fresh */
+  CRTPF FILE(QTEMP/TMPFILE) RCDLEN(200)
+
+  /* Run a command and handle a specific error differently */
+  SBMJOB JOB(CUSTBATCH) JOBQ(APPLIB/APPJOBQ) +
+           CMD(CALL PGM(APPLIB/CUSTPRC))
+  MONMSG MSGID(CPF1318) EXEC(DO)
+    /* CPF1318: Job queue is held — send a notification */
+    SNDPGMMSG MSG('Job queue APPJOBQ is held — job not submitted') +
+              TOMSGQ(QSYSOPR)
+    GOTO CMDLBL(END)
+  ENDDO
+
+  END:
+ENDPGM
+</pre>
+
+<p>Key MONMSG rules:</p>
+<ul>
+  <li>MONMSG must immediately follow the command it monitors (no intervening commands)</li>
+  <li>A program-level MONMSG (at the top of PGM block) catches all escape messages not caught by command-level MONMSG</li>
+  <li>MONMSG only catches <em>escape</em> messages — not completion, informational, or status messages</li>
+  <li>Monitoring <code>CPF0000</code> catches all CPF messages; <code>MCH0000</code> catches all machine-level exceptions (overflow, divide by zero, etc.)</li>
+  <li>Monitoring <code>CPF9999</code> alone only catches that one message — always use <code>CPF0000</code> for a general catch-all</li>
+</ul>
+
+<h2>SNDPGMMSG — Sending Messages from CL</h2>
+
+<p>CL programs send messages using <code>SNDPGMMSG</code>. This command is how you communicate status, errors, and completion information to callers and to the job log:</p>
+
+<pre>
+/* Send an informational message to the job log */
+SNDPGMMSG MSG('Processing customer records...') +
+          MSGTYPE(*INFO)
+
+/* Send a completion message to the caller */
+SNDPGMMSG MSG('Customer batch completed. 1,247 records processed.') +
+          MSGTYPE(*COMP) +
+          TOPGMQ(*PGMBDY)
+
+/* Send an escape message to the caller — causes the caller to fail */
+SNDPGMMSG MSG('Customer file locked — cannot continue') +
+          MSGTYPE(*ESCAPE) +
+          TOPGMQ(*PGMBDY)
+
+/* Send a message from a message file (for NLS and consistent messages) */
+SNDPGMMSG MSGID(APP0001) MSGF(APPLIB/APPMSGF) +
+          MSGDTA('CUSTMST') +
+          TOPGMQ(*PGMBDY) +
+          MSGTYPE(*ESCAPE)
+
+/* Send a message to the system operator's message queue */
+SNDPGMMSG MSG('Nightly batch started on ' *CAT %DATE()) +
+          TOMSGQ(QSYSOPR)
+
+/* Send a message to a user's message queue */
+SNDPGMMSG MSG('Your report is ready') +
+          TOMSGQ(DEVUSER)
+</pre>
+
+<h2>RCVMSG — Retrieving Messages</h2>
+
+<p><code>RCVMSG</code> retrieves a message from a program message queue. It is used when a CL program needs to capture the exact message text of an error that just occurred — for logging or forwarding:</p>
+
+<pre>
+PGM
+  DCL VAR(&MSGID)   TYPE(*CHAR) LEN(7)
+  DCL VAR(&MSGTXT)  TYPE(*CHAR) LEN(256)
+  DCL VAR(&MSGDTA)  TYPE(*CHAR) LEN(100)
+
+  MONMSG MSGID(CPF0000 MCH0000) EXEC(GOTO CMDLBL(ERROR))
+
+  /* ... normal commands ... */
+
+  GOTO CMDLBL(END)
+
+  ERROR:
+    /* Retrieve the last escape message from our own message queue */
+    RCVMSG PGMQ(*SAME *) MSGTYPE(*LAST) +
+           MSGID(&MSGID) MSG(&MSGTXT) MSGDTA(&MSGDTA) +
+           RMV(*NO)
+
+    /* Log the message ID and text to a data queue or database */
+    CALL PGM(APPLIB/LOGERROR) PARM(&MSGID &MSGTXT)
+
+    /* Re-send as escape to notify our caller */
+    SNDPGMMSG MSGID(&MSGID) MSGF(QCPFMSG) +
+              MSGDTA(&MSGDTA) +
+              MSGTYPE(*ESCAPE) TOPGMQ(*PGMBDY)
+
+  END:
+ENDPGM
+</pre>
+
+<h2>DMPJOB — Diagnostic Job Dump</h2>
+
+<p><code>DMPJOB</code> (Dump Job) writes a detailed diagnostic snapshot of the current job to a spooled file in the QPPGMDMP output queue. The dump includes:</p>
+<ul>
+  <li>All program call stack entries with their local variable values</li>
+  <li>Open data paths and file status</li>
+  <li>Job attributes and environment at the time of the dump</li>
+  <li>Data area contents</li>
+  <li>Message queue contents</li>
+</ul>
+
+<pre>
+/* Dump job state from within a CL error handler — useful for debugging */
+PGM
+  MONMSG MSGID(CPF0000 MCH0000) EXEC(GOTO CMDLBL(ERRHDL))
+
+  /* ... processing ... */
+  GOTO CMDLBL(END)
+
+  ERRHDL:
+    DMPJOB OUTPUT(*PRINT)       /* Write dump to a spooled file */
+    /* Optionally also log to QHST or a custom log */
+    SNDPGMMSG MSG('Job dumped — see QPPGMDMP for details') +
+              TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+    SNDPGMMSG MSG('Fatal error in CUSTJOB') MSGTYPE(*ESCAPE) +
+              TOPGMQ(*PGMBDY)
+
+  END:
+ENDPGM
+</pre>
+
+<p>View the DMPJOB spooled file with: <code>WRKSPLF SELECT(QPPGMDMP)</code> or look in the job's spooled file list with <code>WRKJOB</code>.</p>
+
+<h2>CL Procedures and Scoped Error Handling</h2>
+
+<p>CL supports <strong>procedures</strong> (not just programs) in modern free-format CL (CLLE source members). Procedures enable scoped error handling — each procedure has its own program message queue and its own MONMSG scope:</p>
+
+<pre>
+/* CLLE source — CL with procedures */
+**FREE
+
+dcl-proc ProcessCustomers export;
+  dcl-pi *n ind;
+    pLibrary  char(10) const;
+  end-pi;
+
+  dcl-s wCustCount int(5) inz(0);
+
+  monitor;                                  // Start a monitor block (free-format)
+    // Attempt the operation
+    QCMDEXC('DLTF FILE(' + %trimr(pLibrary) + '/TMPCUST)': 99);
+    QCMDEXC('CPYF FROMFILE(' + %trimr(pLibrary) + '/CUSTMST) ' +
+            'TOFILE(QTEMP/TMPCUST) MBROPT(*REPLACE) CRTFILE(*YES)': 99);
+    // Count records
+    exec sql SELECT COUNT(*) INTO :wCustCount FROM QTEMP.TMPCUST;
+
+    SNDPGMMSG('Copied ' + %char(wCustCount) + ' customer records': *comp: *pgmbdy);
+    return *on;
+
+  on-error;                                 // Catch any escape message
+    SNDPGMMSG('ProcessCustomers failed for library ' +
+              %trimr(pLibrary): *escape: *pgmbdy);
+    return *off;
+  endmon;
+end-proc;
+</pre>
+
+<h2>Production CL Error-Handling Template</h2>
+
+<p>A complete, production-ready CL program with full error handling, job log messaging, and QHST logging:</p>
+
+<pre>
+/* APPLIB/NIGHTBATCH — Nightly batch controller */
+PGM
+
+  /* ── Declarations ── */
+  DCL VAR(&MSGID)    TYPE(*CHAR) LEN(7)
+  DCL VAR(&MSGTXT)   TYPE(*CHAR) LEN(256)
+  DCL VAR(&MSGDTA)   TYPE(*CHAR) LEN(100)
+  DCL VAR(&STARTDT)  TYPE(*CHAR) LEN(10)
+  DCL VAR(&STRTIM)   TYPE(*CHAR) LEN(8)
+
+  /* ── Program-level catch-all ── */
+  MONMSG MSGID(CPF0000 MCH0000) EXEC(GOTO CMDLBL(ERRHDL))
+
+  /* ── Record start time ── */
+  RTVSYSVAL SYSVAL(QDATE) RTNVAR(&STARTDT)
+  RTVSYSVAL SYSVAL(QTIME) RTNVAR(&STRTIM)
+  SNDPGMMSG MSG('NIGHTBATCH started ' *CAT &STARTDT *BCAT &STRTIM) +
+            TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+
+  /* ── Step 1: Customer processing ── */
+  CALL PGM(APPLIB/CUSTPRC)
+  MONMSG MSGID(CPF0000 MCH0000) EXEC(DO)
+    SNDPGMMSG MSG('CUSTPRC failed — aborting NIGHTBATCH') +
+              TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+    GOTO CMDLBL(ERRHDL)
+  ENDDO
+
+  /* ── Step 2: Order processing ── */
+  CALL PGM(APPLIB/ORDPRC)
+  MONMSG MSGID(CPF0000 MCH0000) EXEC(DO)
+    SNDPGMMSG MSG('ORDPRC failed — aborting NIGHTBATCH') +
+              TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+    GOTO CMDLBL(ERRHDL)
+  ENDDO
+
+  /* ── Success ── */
+  SNDPGMMSG MSG('NIGHTBATCH completed successfully') +
+            TOMSGQ(QSYSOPR) MSGTYPE(*COMP)
+  GOTO CMDLBL(END)
+
+  /* ── Error handler ── */
+  ERRHDL:
+    RCVMSG PGMQ(*SAME *) MSGTYPE(*LAST) +
+           MSGID(&MSGID) MSG(&MSGTXT) MSGDTA(&MSGDTA) RMV(*NO)
+    DMPJOB OUTPUT(*PRINT)
+    SNDPGMMSG MSG('NIGHTBATCH ABEND: ' *CAT &MSGID *BCAT &MSGTXT) +
+              TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+    CALL PGM(APPLIB/LOGERR) PARM(&MSGID &MSGTXT 'NIGHTBATCH')
+    SNDPGMMSG MSGID(&MSGID) MSGF(QCPFMSG) MSGDTA(&MSGDTA) +
+              MSGTYPE(*ESCAPE) TOPGMQ(*PGMBDY)
+
+  END:
+ENDPGM
+</pre>
+
+<p>This pattern — program-level MONMSG with a labelled error handler, RCVMSG to capture the failing message, DMPJOB for a diagnostic snapshot, SNDPGMMSG to QSYSOPR for operator visibility, and re-sending the original escape message to the caller — covers the requirements of most production CL batch jobs.</p>
+
+<em>Next post: DB2 for i Query Optimization — SQE vs CQE query engines, Visual Explain in ACS, index design strategies for IBM i, encoded vector indexes (EVI), STRDBMON database monitoring, and reading the SQL plan cache using QSYS2 catalog views to diagnose slow queries.</em>

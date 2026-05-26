@@ -1,0 +1,352 @@
+<p>The previous post covered the IBM i PASE runtime in depth — AIX binary compatibility, PASE vs QShell differences, environment variables, PASE process management with ps and nohup, shared library loading with LIBPATH, yum package management for open-source tools, and how PASE integrates with the IBM i job structure and ILE programs. This post covers RPG data structures in depth: the dcl-ds keyword, qualified data structures with dot notation, LIKEDS for cloning a structure, template data structures, data structure arrays with DIM, external data structures from DB2 file definitions using EXTNAME and LIKEREC, nested data structures, and passing data structures to subprocedures.</p>
+
+<h2>Data Structures in ILE RPG — Overview</h2>
+
+<p>A data structure (DS) in ILE RPG is a named grouping of fields that occupy contiguous storage. Data structures serve several purposes: organising related fields into a logical unit, mapping memory overlays (a DS and its subfields share the same storage), passing structured data between procedures, and defining the layout of an externally described database record.</p>
+
+<p>In older fixed-format RPG, data structures were defined with a D-spec line that had <code>DS</code> in columns 24–25 and subfields beneath it. In free-format RPG IV, the <code>dcl-ds</code> keyword replaces D-spec DS definitions. Both syntaxes are valid in ILE RPG, but free-format is cleaner and all new code should use it.</p>
+
+<h2>Basic dcl-ds Syntax</h2>
+
+<p>A simple free-format data structure definition:</p>
+
+<pre>
+**FREE
+
+// Basic data structure — a customer record layout
+dcl-ds CustomerDS;
+  CustNo     packed(9:0);
+  CustName   char(40);
+  CustCity   char(30);
+  CustSts    char(1);
+  CrdLimit   packed(13:2);
+end-ds;
+
+// Initialise individual subfields
+CustNo   = 100001;
+CustName = 'ACME Corporation';
+CustSts  = 'A';
+
+// Clear all subfields to their default values
+clear CustomerDS;
+</pre>
+
+<p>The <code>clear</code> operation resets all subfields: numeric fields to 0, character fields to blanks, date/time fields to their default values. <code>reset</code> restores subfields to their compile-time initial values (if any were specified with INZ).</p>
+
+<h2>Qualified Data Structures</h2>
+
+<p>A <em>qualified</em> data structure requires its subfields to be accessed using dot notation: <code>dsname.subfieldname</code>. Without QUALIFIED, subfield names are in the global namespace and can conflict with other field names. QUALIFIED is the recommended default for all data structures in modern ILE RPG.</p>
+
+<pre>
+**FREE
+
+// Qualified DS — subfields accessed as OrderDS.OrderNo, etc.
+dcl-ds OrderDS qualified;
+  OrderNo    packed(9:0);
+  CustNo     packed(9:0);
+  OrderDt    date;
+  OrderAmt   packed(13:2);
+  OrderSts   char(2);
+end-ds;
+
+// Access via dot notation — no ambiguity
+OrderDS.OrderNo  = 20001;
+OrderDS.CustNo   = 100001;
+OrderDS.OrderDt  = %date();
+OrderDS.OrderAmt = 1250.00;
+OrderDS.OrderSts = 'OP';
+
+// Two qualified DS can have subfields with the same name — no conflict
+dcl-ds LineDS qualified;
+  OrderNo    packed(9:0);   // Same name as OrderDS.OrderNo — no problem
+  LineNo     packed(3:0);
+  ItemNo     char(10);
+  Qty        packed(7:0);
+  UnitPrice  packed(11:2);
+end-ds;
+
+LineDS.OrderNo = OrderDS.OrderNo;
+LineDS.LineNo  = 1;
+</pre>
+
+<h2>LIKEDS — Cloning a Data Structure</h2>
+
+<p>The <code>LIKEDS</code> keyword creates a new data structure with the same subfield layout as an existing one. This is the RPG equivalent of a struct typedef in C — define the shape once, create as many instances as needed.</p>
+
+<pre>
+**FREE
+
+// Define a "template" layout using a standalone DS
+dcl-ds t_Order qualified template;
+  OrderNo    packed(9:0);
+  CustNo     packed(9:0);
+  OrderDt    date;
+  OrderAmt   packed(13:2);
+  OrderSts   char(2);
+end-ds;
+
+// Create two separate instances with the same layout using LIKEDS
+dcl-ds CurrentOrder  likeds(t_Order);
+dcl-ds PreviousOrder likeds(t_Order);
+
+// Both have their own storage — changing one does not affect the other
+CurrentOrder.OrderNo  = 20001;
+PreviousOrder.OrderNo = 19998;
+
+// Copy one DS to another of the same LIKEDS type — a single assignment
+PreviousOrder = CurrentOrder;
+
+// LIKEDS also works for procedure parameters — strongly typed
+dcl-proc ProcessOrder;
+  dcl-pi *n;
+    pOrder  likeds(t_Order) const;
+  end-pi;
+  // pOrder.OrderNo, pOrder.CustNo etc. are available here
+end-proc;
+</pre>
+
+<h2>Template Data Structures</h2>
+
+<p>The <code>TEMPLATE</code> keyword marks a data structure as a template — it defines a layout but allocates no storage at compile time. Template DS are only used as prototypes for LIKEDS references or for procedure parameter definitions; they cannot be read from or written to directly.</p>
+
+<pre>
+**FREE
+
+// Template DS — no storage allocated; used only as a LIKEDS source
+dcl-ds t_Address qualified template;
+  Street   char(50);
+  City     char(30);
+  State    char(2);
+  PostCode char(10);
+  Country  char(3);
+end-ds;
+
+// Use the template to define actual variables
+dcl-ds ShipAddress  likeds(t_Address);
+dcl-ds BillAddress  likeds(t_Address);
+
+// Template DS used as a procedure parameter type
+dcl-pr FormatAddress varchar(200) extproc('FormatAddress');
+  pAddr  likeds(t_Address) const;
+end-pr;
+
+// Calling the procedure
+ShipAddress.Street   = '123 Main St';
+ShipAddress.City     = 'Springfield';
+ShipAddress.State    = 'IL';
+ShipAddress.PostCode = '62701';
+ShipAddress.Country  = 'USA';
+wFormattedAddr = FormatAddress(ShipAddress);
+</pre>
+
+<h2>Data Structure Arrays</h2>
+
+<p>Adding the <code>DIM</code> keyword to a data structure makes it an array of data structures. Each element is a complete instance of the DS, accessed by index. DS arrays are the RPG equivalent of a struct array in C or an array of objects in Java.</p>
+
+<pre>
+**FREE
+
+// DS array — an array of order line items
+dcl-ds OrderLines qualified dim(100);
+  LineNo     packed(3:0);
+  ItemNo     char(10);
+  Qty        packed(7:0);
+  UnitPrice  packed(11:2);
+  LineAmt    packed(13:2);
+end-ds;
+
+dcl-s wLineCount  int(5)   inz(0);
+dcl-s wIndex      int(5);
+dcl-s wTotalAmt   packed(13:2) inz(0);
+
+// Populate the DS array
+wLineCount += 1;
+OrderLines(wLineCount).LineNo    = wLineCount;
+OrderLines(wLineCount).ItemNo    = 'WIDGET-001';
+OrderLines(wLineCount).Qty       = 5;
+OrderLines(wLineCount).UnitPrice = 24.99;
+OrderLines(wLineCount).LineAmt   = OrderLines(wLineCount).Qty *
+                                   OrderLines(wLineCount).UnitPrice;
+
+// Iterate over all populated elements
+for wIndex = 1 to wLineCount;
+  wTotalAmt += OrderLines(wIndex).LineAmt;
+endfor;
+
+// Clear all elements
+clear OrderLines;
+
+// %ELEM returns the declared size of the DS array (100)
+dcl-s wMax int(5);
+wMax = %elem(OrderLines);
+</pre>
+
+<h2>External Data Structures with EXTNAME</h2>
+
+<p>The <code>EXTNAME</code> keyword defines a data structure whose subfields are taken directly from a DB2 for i file (physical file or logical file) or from a SQL table definition using the EXTFLD or PREFIX keywords. The compiler reads the file definition at compile time and generates the subfields automatically — no need to manually define each column.</p>
+
+<pre>
+**FREE
+
+// External DS — subfields come from CUSTMST file definition
+// Compiler reads CUSTMST from the library list at compile time
+dcl-ds CustomerRec extname('CUSTMST') qualified;
+end-ds;
+
+// The subfields match the CUSTMST column names exactly
+// (field names are as defined in the DDS or CREATE TABLE)
+CustomerRec.CUSNO  = 100001;
+CustomerRec.CUSNM  = 'ACME Corporation';
+CustomerRec.CUSST  = 'A';
+
+// Use with an SQL cursor — populate the DS from a SELECT
+exec sql
+  SELECT CUSNO, CUSNM, CUSST, CRDLMT
+  INTO   :CustomerRec
+  FROM   APPLIB.CUSTMST
+  WHERE  CUSNO = :wSearchCustNo;
+
+if sqlcode = 0;
+  // CustomerRec.CUSNO, CUSNO, CUSNM etc. are populated
+endif;
+
+// EXTNAME with a specific record format (for files with multiple formats)
+dcl-ds OrderHdrRec extname('ORDMST': 'ORDHDRF') qualified;
+end-ds;
+
+// PREFIX renames subfields to avoid conflicts
+dcl-ds OrderLinRec extname('ORDLIN') prefix('LIN_') qualified;
+end-ds;
+// Subfields become LIN_LINNO, LIN_ITMNO, LIN_QTY, etc.
+</pre>
+
+<h2>LIKEREC — Data Structure from a Record Format</h2>
+
+<p><code>LIKEREC</code> is similar to EXTNAME but references a record format within a file that is already declared in the program (via an F-spec or a dcl-f). LIKEREC is particularly useful when working with files declared in the program and you need a DS that matches the full record layout for read/write operations.</p>
+
+<pre>
+**FREE
+
+// File declaration
+dcl-f ORDMST usage(*input) keyed;
+
+// DS based on the ORDHDRF record format of ORDMST
+dcl-ds OrderHeader likerec(ORDMST.ORDHDRF) qualified;
+end-ds;
+
+// Read a record into the DS
+chain (wOrderNo) ORDMST OrderHeader;
+if %found(ORDMST);
+  // OrderHeader subfields are populated from the record
+  wOrderAmt = OrderHeader.ORDAMT;
+  wOrderSts = OrderHeader.ORDSTS;
+endif;
+
+// LIKEREC with *OUTPUT — only output-capable fields included
+dcl-ds WriteOrder likerec(ORDMST.ORDHDRF: *output) qualified;
+end-ds;
+
+// LIKEREC with *KEY — only key fields included
+dcl-ds OrderKey likerec(ORDMST.ORDHDRF: *key) qualified;
+end-ds;
+</pre>
+
+<h2>Nested Data Structures</h2>
+
+<p>Data structure subfields can themselves be data structures, creating nested (multi-level) structures. This is expressed in free-format RPG by embedding a dcl-ds within another dcl-ds:</p>
+
+<pre>
+**FREE
+
+// Nested DS — an order with embedded address and line items
+dcl-ds t_ShipAddress qualified template;
+  Street   char(50);
+  City     char(30);
+  State    char(2);
+  PostCode char(10);
+end-ds;
+
+dcl-ds t_OrderFull qualified template;
+  OrderNo     packed(9:0);
+  CustNo      packed(9:0);
+  OrderDt     date;
+  ShipAddr    likeds(t_ShipAddress);  // Nested DS
+  TotalAmt    packed(13:2);
+end-ds;
+
+dcl-ds CurrentOrder likeds(t_OrderFull);
+
+// Access nested subfields with chained dot notation
+CurrentOrder.OrderNo             = 20001;
+CurrentOrder.ShipAddr.Street     = '456 Oak Ave';
+CurrentOrder.ShipAddr.City       = 'Chicago';
+CurrentOrder.ShipAddr.State      = 'IL';
+CurrentOrder.ShipAddr.PostCode   = '60601';
+CurrentOrder.TotalAmt            = 350.00;
+</pre>
+
+<h2>Passing Data Structures to Subprocedures</h2>
+
+<p>The standard patterns for passing data structures as procedure parameters:</p>
+
+<pre>
+**FREE
+
+dcl-ds t_Order qualified template;
+  OrderNo  packed(9:0);
+  CustNo   packed(9:0);
+  OrderAmt packed(13:2);
+  OrderSts char(2);
+end-ds;
+
+// Prototype: pass DS by read-only reference (CONST — cannot be modified)
+dcl-pr ValidateOrder ind extproc('ValidateOrder');
+  pOrder   likeds(t_Order) const;
+  pErrMsg  varchar(200);              // Output — passed by reference (default)
+end-pr;
+
+// Prototype: pass DS by reference (can modify)
+dcl-pr EnrichOrder extproc('EnrichOrder');
+  pOrder   likeds(t_Order);           // No CONST — caller's DS is modified
+end-pr;
+
+// Implementation of ValidateOrder
+dcl-proc ValidateOrder export;
+  dcl-pi *n ind;
+    pOrder   likeds(t_Order) const;
+    pErrMsg  varchar(200);
+  end-pi;
+
+  if pOrder.OrderAmt <= 0;
+    pErrMsg = 'Order amount must be greater than zero';
+    return *off;
+  endif;
+
+  if pOrder.CustNo = 0;
+    pErrMsg = 'Customer number is required';
+    return *off;
+  endif;
+
+  pErrMsg = '';
+  return *on;
+end-proc;
+
+// Calling code
+dcl-ds MyOrder likeds(t_Order);
+dcl-s  wMsg   varchar(200);
+
+MyOrder.OrderNo  = 20001;
+MyOrder.CustNo   = 100001;
+MyOrder.OrderAmt = 500.00;
+
+if ValidateOrder(MyOrder: wMsg);
+  // Process the order
+else;
+  // wMsg contains the validation error
+  dsply wMsg;
+endif;
+</pre>
+
+<p>Always use <code>CONST</code> for DS parameters that the procedure should not modify — it documents intent and the compiler enforces it. For output parameters, pass without CONST (by reference). Avoid passing DS by value (<code>VALUE</code> keyword) unless the DS is small, because DS by value copies the entire structure on each call.</p>
+
+<em>Next post: CL Error Handling and Exception Management on IBM i — IBM i message types, MONMSG command patterns, program message queues, SNDPGMMSG for custom errors, RCVMSG, condition handlers in CL procedures, DMPJOB diagnostic dumps, and complete error-handling templates for production CL programs.</em>

@@ -1,0 +1,307 @@
+<p>The previous post covered IBM i output queue and print management — creating and configuring output queues with CRTOUTQ and CHGOUTQ, working with spooled files, moving and copying spooled files, converting spooled files to PDF with IBM i Transform Services, sending spooled files with SNDNETSPLF, and managing printer writers with STRPRTWTR and ENDWTR on IBM i. This post covers IBM MQ messaging from IBM i: the IBM MQ architecture on IBM i PASE, creating and managing queue managers, defining local and remote queues, setting up sender and receiver channels, sending and receiving persistent messages with MQPUT and MQGET from ILE RPG programs, configuring MQ Triggering to start IBM i jobs when messages arrive, dead letter queue handling, and monitoring MQ activity on IBM i in 2026.</p>
+
+<h2>Why IBM MQ on IBM i?</h2>
+
+<p>IBM MQ (formerly WebSphere MQ and MQSeries) is IBM's enterprise message queuing middleware. It provides <strong>guaranteed message delivery</strong> — messages are persisted to disk and survive system restarts, network failures, and application crashes. On IBM i, IBM MQ runs as a PASE application with full integration into the IBM i job structure. It is the standard choice when:</p>
+<ul>
+  <li>An IBM i application must exchange data with an AIX, Linux, Windows, or z/OS system with guaranteed delivery and no message loss</li>
+  <li>Point-to-point or publish/subscribe messaging is needed between IBM i and enterprise integration middleware (IBM App Connect, MuleSoft, Kafka connectors)</li>
+  <li>Transactional message processing is required — messages participate in DB2 for i commitment control so a message is consumed if and only if the associated DB2 transaction commits</li>
+  <li>Asynchronous decoupling is needed — the sender and receiver do not have to be active at the same time</li>
+</ul>
+
+<h2>IBM MQ Architecture on IBM i</h2>
+
+<p>On IBM i, IBM MQ runs in PASE. The key objects are:</p>
+<ul>
+  <li><strong>Queue Manager (QM)</strong> — the MQ server process. One IBM i partition can host multiple queue managers. Each QM manages its own set of queues, channels, and configuration. The QM name is unique within the network.</li>
+  <li><strong>Local Queue</strong> — a named message store on the local QM. Applications put messages to local queues and get messages from them.</li>
+  <li><strong>Remote Queue Definition</strong> — a local alias that points to a queue on a remote QM. Putting a message to a remote queue definition routes it through a transmission queue and a channel to the remote QM.</li>
+  <li><strong>Transmission Queue</strong> — a local queue that temporarily holds messages destined for a remote QM while a channel is transferring them.</li>
+  <li><strong>Channel</strong> — a communication link between two QMs. A sender channel reads from a transmission queue; the matching receiver channel on the remote QM writes to the target queue.</li>
+  <li><strong>Trigger</strong> — when a message arrives on a queue, MQ can automatically start a job (an IBM i program) to process it — this is MQ Triggering.</li>
+</ul>
+
+<h2>Creating and Starting a Queue Manager</h2>
+
+<pre>
+/* All MQ administration is done from a PASE shell or QSH */
+/* Start a PASE shell */
+CALL QSYS/QP2TERM
+
+# Create a queue manager named IBMIMQ1
+# -p 1414: listener port (default)
+# -u MQADMIN: primary MQ administrator user
+crtmqm -p 1414 -u dlq IBMIMQ1
+
+# Start the queue manager
+strmqm IBMIMQ1
+
+# Verify the queue manager is running
+dspmq
+# Output: QMNAME(IBMIMQ1) STATUS(Running)
+
+# Start the MQSC command shell for this QM
+runmqsc IBMIMQ1
+</pre>
+
+<pre>
+/* MQSC: define queues and channels inside the runmqsc shell */
+
+* Define a local queue for inbound orders from the ERP system
+DEFINE QLOCAL('ORDLIB.INBOUND.ORDERS') +
+       DESCR('Inbound order messages from ERP') +
+       MAXMSGL(104857600) +
+       DEFPSIST(YES) +           * Messages are persistent by default
+       MAXDEPTH(99999999) +
+       PUT(ENABLED) GET(ENABLED)
+
+* Define a local queue for outbound acknowledgements back to ERP
+DEFINE QLOCAL('ORDLIB.OUTBOUND.ACK') +
+       DESCR('Outbound order acknowledgements to ERP') +
+       DEFPSIST(YES)
+
+* Define a dead letter queue — receives undeliverable messages
+DEFINE QLOCAL('DLQ.IBMIMQ1') +
+       DESCR('Dead letter queue for undeliverable messages')
+
+* Alter the queue manager to use the DLQ
+ALTER QMGR DEADQ('DLQ.IBMIMQ1')
+
+* Define a listener (accepts inbound channel connections)
+DEFINE LISTENER('LISTENER.TCP') +
+       TRPTYPE(TCP) PORT(1414) CONTROL(QMGR)
+
+* Start the listener
+START LISTENER('LISTENER.TCP')
+
+END
+</pre>
+
+<h2>Setting Up Sender and Receiver Channels</h2>
+
+<pre>
+/* On the IBM i (sender side): define a sender channel to the ERP system's QM */
+runmqsc IBMIMQ1
+
+* Transmission queue for messages going to ERPMQ
+DEFINE QLOCAL('XMITQ.TO.ERPMQ') +
+       USAGE(XMITQ) +
+       DESCR('Transmission queue to ERP queue manager')
+
+* Sender channel — reads from XMITQ and sends to ERP
+DEFINE CHANNEL('IBMI.TO.ERP') +
+       CHLTYPE(SDR) +
+       TRPTYPE(TCP) +
+       CONNAME('erp.company.internal(1414)') +
+       XMITQ('XMITQ.TO.ERPMQ') +
+       DESCR('Sender channel to ERP queue manager')
+
+* Start the sender channel
+START CHANNEL('IBMI.TO.ERP')
+
+* Define a receiver channel — accepts connections from ERP
+DEFINE CHANNEL('ERP.TO.IBMI') +
+       CHLTYPE(RCVR) +
+       TRPTYPE(TCP) +
+       DESCR('Receiver channel from ERP queue manager')
+
+* Remote queue definition: messages put to this resolve to ERP's queue
+DEFINE QREMOTE('ERP.INBOUND.ORDERS') +
+       RNAME('ORDERS.FROM.IBMI') +     * Queue name on remote QM
+       RQMNAME('ERPMQ') +             * Remote QM name
+       XMITQ('XMITQ.TO.ERPMQ') +
+       DESCR('Remote queue: ERP inbound orders queue')
+
+END
+</pre>
+
+<h2>MQPUT and MQGET from ILE RPG</h2>
+
+<p>IBM MQ provides a C-language API callable from ILE RPG via <code>ExtProc</code> prototypes. The key calls are <code>MQCONN</code>/<code>MQCONNX</code> (connect to QM), <code>MQOPEN</code> (open a queue), <code>MQPUT</code>/<code>MQGET</code> (send/receive), and <code>MQCLOSE</code>/<code>MQDISC</code> (disconnect).</p>
+
+<pre>
+**FREE
+Ctl-Opt DftActGrp(*No) ActGrp('MQGRP');
+
+// ── MQ API constants ──────────────────────────────────
+Dcl-C  MQOO_INPUT_AS_Q_DEF    1;    // Open for get using queue default
+Dcl-C  MQOO_OUTPUT            16;   // Open for put
+Dcl-C  MQPMO_SYNCPOINT        2;    // Put participates in UOW (commit/rollback)
+Dcl-C  MQGMO_SYNCPOINT        2;    // Get participates in UOW
+Dcl-C  MQGMO_WAIT             1;    // Wait for a message if queue is empty
+Dcl-C  MQRC_NONE              0;    // No error
+Dcl-C  MQRC_NO_MSG_AVAILABLE  2033; // Queue empty (wait timed out)
+
+// ── MQ data structures (simplified) ──────────────────
+Dcl-DS  MQMD  Qualified Inz;        // Message descriptor
+  StrucId      Char(4)   Inz('MD  ');
+  Version      Int(10)   Inz(2);
+  MsgType      Int(10)   Inz(8);    // MQMT_DATAGRAM = 8
+  Persistence  Int(10)   Inz(1);    // MQPER_PERSISTENT = 1
+  // ... 60+ more fields; use full MQMD copybook from MQ header files
+End-DS;
+
+Dcl-DS  MQPMO Qualified Inz;        // Put message options
+  StrucId  Char(4)  Inz('PMO ');
+  Version  Int(10)  Inz(1);
+  Options  Int(10)  Inz(MQPMO_SYNCPOINT);
+End-DS;
+
+Dcl-DS  MQGMO Qualified Inz;        // Get message options
+  StrucId   Char(4)  Inz('GMO ');
+  Version   Int(10)  Inz(1);
+  Options   Int(10)  Inz(MQGMO_WAIT + MQGMO_SYNCPOINT);
+  WaitInterval Int(10) Inz(30000);  // Wait up to 30 seconds (milliseconds)
+End-DS;
+
+// ── MQ API prototypes ─────────────────────────────────
+Dcl-PR MQCONN ExtProc('MQCONN');
+  QMgrName  Char(48) Const;
+  Hconn     Int(10);
+  CompCode  Int(10);
+  Reason    Int(10);
+End-PR;
+
+Dcl-PR MQOPEN ExtProc('MQOPEN');
+  Hconn     Int(10) Const;
+  ObjDesc   Char(264);           // MQOD structure
+  Options   Int(10) Const;
+  Hobj      Int(10);
+  CompCode  Int(10);
+  Reason    Int(10);
+End-PR;
+
+Dcl-PR MQPUT ExtProc('MQPUT');
+  Hconn     Int(10) Const;
+  Hobj      Int(10) Const;
+  MsgDesc   LikeDS(MQMD);
+  PutOpts   LikeDS(MQPMO);
+  BufLen    Int(10) Const;
+  Buf       Char(65535) Const Options(*VarSize);
+  CompCode  Int(10);
+  Reason    Int(10);
+End-PR;
+
+Dcl-PR MQGET ExtProc('MQGET');
+  Hconn     Int(10) Const;
+  Hobj      Int(10) Const;
+  MsgDesc   LikeDS(MQMD);
+  GetOpts   LikeDS(MQGMO);
+  BufLen    Int(10) Const;
+  Buf       Char(65535) Options(*VarSize);
+  DataLen   Int(10);
+  CompCode  Int(10);
+  Reason    Int(10);
+End-PR;
+
+Dcl-PR MQCLOSE ExtProc('MQCLOSE');
+  Hconn     Int(10) Const;
+  Hobj      Int(10);
+  Options   Int(10) Const;
+  CompCode  Int(10);
+  Reason    Int(10);
+End-PR;
+
+Dcl-PR MQDISC ExtProc('MQDISC');
+  Hconn     Int(10);
+  CompCode  Int(10);
+  Reason    Int(10);
+End-PR;
+
+// ── Send an order message ─────────────────────────────
+Dcl-S  Hconn      Int(10);
+Dcl-S  Hobj       Int(10);
+Dcl-S  CompCode   Int(10);
+Dcl-S  Reason     Int(10);
+Dcl-S  MsgBuf     Varchar(10000);
+Dcl-S  ObjDesc    Char(264)   Inz(*AllX'00');  // MQOD structure (simplified)
+
+// Connect to the queue manager
+MQCONN('IBMIMQ1' : Hconn : CompCode : Reason);
+If CompCode <> MQRC_NONE;
+  Dsply ('MQCONN failed, reason=' + %Char(Reason));
+  *InLR = *On;
+  Return;
+EndIf;
+
+// Set queue name in MQOD (bytes 25-72 = ObjectName field)
+%SubSt(ObjDesc : 25 : 48) = 'ORDLIB.INBOUND.ORDERS' + *AllX'00';
+
+// Open the queue for output (put)
+MQOPEN(Hconn : ObjDesc : MQOO_OUTPUT : Hobj : CompCode : Reason);
+
+// Build JSON order message
+MsgBuf = '{"orderNo":"ORD0012345","custNo":"C001234","amount":2450.75,"date":"2026-07-21"}';
+
+// Put the message
+MQPUT(Hconn : Hobj : MQMD : MQPMO : %Len(MsgBuf) : MsgBuf : CompCode : Reason);
+
+If CompCode = MQRC_NONE;
+  Exec SQL COMMIT;   // Commit the DB2 transaction + MQ message atomically
+Else;
+  Exec SQL ROLLBACK;
+EndIf;
+
+MQCLOSE(Hconn : Hobj : 0 : CompCode : Reason);
+MQDISC(Hconn : CompCode : Reason);
+*InLR = *On;
+</pre>
+
+<h2>MQ Triggering: Starting IBM i Jobs on Message Arrival</h2>
+
+<p>MQ <strong>Triggering</strong> automatically starts an IBM i program when one or more messages arrive on a queue. It eliminates the need for polling loops — the MQ trigger monitor notifies the IBM i job scheduler instead.</p>
+
+<pre>
+/* Configure triggering on the inbound order queue */
+runmqsc IBMIMQ1
+
+* Enable triggering on the inbound queue
+ALTER QLOCAL('ORDLIB.INBOUND.ORDERS') +
+      TRIGGER +                   * Enable triggering
+      TRIGTYPE(FIRST) +           * Trigger when queue goes from 0 to 1 message
+      TRIGMPRI(0) +               * Trigger on any message priority
+      INITQ('SYSTEM.DEFAULT.INITIATION.QUEUE') +
+      PROCESS('ORDLIB.PROC')      * Name of the process definition
+
+* Define the process (what to run when triggered)
+DEFINE PROCESS('ORDLIB.PROC') +
+       DESCR('Process inbound orders') +
+       APPLICID('/QSYS.LIB/ORDLIB.LIB/PRCMQORD.PGM') +
+       APPLTYPE(OS400)             * IBM i native program
+
+END
+
+/* Start the trigger monitor on the IBM i — this job watches the initiation queue
+   and starts the triggered program when messages arrive */
+STRQSH CMD('/QIBM/ProdData/mqm/bin/runmqtrm -m IBMIMQ1 -q SYSTEM.DEFAULT.INITIATION.QUEUE &')
+
+/* The triggered program PRCMQORD receives the trigger message and
+   calls MQGET to process inbound order messages */
+</pre>
+
+<h2>Dead Letter Queue Handling</h2>
+
+<p>When a message cannot be delivered to its target queue (queue full, queue does not exist, message too large), IBM MQ routes it to the <strong>Dead Letter Queue (DLQ)</strong>. Every production queue manager must have a DLQ defined and a DLQ handler program running to process undeliverable messages.</p>
+
+<pre>
+/* Start the IBM MQ DLQ handler — IBM-provided utility */
+STRQSH CMD('/QIBM/ProdData/mqm/bin/runmqdlq ORDLIB.INBOUND.ORDERS IBMIMQ1 < /etc/mq/dlqrules.rul &')
+
+/* /etc/mq/dlqrules.rul — rules for handling DLQ messages */
+/* Rule: retry messages with reason MQRC_Q_FULL up to 3 times, then discard */
+/*
+INPUT(ORDLIB.INBOUND.ORDERS)
+ACTION(RETRY) RETRY(3) RETRYINT(60) REASON(MQRC_Q_FULL)
+ACTION(DISCARD) REASON(MQRC_Q_FULL)
+ACTION(FWD) FWDQ('ORDLIB.DLQ.REVIEW') FWDQM(IBMIMQ1)
+*/
+
+/* Query DLQ contents using AMQSGET (IBM MQ sample program) */
+STRQSH CMD('/QIBM/ProdData/mqm/samp/bin/amqsget DLQ.IBMIMQ1 IBMIMQ1')
+
+/* Use AMQSPUT to inject a test message */
+STRQSH CMD('echo "{\"test\":\"ping\"}" | /QIBM/ProdData/mqm/samp/bin/amqsput ORDLIB.INBOUND.ORDERS IBMIMQ1')
+</pre>
+
+<em>Next post: IFS permissions and security on IBM i — managing stream file and directory authorities with CHGAUT and WRKOBJAUT, changing ownership with CHGOWN, applying access control lists (ACLs) using SETFACL and GETFACL in PASE, configuring the PASE umask for default creation permissions, auditing IFS object access with QAUDJRN, and stream file security best practices on IBM i in 2026.</em>

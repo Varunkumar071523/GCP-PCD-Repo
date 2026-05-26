@@ -1,0 +1,329 @@
+<p>The previous post covered IBM i IFS permissions and security — the POSIX-style IFS authority model, controlling *PUBLIC access, using CHGAUT and CHGOWN to set permissions and ownership, configuring access control lists with authorization lists, symbolic link authority implications, designing secure PASE application directory trees, and auditing IFS access through QAUDJRN. This post covers IBM i RPG subfile programming: what a subfile is, DDS subfile and subfile control record design with SFLPAG and SFLSIZ, loading records into a subfile with WRITE, displaying and clearing with SFLDSP and SFLDSPCTL, implementing page-up and page-down paging logic in free-format RPG, handling option codes, and cursor positioning with SFLRCDNBR.</p>
+
+<h2>What Is a Subfile?</h2>
+
+<p>A <strong>subfile</strong> is a special type of record format in a display file (DDS) that allows a program to write multiple records to the screen at once and display them as a scrollable list. Subfiles are the standard IBM i mechanism for presenting tabular data — a list of orders, customer search results, an inquiry display — in a 5250 interactive application.</p>
+
+<p>A subfile consists of two paired DDS record formats:</p>
+<ul>
+  <li><strong>Subfile record (SFL)</strong> — defines the layout of a single row in the list. Each WRITE to the subfile record adds one row. Fields in this record are the columns of the displayed list.</li>
+  <li><strong>Subfile control record (SFLCTL)</strong> — controls the display of the entire subfile: page size, total size, whether the subfile is displayed, whether it is cleared, and the header, function key definitions, and constant text that appear above the subfile list.</li>
+</ul>
+
+<p>The program fills the subfile by writing records to the SFL format, then executes EXFMT on the SFLCTL format to display the screen and wait for user input. The 5250 display station handles paging automatically based on the SFLPAG setting.</p>
+
+<h2>DDS Subfile Record Format Design</h2>
+
+<p>The DDS source for a subfile lives in a source physical file (typically QDDSSRC, member type DSPF). Here is a realistic subfile design for an order inquiry screen:</p>
+
+<pre>
+     A*  APPLIB/QDDSSRC  Member: ORDINQ  Type: DSPF
+     A*  Order Inquiry Subfile Display File
+     A
+     A          R ORDSFR                    SFL
+     A            SFLOPTION      1A  B  9  3
+     A            ORDNO         9P 0O  9  6EDTCDE(Z)
+     A            CUSNO         9P 0O  9 17EDTCDE(Z)
+     A            CUSNAM       30A  O  9 28
+     A            ORDAMT       13P 2O  9 60EDTCDE(1)
+     A            ORDSTS        1A  O  9 77
+     A*
+     A          R ORDSFC                    SFLCTL(ORDSFR)
+     A                                      SFLDSP
+     A                                      SFLDSPCTL
+     A                                      SFLEND(*MORE)
+     A                                      SFLPAG(14)
+     A                                      SFLSIZ(15)
+     A  91                                  SFLCLR
+     A  92                                  SFLEMPTY
+     A            SFLRCDNBR     4S 0H       SFLRCDNBR(CURSOR)
+     A                                  1  2'Order Inquiry'
+     A                                  3  2'Customer Number . . .'
+     A            SCUSNO        9P 0B  3 24
+     A                                  5  2'Status . . . . . . .'
+     A            SSTS          1A  B  5 24
+     A                                  8  2'Opt'
+     A                                  8  6'Order'
+     A                                  8 17'Customer'
+     A                                  8 28'Name'
+     A                                  8 60'Amount'
+     A                                  8 77'S'
+     A                                 24  2'F3=Exit  F5=Refresh  F12=Cancel'
+     A                                      CA03(03 'F3=Exit')
+     A                                      CA05(05 'F5=Refresh')
+     A                                      CA12(12 'F12=Cancel')
+</pre>
+
+<p>Key DDS keywords explained:</p>
+<ul>
+  <li><code>SFL</code> — marks the record format as a subfile record (the row definition)</li>
+  <li><code>SFLCTL(ORDSFR)</code> — marks this as the subfile control record for the ORDSFR subfile</li>
+  <li><code>SFLPAG(14)</code> — 14 rows are displayed on screen per page</li>
+  <li><code>SFLSIZ(15)</code> — the subfile can hold a maximum of 15 records in memory at one time. SFLSIZ must be at least SFLPAG + 1 for the More indicator to work correctly with full-page loads</li>
+  <li><code>SFLDSP</code> — indicator-controlled: when this indicator is on, the subfile data is visible on screen</li>
+  <li><code>SFLDSPCTL</code> — indicator-controlled: when on, the control record header fields are visible</li>
+  <li><code>SFLCLR</code> — controlled by indicator 91: clears all records from the subfile buffer</li>
+  <li><code>SFLEMPTY</code> — controlled by indicator 92: displays a "No records to display" message when the subfile has no records</li>
+  <li><code>SFLEND(*MORE)</code> — shows "More..." at the bottom when there are more pages, "Bottom" when on the last page</li>
+  <li><code>SFLRCDNBR(CURSOR)</code> — positions the cursor at the record number stored in SFLRCDNBR when the subfile is displayed</li>
+</ul>
+
+<h2>The SFLPAG and SFLSIZ Relationship</h2>
+
+<p>SFLPAG and SFLSIZ are the most frequently misunderstood DDS subfile parameters. The rules are:</p>
+
+<table>
+  <thead>
+    <tr><th>Scenario</th><th>SFLPAG</th><th>SFLSIZ</th><th>Behaviour</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Single-page subfile (load all)</td><td>14</td><td>9999</td><td>All records loaded up front; 5250 station handles paging entirely</td></tr>
+    <tr><td>Page-at-a-time (program paging)</td><td>14</td><td>15</td><td>Program loads one page at a time; must reload on PageDown</td></tr>
+    <tr><td>SFLPAG = SFLSIZ (exact match)</td><td>14</td><td>14</td><td>Valid only if SFLEND(*NOMORE) — means only one page ever displayed</td></tr>
+    <tr><td>Expandable load</td><td>14</td><td>1400</td><td>Pre-load many records; 5250 pages through all without program re-entry</td></tr>
+  </tbody>
+</table>
+
+<p>The page-at-a-time pattern (SFLPAG=14, SFLSIZ=15) minimises memory usage and database reads for large result sets. The single-page load-all pattern (SFLSIZ=9999) is simpler to code but loads all rows into memory before displaying the first screen.</p>
+
+<h2>Loading Subfile Records in Free-Format RPG</h2>
+
+<p>Loading a subfile means writing SFL format records in a loop. Each WRITE increments the relative record number (RRN) in the subfile buffer. The RRN is a 4-byte packed field that identifies each row's position.</p>
+
+<pre>
+**FREE
+// APPLIB/QRPGLESRC  Member: ORDINQ  Type: RPGLE
+// Order Inquiry with subfile — free-format RPG IV
+// Compile: CRTBNDRPG PGM(APPLIB/ORDINQ) SRCFILE(APPLIB/QRPGLESRC) SRCMBR(ORDINQ)
+//          DFTACTGRP(*NO) ACTGRP(ORDGRP) DBGVIEW(*SOURCE)
+
+ctl-opt dftactgrp(*no) actgrp('ORDGRP') option(*nodebugio);
+
+dcl-f ORDINQ  workstn sfile(ORDSFR:wRRN) indds(wInds);
+
+// Indicator data structure — maps indicator numbers to named variables
+dcl-ds wInds len(99);
+  indClrSfl  ind pos(91);   // Indicator 91 = SFLCLR
+  indEmpSfl  ind pos(92);   // Indicator 92 = SFLEMPTY
+end-ds;
+
+dcl-s wRRN    packed(4:0);
+dcl-s wDone   ind inz(*off);
+dcl-s wF3     ind inz(*off);
+
+// Main procedure
+LoadAndDisplay();
+*inlr = *on;
+
+dcl-proc LoadAndDisplay;
+  dow not wDone;
+    LoadSubfile();
+    ExfmtScreen();
+    ProcessInput();
+  enddo;
+end-proc;
+
+dcl-proc LoadSubfile;
+  // Clear the subfile before loading
+  indClrSfl = *on;
+  indEmpSfl = *off;
+  write ORDSFC;           // SFLCLR is on — this clears the subfile buffer
+  indClrSfl = *off;
+
+  wRRN = 0;
+
+  // Load matching orders from DB2
+  exec sql
+    DECLARE ordCursor CURSOR FOR
+    SELECT ORDNO, CUSNO, CUSNAM, ORDAMT, ORDSTS
+    FROM   ORDLIB.ORDMST O
+    JOIN   ORDLIB.CUSTMST C ON C.CUSNO = O.CUSNO
+    WHERE  (:SCUSNO = 0 OR O.CUSNO = :SCUSNO)
+    AND    (:SSTS   = ' ' OR O.ORDSTS = :SSTS)
+    ORDER BY ORDNO DESC
+    FETCH FIRST 200 ROWS ONLY;
+
+  exec sql OPEN ordCursor;
+
+  exec sql
+    FETCH NEXT FROM ordCursor
+    INTO :ORDNO, :CUSNO, :CUSNAM, :ORDAMT, :ORDSTS;
+
+  dow sqlcode = 0;
+    wRRN += 1;
+    SFLOPTION = ' ';
+    write ORDSFR;         // Write one row to the subfile
+
+    exec sql
+      FETCH NEXT FROM ordCursor
+      INTO :ORDNO, :CUSNO, :CUSNAM, :ORDAMT, :ORDSTS;
+  enddo;
+
+  exec sql CLOSE ordCursor;
+
+  // Set the empty indicator if no records loaded
+  if wRRN = 0;
+    indEmpSfl = *on;
+  endif;
+end-proc;
+
+dcl-proc ExfmtScreen;
+  SFLRCDNBR = 1;    // Position to first record on initial display
+  exfmt ORDSFC;     // Display the subfile control record (shows the whole screen)
+  wF3 = *in03;      // Check function key indicators
+end-proc;
+</pre>
+
+<h2>Processing User Input and Option Codes</h2>
+
+<p>After EXFMT returns, the program reads back the subfile rows to check which rows the user modified. The <code>READC</code> (Read Changed) opcode reads only records that the user typed in — in a subfile, this means rows where the user entered a value in the option field.</p>
+
+<pre>
+dcl-proc ProcessInput;
+  if wF3;
+    wDone = *on;
+    return;
+  endif;
+
+  if *in05;   // F5 = Refresh: reload the subfile
+    return;   // Loop back to LoadSubfile
+  endif;
+
+  // Read all changed subfile records (rows where user typed an option)
+  readc ORDSFR;
+  dow not %eof(ORDINQ);
+    select;
+      when SFLOPTION = '5';   // Option 5 = Display order detail
+        CallOrderDetail(ORDNO);
+      when SFLOPTION = '2';   // Option 2 = Change order
+        CallOrderChange(ORDNO);
+      when SFLOPTION = '4';   // Option 4 = Delete order (with confirmation)
+        ConfirmDelete(ORDNO);
+      other;
+        // Invalid option — write an error message to the subfile row
+        SFLOPTION = ' ';
+    endsl;
+    SFLOPTION = ' ';    // Clear the option after processing
+    update ORDSFR;      // Update the subfile row (clears the option field on screen)
+    readc ORDSFR;
+  enddo;
+end-proc;
+</pre>
+
+<h2>Subfile Paging: Program-Managed Page Down and Page Up</h2>
+
+<p>When SFLSIZ is only slightly larger than SFLPAG (the page-at-a-time pattern), the program must handle PageDown by detecting the end of the current page, clearing the subfile, loading the next page, and redisplaying. The roll key indicators are IN78 (PageDown/Roll Up) and IN79 (PageUp/Roll Down).</p>
+
+<pre>
+dcl-s wPageStart  packed(9:0) inz(1);  // First order number on current page
+dcl-s wPageSize   packed(4:0) inz(14); // Must match SFLPAG
+dcl-s wLastOrdNo  packed(9:0) inz(0);  // Last order number displayed (for PageDown)
+
+dcl-proc LoadPage;
+  dcl-pi *n;
+    pStartFrom  packed(9:0) const;  // Load orders starting after this order number
+  end-pi;
+
+  indClrSfl = *on;
+  write ORDSFC;
+  indClrSfl = *off;
+  wRRN = 0;
+
+  exec sql
+    DECLARE pageCursor CURSOR FOR
+    SELECT ORDNO, CUSNO, CUSNAM, ORDAMT, ORDSTS
+    FROM   ORDLIB.ORDMST O
+    JOIN   ORDLIB.CUSTMST C ON C.CUSNO = O.CUSNO
+    WHERE  ORDNO < :pStartFrom           -- Page forward by descending key
+    ORDER BY ORDNO DESC
+    FETCH FIRST :wPageSize ROWS ONLY;
+
+  exec sql OPEN pageCursor;
+
+  exec sql
+    FETCH NEXT FROM pageCursor
+    INTO :ORDNO, :CUSNO, :CUSNAM, :ORDAMT, :ORDSTS;
+
+  dow sqlcode = 0 and wRRN < wPageSize;
+    wRRN += 1;
+    wLastOrdNo = ORDNO;
+    SFLOPTION = ' ';
+    write ORDSFR;
+    exec sql
+      FETCH NEXT FROM pageCursor
+      INTO :ORDNO, :CUSNO, :CUSNAM, :ORDAMT, :ORDSTS;
+  enddo;
+
+  exec sql CLOSE pageCursor;
+
+  if wRRN = 0;
+    indEmpSfl = *on;
+  endif;
+end-proc;
+
+// In ExfmtScreen, after EXFMT returns:
+// if *in78 (PageDown) then LoadPage(wLastOrdNo)
+// if *in79 (PageUp)   then LoadPage(wPageStart + wPageSize + 1) — backing up one page
+</pre>
+
+<h2>Cursor Positioning with SFLRCDNBR</h2>
+
+<p>The <code>SFLRCDNBR</code> field (defined in the SFLCTL record with the SFLRCDNBR keyword) controls which page the subfile displays first and where the cursor is positioned. Setting SFLRCDNBR to a specific relative record number before EXFMT makes the 5250 station scroll to the page containing that RRN and optionally position the cursor at that row.</p>
+
+<pre>
+// Position cursor to the first row after loading
+SFLRCDNBR = 1;
+exfmt ORDSFC;
+
+// After processing an option on row 45, redisplay with cursor
+// back on the same row (prevents jumping back to page 1)
+SFLRCDNBR = wLastProcessedRRN;
+exfmt ORDSFC;
+
+// Example: after a successful delete of row 12, position to row 13
+wLastProcessedRRN = 13;
+SFLRCDNBR = wLastProcessedRRN;
+exfmt ORDSFC;
+</pre>
+
+<p>Without managing SFLRCDNBR, the subfile always redisplays from page 1 after a program reentry — a common annoyance in interactive applications where a user is working through page 8 of a large list and is thrown back to page 1 after each action.</p>
+
+<h2>Subfile with DROP and FOLD for Wide Displays</h2>
+
+<p>Two additional subfile control keywords handle wide records on a 24x80 screen:</p>
+<ul>
+  <li><code>SFLDROP(CA11)</code> — allows the user to press a function key to fold the subfile rows to two display lines per record, showing additional fields that don't fit in 80 columns</li>
+  <li><code>SFLFOLD(CA10)</code> — the reverse; compresses folded records back to one line per row</li>
+</ul>
+
+<pre>
+     A          R ORDSFC                    SFLCTL(ORDSFR)
+     A                                      SFLDSP
+     A                                      SFLDSPCTL
+     A                                      SFLEND(*MORE)
+     A                                      SFLPAG(10)
+     A                                      SFLSIZ(11)
+     A                                      SFLDROP(CA11)
+     A                                      SFLFOLD(CA10)
+     A  91                                  SFLCLR
+     A  92                                  SFLEMPTY
+     A            SFLRCDNBR     4S 0H       SFLRCDNBR(CURSOR)
+     A                                 24  2'F3=Exit  F10=Fold  F11=Drop'
+     A                                      CA03(03 'F3=Exit')
+     A                                      CA10(10 'F10=Fold')
+     A                                      CA11(11 'F11=Drop')
+</pre>
+
+<h2>Subfile Best Practices for 2026</h2>
+
+<ul>
+  <li><strong>Use SFLSIZ = SFLPAG + 1 for page-at-a-time subfiles</strong> — this is the minimum that makes SFLEND(*MORE) display "More..." correctly; never set SFLSIZ equal to SFLPAG unless using SFLEND(*NOMORE)</li>
+  <li><strong>Use READC to process only changed rows</strong> — never READ through the entire subfile after EXFMT; READC reads only rows the user modified, which is correct and efficient</li>
+  <li><strong>Clear with SFLCLR before every reload</strong> — if you forget to set the SFLCLR indicator before rewriting the subfile, stale rows from the previous load remain visible</li>
+  <li><strong>Use an indicator data structure (indds)</strong> — mapping indicators to named boolean fields makes free-format RPG subfile code significantly more readable than raw <code>*in91</code> references</li>
+  <li><strong>Protect against SQL cursor leaks</strong> — always CLOSE cursors after the fetch loop, even on error paths; open cursors held by an interactive job survive across EXFMT calls and count against the job's SQL cursor limit</li>
+  <li><strong>Limit subfile loads to 200 rows maximum</strong> — for large tables, use FETCH FIRST N ROWS ONLY in the SQL query and display a message if truncated; loading thousands of rows into a subfile creates slow screen responses and excessive memory usage</li>
+  <li><strong>Save and restore SFLRCDNBR</strong> — store the last processed RRN before EXFMT and restore it before redisplay to keep the user's position in the list between operations</li>
+</ul>
+
+<em>Next post: DB2 for i CTEs and Recursive SQL — writing readable multi-step queries with the WITH clause, chaining multiple CTEs, using CTEs in UPDATE and DELETE statements, traversing hierarchical structures like bills of materials and organizational charts with WITH RECURSIVE, cycle detection, and CTE performance considerations on IBM i.</em>

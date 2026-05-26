@@ -1,0 +1,394 @@
+<p>The previous post covered AI-driven anomaly detection on IBM i operational data — querying QSYS2 system views for job and performance metrics, establishing statistical baselines with DB2 SQL window functions, installing Python and scikit-learn in PASE, training an Isolation Forest model on historical IBM i data, building a real-time detection pipeline, and triggering automated alerts via email or data queue when anomalies are found on IBM i. This post covers IBM i job scheduling with ADDJOBSCDE: the IBM i job scheduler architecture, adding recurring batch jobs with ADDJOBSCDE, managing and modifying schedules with WRKJOBSCDE and CHGJOBSCDE, creating business-day schedule calendars, defining exception calendars for bank holidays, retrieving schedule entries programmatically with RTVJOBSCDE in CL programs, holding and releasing schedules with HLDJOBSCDE and RLSJOBSCDE, and monitoring scheduled job execution history on IBM i in 2026.</p>
+
+<h2>IBM i Job Scheduler Architecture</h2>
+
+<p>The IBM i job scheduler is a subsystem-level service managed by the <code>QSYS</code> subsystem. Scheduled job entries are stored in the IBM i system (not in a user library) and survive IPL. Each schedule entry defines <strong>what</strong> to run (a CL command), <strong>when</strong> to run it (date, time, frequency, calendar), and <strong>how</strong> to run it (job description, user profile, job queue).</p>
+
+<ul>
+  <li><strong>Schedule entry</strong> — the definition stored by ADDJOBSCDE: job name, command, frequency, start date/time, calendar references, and job attributes</li>
+  <li><strong>Schedule calendar</strong> (<code>*CALTYPE(*SCHED)</code>) — defines which days of the week or month a job runs; used for business-day schedules</li>
+  <li><strong>Holiday/exception calendar</strong> (<code>*CALTYPE(*HLD)</code>) — defines dates when a scheduled job should <em>not</em> run, regardless of the schedule calendar; used for bank holidays and system maintenance windows</li>
+  <li><strong>Job scheduler job</strong> — <code>QJOBSCD</code> runs in <code>QSYS</code> and submits jobs to their target job queues at the scheduled time</li>
+</ul>
+
+<pre>
+/* Verify the job scheduler is active */
+WRKACTJOB JOB(QJOBSCD)
+/* Look for QJOBSCD in QSYS subsystem — it must be active for scheduled jobs to run */
+
+/* Display the current job scheduler status */
+WRKJOBSCDE
+/* Shows all schedule entries with status, next scheduled run time, and last completion */
+</pre>
+
+<h2>Adding Scheduled Jobs: ADDJOBSCDE</h2>
+
+<p><code>ADDJOBSCDE</code> adds a new entry to the IBM i job scheduler. The key parameters are <code>JOB</code> (the scheduler entry name, up to 10 characters), <code>CMD</code> (the CL command to submit), <code>FRQ</code> (frequency — <code>*WEEKLY</code>, <code>*MONTHLY</code>, <code>*MINUTES</code>, <code>*ONCE</code>), and the schedule calendar and holiday calendar references.</p>
+
+<pre>
+/* Add a daily end-of-day batch job — runs Monday to Friday at 18:00 */
+ADDJOBSCDE JOB(EODBATCH) +
+           CMD(CALL PGM(APPLIB/RUNEODBATCH)) +
+           FRQ(*WEEKLY) +
+           SCDDAY(*MON *TUE *WED *THU *FRI) +
+           SCDTIME('180000') +
+           JOBD(APPLIB/BATCHJOBD) +
+           USER(BATCHUSR) +
+           JOBQ(APPLIB/BATCHJOBQ) +
+           TEXT('End-of-day batch processing — runs Mon-Fri at 18:00')
+
+/* Add a monthly billing run — first day of each month at 01:00 */
+ADDJOBSCDE JOB(MONTHBILL) +
+           CMD(CALL PGM(ARLIB/RUNBILLING)) +
+           FRQ(*MONTHLY) +
+           SCDDATE(*MONTHSTR) +   /* *MONTHSTR = first day of month */
+           SCDTIME('010000') +
+           JOBD(ARLIB/BILLJOBD) +
+           USER(ARUSR) +
+           JOBQ(ARLIB/ARJOBQ) +
+           TEXT('Monthly billing run — 1st of month at 01:00')
+
+/* Add a job that runs every 15 minutes throughout the day */
+ADDJOBSCDE JOB(SYNCDATA) +
+           CMD(CALL PGM(APPLIB/SYNCMSTR)) +
+           FRQ(*MINUTES) MINUTE(15) +
+           SCDDATE(*CURRENT) SCDTIME(*CURRENT) +
+           JOBD(APPLIB/BATCHJOBD) USER(BATCHUSR) +
+           TEXT('Sync master data to replicated tables every 15 minutes')
+
+/* Add a one-time job — runs once at a specific date and time, then expires */
+ADDJOBSCDE JOB(DATAMIGR) +
+           CMD(CALL PGM(APPLIB/MIGRATEDATA)) +
+           FRQ(*ONCE) +
+           SCDDATE('2026-08-01') +
+           SCDTIME('030000') +
+           JOBD(APPLIB/BATCHJOBD) USER(BATCHUSR) +
+           TEXT('One-time data migration — 2026-08-01 at 03:00')
+
+/* Add a weekly archive job — Sunday at 02:30 */
+ADDJOBSCDE JOB(WEEKARCH) +
+           CMD(CALL PGM(APPLIB/ARCHIVEWK)) +
+           FRQ(*WEEKLY) +
+           SCDDAY(*SUN) +
+           SCDTIME('023000') +
+           JOBD(APPLIB/BATCHJOBD) USER(BATCHUSR) +
+           TEXT('Weekly archive of completed orders — Sunday 02:30')
+</pre>
+
+<h2>Schedule Calendars: Business-Day Schedules</h2>
+
+<p>A <strong>schedule calendar</strong> specifies the set of days on which a scheduled job is eligible to run. It is more flexible than the <code>SCDDAY</code> parameter alone because it can define custom patterns — for example, the last business day of each month, or every other Monday. Calendars are created with <code>ADDJOBSCDE</code>'s <code>SCDCAL</code> parameter after the calendar itself is created with <code>ADDTAAJOBSCDE</code> or the Work with Job Schedule Calendars option.</p>
+
+<pre>
+/* Create a schedule calendar for business days (Mon-Fri) */
+/* Use option 1 on WRKJOBSCDE → F6=Add, then select calendar type *SCHED */
+
+/* From CL: create a schedule calendar */
+ADDSCDCALE SCDCAL(BIZDAYS) +
+           TEXT('Monday to Friday business day calendar') +
+           DAY(*MON *TUE *WED *THU *FRI)
+
+/* Create a schedule calendar for end-of-month runs */
+/* The SCDDATE(*MONTHEND) keyword on ADDJOBSCDE handles this without a calendar */
+ADDJOBSCDE JOB(MONTHEND) +
+           CMD(CALL PGM(GLLIB/RUNMONTHEND)) +
+           FRQ(*MONTHLY) +
+           SCDDATE(*MONTHEND) +     /* Last day of each month */
+           SCDTIME('220000') +
+           JOBD(GLLIB/GLJOBD) USER(GLUSR) +
+           TEXT('Month-end general ledger close — last day of month at 22:00')
+
+/* Use a named schedule calendar in ADDJOBSCDE */
+ADDJOBSCDE JOB(DAILYRPT) +
+           CMD(CALL PGM(RPTLIB/RUNRPT)) +
+           FRQ(*WEEKLY) +
+           SCDDAY(*ALL) +           /* Eligible every day... */
+           SCDCAL(BIZDAYS) +        /* ...but restricted to business day calendar */
+           SCDTIME('070000') +
+           JOBD(RPTLIB/RPTJOBD) USER(RPTUSR) +
+           TEXT('Daily report — business days only at 07:00')
+</pre>
+
+<h2>Exception Calendars: Bank Holiday Handling</h2>
+
+<p>An <strong>exception calendar</strong> (also called a holiday calendar) defines specific dates on which a scheduled job must <em>not</em> run. When the job scheduler reaches a scheduled run date that appears in the exception calendar, it skips that date and uses the <code>OMITDATE</code> parameter to decide whether to run the job on the next eligible day, the previous eligible day, or not at all.</p>
+
+<pre>
+/* Create a holiday exception calendar */
+ADDHLDCALE HLDCAL(UKHOLS2026) +
+           TEXT('UK bank holidays 2026')
+
+/* Add specific holiday dates to the exception calendar */
+ADDHLDDTAE HLDCAL(UKHOLS2026) DATE('2026-01-01')   /* New Year's Day */
+ADDHLDDTAE HLDCAL(UKHOLS2026) DATE('2026-04-03')   /* Good Friday */
+ADDHLDDTAE HLDCAL(UKHOLS2026) DATE('2026-04-06')   /* Easter Monday */
+ADDHLDDTAE HLDCAL(UKHOLS2026) DATE('2026-05-04')   /* Early May Bank Holiday */
+ADDHLDDTAE HLDCAL(UKHOLS2026) DATE('2026-05-25')   /* Spring Bank Holiday */
+ADDHLDDTAE HLDCAL(UKHOLS2026) DATE('2026-08-31')   /* Summer Bank Holiday */
+ADDHLDDTAE HLDCAL(UKHOLS2026) DATE('2026-12-25')   /* Christmas Day */
+ADDHLDDTAE HLDCAL(UKHOLS2026) DATE('2026-12-28')   /* Boxing Day (observed) */
+
+/* Reference the holiday calendar in a job schedule entry */
+/* OMITDATE(*AFTER) = if today is a holiday, run the next eligible day instead */
+/* OMITDATE(*BEFORE) = run the previous eligible day */
+/* OMITDATE(*SKIP) = skip the run entirely for this occurrence */
+ADDJOBSCDE JOB(PAYRUNCAL) +
+           CMD(CALL PGM(PAYLIB/RUNPAYROLL)) +
+           FRQ(*WEEKLY) +
+           SCDDAY(*FRI) +
+           SCDTIME('170000') +
+           SCDCAL(BIZDAYS) +
+           HLDCAL(UKHOLS2026) +     /* Skip bank holidays */
+           OMITDATE(*BEFORE) +      /* If Friday is a holiday, run Thursday instead */
+           JOBD(PAYLIB/PAYJOBD) USER(PAYUSR) +
+           TEXT('Weekly payroll run — Friday 17:00, adjusted for UK bank holidays')
+
+/* Display the dates in a holiday calendar */
+DSPJOBSCDE SCDCAL(*HLDCAL) HLDCAL(UKHOLS2026)
+</pre>
+
+<h2>Working with Schedule Entries: WRKJOBSCDE and CHGJOBSCDE</h2>
+
+<p><code>WRKJOBSCDE</code> is the primary interactive command for managing all schedule entries on the system. It shows the entry name, status, last run date and time, next scheduled run date and time, and the job description used. From the work screen, you can hold, release, change, remove, and display individual entries.</p>
+
+<pre>
+/* Display all job schedule entries */
+WRKJOBSCDE
+
+/* Display entries for a specific job name pattern */
+WRKJOBSCDE JOB(EOD*)    /* Shows all entries whose names start with EOD */
+
+/* Display a specific schedule entry */
+DSPJOBSCDE JOB(EODBATCH)
+
+/* Change the schedule time for an existing entry */
+CHGJOBSCDE JOB(EODBATCH) SCDTIME('190000')    /* Move from 18:00 to 19:00 */
+
+/* Change the command executed by a schedule entry */
+CHGJOBSCDE JOB(MONTHBILL) CMD(CALL PGM(ARLIB/RUNBILLINGV2))
+
+/* Change the frequency of a schedule entry */
+CHGJOBSCDE JOB(SYNCDATA) FRQ(*MINUTES) MINUTE(30)    /* Change from every 15 to every 30 */
+
+/* Change the user and job description */
+CHGJOBSCDE JOB(WEEKARCH) USER(ARCHIVUSR) JOBD(APPLIB/ARCHJOBD)
+
+/* Change the holiday calendar reference */
+CHGJOBSCDE JOB(PAYRUNCAL) HLDCAL(UKHOLS2027)    /* Update to next year's holidays */
+
+/* Remove a schedule entry permanently */
+RMVJOBSCDE JOB(DATAMIGR)    /* Remove the one-time migration entry after it ran */
+</pre>
+
+<h2>Retrieving Schedule Entries in CL: RTVJOBSCDE</h2>
+
+<p><code>RTVJOBSCDE</code> retrieves the attributes of a job schedule entry into CL variables. This is useful for building monitoring programs that check when a job last ran, whether it is currently held, or what its next scheduled run time is — without requiring interactive access to WRKJOBSCDE.</p>
+
+<pre>
+/* CL program: check if the end-of-day job ran successfully today */
+PGM
+
+DCL VAR(&LASTRUNDT)  TYPE(*CHAR) LEN(7)   /* Last run date CYYMMDD */
+DCL VAR(&LASTRUNTM)  TYPE(*CHAR) LEN(6)   /* Last run time HHMMSS */
+DCL VAR(&NEXTRUNDT)  TYPE(*CHAR) LEN(7)   /* Next run date */
+DCL VAR(&NEXTRUNTM)  TYPE(*CHAR) LEN(6)   /* Next run time */
+DCL VAR(&STATUS)     TYPE(*CHAR) LEN(10)  /* *ACTIVE, *HLD, *SAVED */
+DCL VAR(&JOBSTS)     TYPE(*CHAR) LEN(10)  /* Status of last submitted job */
+DCL VAR(&TODAY)      TYPE(*CHAR) LEN(7)
+
+/* Retrieve current date in CYYMMDD format */
+RTVSYSVAL SYSVAL(QDATE) RTNVAR(&TODAY)
+
+/* Retrieve schedule entry attributes */
+RTVJOBSCDE JOB(EODBATCH) +
+           SCDDATE(&LASTRUNDT) +     /* Date of last submission */
+           SCDTIME(&LASTRUNTM) +     /* Time of last submission */
+           NXTSCDDATE(&NEXTRUNDT) +  /* Next scheduled run date */
+           NXTSCDTIME(&NEXTRUNTM) +  /* Next scheduled run time */
+           STATUS(&STATUS)           /* *ACTIVE, *HLD */
+
+/* Compare last run date with today */
+IF COND(&LASTRUNDT *NE &TODAY) THEN(DO)
+    /* Job did not run today — send alert */
+    SNDPGMMSG MSG('WARNING: EODBATCH did not run today') TOPGMQ(*EXT) +
+              MSGTYPE(*ESCAPE)
+ENDDO
+
+/* Display retrieved values for logging */
+SNDPGMMSG MSG('EODBATCH: last=' *CAT &LASTRUNDT *CAT ' ' *CAT &LASTRUNTM +
+              *CAT ' next=' *CAT &NEXTRUNDT *CAT ' ' *CAT &NEXTRUNTM +
+              *CAT ' status=' *CAT &STATUS) +
+           TOPGMQ(*EXT)
+
+ENDPGM
+</pre>
+
+<pre>
+/* CL program: retrieve schedule entry and check if it is held before releasing */
+PGM PARM(&JOBNAME)
+
+DCL VAR(&JOBNAME) TYPE(*CHAR) LEN(10)
+DCL VAR(&STATUS)  TYPE(*CHAR) LEN(10)
+
+RTVJOBSCDE JOB(&JOBNAME) STATUS(&STATUS)
+
+IF COND(&STATUS *EQ '*HLD') THEN(DO)
+    RLSJOBSCDE JOB(&JOBNAME)
+    SNDPGMMSG MSG('Released schedule entry: ' *CAT &JOBNAME) TOPGMQ(*EXT)
+ENDDO
+ELSE DO
+    SNDPGMMSG MSG('Entry ' *CAT &JOBNAME *CAT ' is not held (status=' *CAT &STATUS *CAT ')') +
+               TOPGMQ(*EXT)
+ENDDO
+
+ENDPGM
+</pre>
+
+<h2>Holding and Releasing Schedule Entries: HLDJOBSCDE and RLSJOBSCDE</h2>
+
+<p>Holding a schedule entry temporarily suspends it without removing the entry. The job will not be submitted while held, but the entry and its configuration remain intact. This is the correct approach for maintenance windows, testing periods, or when a dependent system is unavailable.</p>
+
+<pre>
+/* Hold a single schedule entry — job will not run until released */
+HLDJOBSCDE JOB(EODBATCH)
+
+/* Hold all schedule entries — useful before a system upgrade or IPL */
+HLDJOBSCDE JOB(*ALL)
+
+/* Hold all entries matching a name pattern */
+HLDJOBSCDE JOB(EOD*)    /* Hold all entries whose names start with EOD */
+
+/* Release a held schedule entry — returns it to *ACTIVE status */
+RLSJOBSCDE JOB(EODBATCH)
+
+/* Release all held entries */
+RLSJOBSCDE JOB(*ALL)
+
+/* Practical pattern: hold before maintenance, release after */
+/* Before system maintenance window: */
+HLDJOBSCDE JOB(*ALL)
+SNDPGMMSG MSG('All job schedule entries held for maintenance window') TOPGMQ(*EXT)
+
+/* After maintenance completes: */
+RLSJOBSCDE JOB(*ALL)
+SNDPGMMSG MSG('All job schedule entries released after maintenance') TOPGMQ(*EXT)
+
+/* Hold a specific entry for the weekend — release Monday morning via another scheduled job */
+ADDJOBSCDE JOB(RELSENTRY) +
+           CMD(RLSJOBSCDE JOB(SYNCDATA)) +
+           FRQ(*WEEKLY) SCDDAY(*MON) SCDTIME('060000') +
+           JOBD(QGPL/QDFTJOBD) USER(QSYS) +
+           TEXT('Release SYNCDATA entry on Monday morning')
+</pre>
+
+<h2>Monitoring Scheduled Job Execution History</h2>
+
+<p>IBM i logs job scheduler submissions in the job log and the history log (<code>QHST</code>). The <code>QSYS2.SCHEDULED_JOB_INFO</code> SQL view (IBM i 7.4+) provides a queryable history of all job scheduler submissions, including completion status, run duration, and any messages generated.</p>
+
+<pre>
+-- Query the job scheduler history for the past 7 days
+SELECT JOB_NAME, SUBMISSION_TIMESTAMP,
+       SCHEDULED_DATE, SCHEDULED_TIME,
+       JOB_NUMBER, COMPLETION_STATUS,
+       DAYS_BETWEEN(CURRENT_DATE, DATE(SUBMISSION_TIMESTAMP)) AS DAYS_AGO
+FROM QSYS2.SCHEDULED_JOB_INFO
+WHERE SUBMISSION_TIMESTAMP > CURRENT_TIMESTAMP - 7 DAYS
+ORDER BY SUBMISSION_TIMESTAMP DESC
+FETCH FIRST 100 ROWS ONLY;
+
+-- Find scheduled jobs that ended with an error in the past 24 hours
+SELECT JOB_NAME, SUBMISSION_TIMESTAMP, JOB_NUMBER,
+       COMPLETION_STATUS, SCHEDULED_DATE, SCHEDULED_TIME
+FROM QSYS2.SCHEDULED_JOB_INFO
+WHERE SUBMISSION_TIMESTAMP > CURRENT_TIMESTAMP - 1 DAY
+  AND COMPLETION_STATUS NOT IN ('NORMAL', 'RUNNING')
+ORDER BY SUBMISSION_TIMESTAMP DESC;
+
+-- Check how many times a specific job ran this month and its average frequency
+SELECT JOB_NAME,
+       COUNT(*) AS RUN_COUNT,
+       MIN(SUBMISSION_TIMESTAMP) AS FIRST_RUN,
+       MAX(SUBMISSION_TIMESTAMP) AS LAST_RUN
+FROM QSYS2.SCHEDULED_JOB_INFO
+WHERE JOB_NAME = 'EODBATCH'
+  AND SUBMISSION_TIMESTAMP >= DATE_TRUNC('MONTH', CURRENT_DATE)
+GROUP BY JOB_NAME;
+
+-- Jobs that were scheduled but never ran (held entries with past due dates)
+SELECT JOB_NAME, SCHEDULED_DATE, SCHEDULED_TIME,
+       STATUS, OMIT_DATE_OPTION
+FROM QSYS2.JOB_SCHEDULER_INFO
+WHERE STATUS = '*HLD'
+  AND DATE(SCHEDULED_DATE) < CURRENT_DATE
+ORDER BY SCHEDULED_DATE;
+</pre>
+
+<pre>
+/* CL monitoring pattern: check job scheduler history from QHST */
+/* The QHST journal logs CPI1340 (job submitted) and CPI1341 (job completed) */
+
+/* Display job scheduler messages from the history log */
+DSPLOG LOG(QHST) PERIOD(*AVAIL) JOB(*ALL)
+/* Then use option 5 to filter for QJOBSCD messages */
+
+/* For programmatic access, use the DISPLAY_JOURNAL SQL function on QHST */
+SELECT ENTRY_TIMESTAMP, MESSAGE_ID, FROM_JOB, MESSAGE_TEXT
+FROM TABLE(QSYS2.JOBLOG_INFO('*', '*ALL', 'QJOBSCD')) A
+WHERE MESSAGE_ID IN ('CPI1340', 'CPI1341', 'CPF1164')
+  AND ENTRY_TIMESTAMP > CURRENT_TIMESTAMP - 1 DAY
+ORDER BY ENTRY_TIMESTAMP DESC;
+
+/* CPI1340 = job scheduler submitted a job
+   CPI1341 = submitted job completed normally
+   CPF1164 = job ended abnormally (check this one for failures)  */
+</pre>
+
+<h2>Practical Schedule Management Patterns</h2>
+
+<pre>
+/* Pattern: conditional scheduling — only run the month-end job
+   if the previous job (MONTHBILL) completed without errors */
+
+PGM
+
+DCL VAR(&JOBSTS)   TYPE(*CHAR) LEN(10)
+DCL VAR(&ERRMSG)   TYPE(*CHAR) LEN(80)
+
+/* Check completion status of last MONTHBILL submission */
+RTVJOBSCDE JOB(MONTHBILL) STATUS(&JOBSTS)
+
+/* Verify the billing job ran successfully before starting reconciliation */
+IF COND(&JOBSTS *EQ '*ACTIVE') THEN(DO)
+    CALL PGM(GLLIB/RUNRECON)
+ENDDO
+ELSE DO
+    CHGVAR VAR(&ERRMSG) VALUE('MONTHEND RECON skipped: MONTHBILL status=' *CAT &JOBSTS)
+    SNDPGMMSG MSG(&ERRMSG) TOMSGQ(QSYSOPR) MSGTYPE(*INFO)
+ENDDO
+
+ENDPGM
+
+/* Pattern: schedule a job with a specific MSGQ for operator notification */
+ADDJOBSCDE JOB(DAILYRPTS) +
+           CMD(CALL PGM(RPTLIB/RUNALLRPTS)) +
+           FRQ(*WEEKLY) SCDDAY(*MON *TUE *WED *THU *FRI) +
+           SCDTIME('060000') +
+           JOBD(RPTLIB/RPTJOBD) USER(RPTUSR) +
+           JOBQ(RPTLIB/RPTJOBQ) +
+           MSGQ(QSYSOPR) +          /* Operator console receives job start/end msgs */
+           RJOBNAME(RPTJOB) +       /* The submitted job's name */
+           TEXT('Daily report generation — weekdays at 06:00')
+
+/* Pattern: stagger jobs to avoid peak-hour contention */
+/* Metrics collection runs at :00 and :05 and :10 ... */
+/* Anomaly detection runs at :01 and :06 and :11 ... (offset by 1 minute) */
+/* Report generation runs at :03 and :08 and :13 ... (offset by 3 minutes) */
+ADDJOBSCDE JOB(RPTGEN15) +
+           CMD(CALL PGM(RPTLIB/RPTGEN)) +
+           FRQ(*MINUTES) MINUTE(15) +
+           SCDDATE(*CURRENT) SCDTIME('000300') +    /* Start at :03 past the hour */
+           JOBD(RPTLIB/RPTJOBD) USER(RPTUSR) +
+           TEXT('Report generation every 15 minutes, offset 3 minutes')
+</pre>
+
+<em>Next post: IBM i commitment control and transaction management — starting and ending commitment definitions with STRCMTCTL and ENDCMTCTL, controlling DB2 transaction scope with COMMIT and ROLLBACK in CL and RPG, journal-based commitment control with STRJRNPF and APYJRNCHG, savepoints with SAVEPOINT and ROLLBACK TO SAVEPOINT in embedded SQL, handling commitment control errors and job-level rollback on program abnormal end, and designing reliable multi-file update patterns on IBM i in 2026.</em>
